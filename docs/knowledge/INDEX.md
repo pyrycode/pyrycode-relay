@@ -4,7 +4,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Features
 
-- [`/v1/server` WS upgrade](features/server-endpoint.md) — binary-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Version` / `User-Agent` pre-upgrade, claims the slot, emits `4409` on conflict, holds the conn via `CloseRead` until #6's frame loop replaces it.
+- [`/v1/server` WS upgrade](features/server-endpoint.md) — binary-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Version` / `User-Agent` pre-upgrade, claims the slot, emits `4409` on conflict, holds the conn via `CloseRead` until #6's frame loop replaces it; on disconnect schedules a 30s grace release so a quick reconnect inherits the slot (#21).
 - [`/healthz` JSON endpoint](features/healthz.md) — unauthenticated `GET /healthz` returning `{status, version, connected_binaries, connected_phones, uptime_seconds}`; `Cache-Control: no-store`, body bounded ≈135 bytes.
 - [WSConn adapter](features/ws-conn-adapter.md) — wraps `nhooyr.io/websocket.Conn` to satisfy the registry's `Conn`; owns the per-conn write mutex and a `Close`-cancelled context with a 10s per-`Send` deadline.
 - [Connection registry](features/connection-registry.md) — thread-safe `Registry` (server-id → binary 1:1, server-id → phones 1:N) with `Conn` interface, snapshot-returning `PhonesFor`, sentinel errors for `4409` / `4404`, deferred-release `ScheduleReleaseServer` with grace-window reclaim semantics.
@@ -16,7 +16,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 - [ADR-0006: Grace window IS the reclaim path](decisions/0006-grace-period-as-reclaim-path.md) — `ClaimServer` during a pending grace timer succeeds (not `4409`); pointer-identity wrapper defends against stale `time.AfterFunc` fires after `Stop()`.
 - [ADR-0005: Application WS close codes go through the underlying `*websocket.Conn`](decisions/0005-application-close-codes-via-underlying-conn.md) — `WSConn.Close()` stays minimal (`StatusNormalClosure`); handlers emit `4409` / `4401` / `4404` directly on the `*websocket.Conn` in stillborn-WSConn paths.
 - [ADR-0004: WS library choice and adapter context strategy](decisions/0004-ws-library-and-adapter-context-strategy.md) — `nhooyr.io/websocket` v1.8.x; adapter-owned context cancelled by `Close`, 10s per-`Send` deadline; registry's `Send` signature stays context-free.
-- [ADR-0003: Connection registry as a passive store](decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, no callbacks, narrow `ReleaseServer` so grace logic (#8) can wrap it.
+- [ADR-0003: Connection registry as a passive store](decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, no callbacks, narrow `ReleaseServer` so grace logic (#20/#21) can wrap it.
 - [ADR-0002: Explicit-failure 404 on `:80` instead of HTTPS redirect](decisions/0002-autocert-explicit-failure-on-port-80.md) — pass `http.NotFoundHandler()` to `autocert.Manager.HTTPHandler`, not `nil`; loud failure over silent scheme-switching.
 - [ADR-0001: Routing envelope shape and opacity](decisions/0001-routing-envelope-shape-and-opacity.md) — `json.RawMessage` for the inner frame; sentinel errors; validate at boundary, never parse payloads.
 

@@ -18,9 +18,9 @@ A WebSocket connection only sees a peer-side close when *something* on this side
 
 The registry's `WSConn.Close()` is fixed to `StatusNormalClosure` by contract. To emit `4409` / `4401` / `4404`, call `Close` directly on the underlying `*websocket.Conn` from the upgrade handler — but only in the stillborn-WSConn window (after construction, before any `Send`, before the close `defer` is registered). Outside that window you'd race the adapter's `closeOnce` and `writeMu`. The handler comments name the exception so it doesn't read as a "use the underlying conn whenever you like" pattern. Captured as ADR-0005. Source: `/v1/server` conflict path (#16).
 
-## `defer ReleaseServer(...)` must be registered AFTER the successful `ClaimServer`
+## `defer { release-or-schedule }` must be registered AFTER the successful `ClaimServer`
 
-If you `defer reg.ReleaseServer(serverID)` before `ClaimServer` returns, the conflict path (`ErrServerIDConflict`) ends up calling `ReleaseServer` on a slot it does not hold — currently a no-op (returns false) but a structural foot-gun if a future grace-period wrapper from #8 starts a timer on every `ReleaseServer` call. Order: claim, then log success, then `defer`. Source: `/v1/server` (#16).
+If you `defer reg.ReleaseServer(serverID)` (or `ScheduleReleaseServer`) before `ClaimServer` returns, the conflict path (`ErrServerIDConflict`) ends up acting on a slot it does not hold. Pre-#21 this was a benign no-op (`ReleaseServer` returned false); after #21 swapped the defer to `ScheduleReleaseServer`, violating the rule would *arm a 30-second grace timer for an id the handler never owned* — at expiry the timer fires against whatever entry happens to be present (typically nothing, but indistinguishable in shape from a deletion). Order is non-negotiable: claim, then log success, then `defer`. Source: `/v1/server` (#16, sharpened by #21).
 
 ## `crypto/rand.Read` failure is fatal-by-design on Linux/macOS
 
