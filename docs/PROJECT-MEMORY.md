@@ -15,7 +15,7 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 | Connection registry (server-id ↔ binary, server-id ↔ phones) | Not started | — |
 | Frame forwarding using the routing envelope | Not started | — |
 | `conn_id` generation scheme | Not started | — |
-| Threat model doc | Not started | `docs/threat-model.md` planned |
+| Threat model doc — operational surface (deploy, supply chain, DoS, log hygiene, cert handling, TLS, error leakage) | Done (#11) | `docs/threat-model.md` |
 
 ## Patterns established
 

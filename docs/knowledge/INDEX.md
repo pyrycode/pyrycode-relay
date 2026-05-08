@@ -18,5 +18,6 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Cross-cutting
 
+- [Threat model](../threat-model.md) — operational threats to the relay-as-deployed-process: deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error leakage. Complements (does not replace) the protocol spec's wire-protocol Security model.
 - [Project memory](../PROJECT-MEMORY.md) — what's built, patterns established, current state.
 - [Lessons](../lessons.md) — gotchas worth carrying forward.
