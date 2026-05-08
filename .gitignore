@@ -1,0 +1,24 @@
+# Build artifacts
+dist/
+bin/
+*.test
+*.out
+coverage.txt
+
+# Go
+go.work
+go.work.sum
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs / runtime
+*.log
+.cert-cache/
+
+# OS
+.DS_Store
+Thumbs.db
