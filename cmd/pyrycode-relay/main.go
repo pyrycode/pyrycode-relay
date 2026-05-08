@@ -42,11 +42,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	startedAt := time.Now()
+	reg := relay.NewRegistry()
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)

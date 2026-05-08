@@ -12,6 +12,7 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 | Connection registry (`Conn`, `Registry`; 1:1 binary, 1:N phones; sentinel errors for `4409`/`4404`; race-tested) | Done (#3) | `internal/relay/registry.go` |
 | TLS via autocert in `--domain` mode (`NewAutocertManager`, `EnforceHost`, `TLSConfig`, `ErrCacheDirInsecure`) | Done (#9) | `internal/relay/tls.go`, `cmd/pyrycode-relay/main.go` |
 | `WSConn` adapter (`nhooyr.io/websocket.Conn` → registry `Conn`; per-conn write mutex; `Close`-cancelled context; 10s `Send` deadline) | Done (#15) | `internal/relay/ws_conn.go` |
+| `/healthz` JSON endpoint (`status`, `version`, `connected_binaries`, `connected_phones`, `uptime_seconds`; `Cache-Control: no-store`; unauthenticated) | Done (#10) | `internal/relay/healthz.go`, `cmd/pyrycode-relay/main.go` |
 | WS upgrade on `/v1/server` and `/v1/client` | Not started | — |
 | Header validation (`x-pyrycode-server`, `x-pyrycode-token`) | Not started | — |
 | Frame forwarding using the routing envelope | Not started | — |
@@ -29,6 +30,8 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 - **Passive in-memory stores guard mutation under one RWMutex; reads return copies, never references.** `PhonesFor` allocates a fresh slice so callers do slow work (broadcast, `Send` over the network) without holding the registry lock. Adopted in `internal/relay/registry.go` (#3); the same shape applies to any future "shared map of conns" type.
 - **Interface methods called under the lock are documented as non-blocking getters.** The registry's `Conn.ConnID()` is invoked under the write lock during `UnregisterPhone`; `Send` and `Close` are never called while the lock is held. Pattern: state the contract on the interface, never call something that could block on I/O while a mutex is held.
 - **Adapters bridge interface↔library API mismatches by owning policy locally.** When a library method needs a `context.Context` but the registry's `Conn` interface doesn't take one (and shouldn't — most callers don't have a context to thread), the adapter owns its own context: derived in the constructor, cancelled by `Close`, narrowed per-call with `WithTimeout` for deadline policy. Adopted in `WSConn` (#15); avoids forcing context-plumbing changes into upstream interfaces.
+- **Handler factories return `http.Handler`, not `http.HandlerFunc`.** `NewHealthzHandler(reg, version, startedAt) http.Handler` keeps construction factory-shaped so a future ticket adding per-handler state (logger, injectable clock) can do so without touching the call site in `main`. Adopted in `/healthz` (#10).
+- **Capture process-state timestamps in `main` after `flag.Parse()`, not as package-level vars.** `startedAt := time.Now()` lives inside `main` and is passed into the handler factory. A package-level `var startedAt = time.Now()` would fire at import time — before flag parsing, before `--version` early-returns — and be wrong for short-lived test binaries and any future deferred-serve setup. Adopted in #10.
 
 ## Conventions
 
