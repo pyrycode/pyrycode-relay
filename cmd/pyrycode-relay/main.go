@@ -47,6 +47,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
+	mux.Handle("/v1/server", relay.ServerHandler(reg, logger))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
