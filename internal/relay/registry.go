@@ -3,6 +3,7 @@ package relay
 import (
 	"errors"
 	"sync"
+	"time"
 )
 
 // Sentinel errors returned by Registry methods. Callers branch on these with
@@ -56,6 +57,16 @@ type Registry struct {
 	mu       sync.RWMutex
 	binaries map[string]Conn
 	phones   map[string][]Conn
+	timers   map[string]*graceEntry
+}
+
+// graceEntry wraps a pending grace-period timer. Its pointer identity
+// (NOT *time.Timer's) is what the expiry handler compares against the map
+// to detect stale fires. Capturing the entry pointer in the AfterFunc
+// closure — rather than the *time.Timer assigned after AfterFunc returns —
+// avoids the race-detector flag on a self-referential local var.
+type graceEntry struct {
+	timer *time.Timer
 }
 
 // NewRegistry constructs an empty Registry.
@@ -63,6 +74,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		binaries: make(map[string]Conn),
 		phones:   make(map[string][]Conn),
+		timers:   make(map[string]*graceEntry),
 	}
 }
 
@@ -78,6 +90,16 @@ func NewRegistry() *Registry {
 func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if entry, gracing := r.timers[serverID]; gracing {
+		// Grace window in flight: cancel the pending release and atomically
+		// replace the binary Conn. Phones registered during the grace window
+		// stay; the new binary inherits them. The expiry handler defends
+		// against a concurrent stale fire via pointer-identity on r.timers.
+		entry.timer.Stop()
+		delete(r.timers, serverID)
+		r.binaries[serverID] = conn
+		return nil
+	}
 	if _, ok := r.binaries[serverID]; ok {
 		return ErrServerIDConflict
 	}
@@ -98,6 +120,67 @@ func (r *Registry) ReleaseServer(serverID string) (released bool) {
 	}
 	delete(r.binaries, serverID)
 	return true
+}
+
+// ScheduleReleaseServer arms (or replaces) a deferred release of serverID
+// after d. The grace window is the reclaim path: until the timer fires,
+//
+//   - BinaryFor(serverID) continues to return the (now-closed) binary Conn —
+//     callers that Send through it observe whatever error the underlying
+//     impl returns.
+//   - RegisterPhone(serverID, conn) continues to succeed.
+//   - ClaimServer(serverID, conn) replaces the binary atomically and
+//     cancels the pending timer (returns nil, NOT ErrServerIDConflict).
+//
+// If a timer is already pending for serverID, it is stopped and replaced
+// (last call wins). Calling ScheduleReleaseServer for a serverID with no
+// binary holding it arms the timer anyway; on expiry it removes only
+// whatever state happens to be present (defensive, matches the no-op
+// semantics of ReleaseServer on an unheld id).
+//
+// On expiry (no reclaim within d): the binary entry for serverID is
+// removed, every phone currently registered for serverID is removed from
+// the registry and Close() is invoked on it. Close calls happen OUTSIDE
+// the registry lock (snapshot-and-iterate, same shape as PhonesFor).
+//
+// This method does not block on d; the timer fires on Go's runtime
+// goroutine for time.AfterFunc.
+func (r *Registry) ScheduleReleaseServer(serverID string, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if existing, ok := r.timers[serverID]; ok {
+		existing.timer.Stop()
+		delete(r.timers, serverID)
+	}
+
+	entry := &graceEntry{}
+	r.timers[serverID] = entry
+	entry.timer = time.AfterFunc(d, func() { r.handleGraceExpiry(serverID, entry) })
+}
+
+// handleGraceExpiry runs on the time.AfterFunc goroutine when the grace
+// timer for serverID fires. The pointer-identity check on r.timers[serverID]
+// closes the one race the lock cannot: a timer whose body has already
+// started executing cannot be Stop()'d, but is queued behind us on the
+// lock. By the time it acquires the lock, ClaimServer or a later
+// ScheduleReleaseServer may have replaced the entry — in which case self
+// no longer matches and we no-op.
+func (r *Registry) handleGraceExpiry(serverID string, self *graceEntry) {
+	r.mu.Lock()
+	if r.timers[serverID] != self {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.timers, serverID)
+	delete(r.binaries, serverID)
+	snapshot := r.phones[serverID]
+	delete(r.phones, serverID)
+	r.mu.Unlock()
+
+	for _, p := range snapshot {
+		p.Close()
+	}
 }
 
 // RegisterPhone appends conn to the phones slice for serverID. Returns

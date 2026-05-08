@@ -5,21 +5,44 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeConn is a minimal in-package Conn for tests. The registry's race
 // coverage proves the registry is race-free with well-behaved Conns; it does
 // not vouch for fakeConn under concurrent mutation, so tests register
 // distinct fakes per goroutine.
+//
+// Close mutates closed under mu so tests on a different goroutine than the
+// grace-expiry handler can safely read it via isClosed. Tests that need to
+// block until Close fires allocate closeCh; Close closes it once.
 type fakeConn struct {
-	id     string
-	sent   [][]byte
-	closed bool
+	id      string
+	sent    [][]byte
+	mu      sync.Mutex
+	closed  bool
+	closeCh chan struct{}
 }
 
 func (c *fakeConn) ConnID() string        { return c.id }
 func (c *fakeConn) Send(msg []byte) error { c.sent = append(c.sent, msg); return nil }
-func (c *fakeConn) Close()                { c.closed = true }
+func (c *fakeConn) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	if c.closeCh != nil {
+		close(c.closeCh)
+	}
+}
+
+func (c *fakeConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
 
 func TestClaimServer_FirstWinsSecondConflicts(t *testing.T) {
 	t.Parallel()
@@ -219,6 +242,212 @@ func TestUnregisterPhone_RemovesEmptySlice(t *testing.T) {
 	if _, p := r.Counts(); p != 0 {
 		t.Errorf("phones count after empty: got %d, want 0", p)
 	}
+}
+
+func TestScheduleReleaseServer_ReclaimWithinGrace_NoReleaseFires(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	b1 := &fakeConn{id: "b-1"}
+	b2 := &fakeConn{id: "b-2"}
+	p1 := &fakeConn{id: "p-1"}
+
+	if err := r.ClaimServer("s1", b1); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone p1: %v", err)
+	}
+
+	r.ScheduleReleaseServer("s1", 50*time.Millisecond)
+
+	if err := r.ClaimServer("s1", b2); err != nil {
+		t.Fatalf("reclaim ClaimServer: got %v, want nil", err)
+	}
+	got, ok := r.BinaryFor("s1")
+	if !ok || got.ConnID() != "b-2" {
+		t.Errorf("BinaryFor after reclaim: got (%v, %v), want (b-2, true)", got, ok)
+	}
+	phones := r.PhonesFor("s1")
+	if len(phones) != 1 || phones[0].ConnID() != "p-1" {
+		t.Errorf("PhonesFor after reclaim: got %v, want [p-1]", phones)
+	}
+
+	// Sleep past the original grace window. If the timer had fired stale
+	// and bypassed the pointer check, p1 would now be closed.
+	time.Sleep(100 * time.Millisecond)
+
+	if p1.isClosed() {
+		t.Error("p1 was closed after reclaim — stale timer fire was not suppressed")
+	}
+	if got, ok := r.BinaryFor("s1"); !ok || got.ConnID() != "b-2" {
+		t.Errorf("BinaryFor after grace window elapsed: got (%v, %v), want (b-2, true)", got, ok)
+	}
+}
+
+func TestScheduleReleaseServer_ExpiryRemovesBinaryAndClosesPhones(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	p1 := &fakeConn{id: "p-1", closeCh: make(chan struct{})}
+	p2 := &fakeConn{id: "p-2", closeCh: make(chan struct{})}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone p1: %v", err)
+	}
+	if err := r.RegisterPhone("s1", p2); err != nil {
+		t.Fatalf("RegisterPhone p2: %v", err)
+	}
+
+	r.ScheduleReleaseServer("s1", 20*time.Millisecond)
+
+	for _, p := range []*fakeConn{p1, p2} {
+		select {
+		case <-p.closeCh:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s.Close()", p.id)
+		}
+	}
+
+	if _, ok := r.BinaryFor("s1"); ok {
+		t.Error("BinaryFor: binary entry still present after grace expiry")
+	}
+	if got := r.PhonesFor("s1"); got != nil {
+		t.Errorf("PhonesFor after expiry: got %v, want nil", got)
+	}
+	if err := r.RegisterPhone("s1", &fakeConn{id: "p-3"}); !errors.Is(err, ErrNoServer) {
+		t.Errorf("RegisterPhone after expiry: got %v, want errors.Is(_, ErrNoServer)", err)
+	}
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-2"}); err != nil {
+		t.Errorf("ClaimServer after expiry: got %v, want nil", err)
+	}
+}
+
+func TestScheduleReleaseServer_PhoneRegisteredDuringGrace_SurvivesReclaim(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+
+	r.ScheduleReleaseServer("s1", 50*time.Millisecond)
+
+	p1 := &fakeConn{id: "p-1"}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone during grace: got %v, want nil", err)
+	}
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-2"}); err != nil {
+		t.Fatalf("reclaim ClaimServer: got %v, want nil", err)
+	}
+
+	phones := r.PhonesFor("s1")
+	if len(phones) != 1 || phones[0].ConnID() != "p-1" {
+		t.Errorf("PhonesFor after reclaim: got %v, want [p-1]", phones)
+	}
+}
+
+func TestScheduleReleaseServer_PhoneRegisteredDuringGrace_ClosedOnExpiry(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+
+	r.ScheduleReleaseServer("s1", 20*time.Millisecond)
+
+	p1 := &fakeConn{id: "p-1", closeCh: make(chan struct{})}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone during grace: got %v, want nil", err)
+	}
+
+	select {
+	case <-p1.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for p1.Close() on grace expiry")
+	}
+	if !p1.isClosed() {
+		t.Error("p1.isClosed() = false after closeCh signalled")
+	}
+}
+
+func TestScheduleReleaseServer_ReplacesPendingTimer(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	p1 := &fakeConn{id: "p-1", closeCh: make(chan struct{})}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	// Arm a long timer first, then replace with a short one.
+	r.ScheduleReleaseServer("s1", time.Hour)
+	r.ScheduleReleaseServer("s1", 20*time.Millisecond)
+
+	select {
+	case <-p1.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replacement timer to fire")
+	}
+}
+
+func TestScheduleReleaseServer_OnUnheldID_NoOp(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	r.ScheduleReleaseServer("nope", 10*time.Millisecond)
+	time.Sleep(40 * time.Millisecond)
+
+	if b, p := r.Counts(); b != 0 || p != 0 {
+		t.Errorf("Counts after unheld-id schedule: got (%d,%d), want (0,0)", b, p)
+	}
+}
+
+// TestScheduleReleaseServer_RaceFreedomUnderRapidCycles hammers the
+// disconnect/reclaim cycle from many goroutines and asserts the absence of
+// DATA RACE reports under -race. Exercises time.AfterFunc cancel/replace and
+// stale-fire pointer-identity paths.
+//
+// Run with: go test -race -count=20 -run TestScheduleReleaseServer_RaceFreedomUnderRapidCycles ./internal/relay
+func TestScheduleReleaseServer_RaceFreedomUnderRapidCycles(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	const goroutines = 16
+	const opsPer = 200
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			sid := fmt.Sprintf("s-%d", g%4)
+			for i := 0; i < opsPer; i++ {
+				_ = r.ClaimServer(sid, &fakeConn{id: fmt.Sprintf("b-%d-%d", g, i)})
+				_ = r.RegisterPhone(sid, &fakeConn{id: fmt.Sprintf("p-%d-%d", g, i)})
+				r.ScheduleReleaseServer(sid, time.Millisecond)
+				_ = r.ClaimServer(sid, &fakeConn{id: fmt.Sprintf("b2-%d-%d", g, i)})
+				r.UnregisterPhone(sid, fmt.Sprintf("p-%d-%d", g, i))
+				_, _ = r.Counts()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Sleep past max grace duration so any in-flight timers fire and exit.
+	time.Sleep(50 * time.Millisecond)
+
+	// Final state need not be empty (some claims won the cancellation race);
+	// we only assert no panic and that Counts is callable.
+	_, _ = r.Counts()
 }
 
 // TestRegistry_RaceFreedom hammers the public API from many goroutines and
