@@ -2,6 +2,14 @@
 
 Gotchas worth carrying forward. Each entry: what bit us (or nearly did), and what we do about it.
 
+## `time.Timer.Stop()` returns false if the func has already started — a mutex alone won't save you
+
+`time.AfterFunc(d, fn)` fires `fn` on a runtime goroutine. Calling `t.Stop()` returns true if the timer was cancelled before firing, false if it already fired *or its `fn` is currently executing*. The "currently executing" case is a race the registry's `sync.RWMutex` cannot prevent: the AfterFunc body has started, blocked on the lock; another goroutine acquires the lock first, calls `Stop()` (gets false), replaces the map entry, releases the lock; the AfterFunc body then takes the lock and would naïvely tear down the new claimant's state. Defence: wrap each pending timer in a small struct (`*graceEntry`), store the wrapper in the map keyed by the same id, and have the AfterFunc closure capture the wrapper pointer. On fire, check `m[key] == self` under the lock — if the entry was replaced, the pointer no longer matches and the body returns. Source: `Registry.ScheduleReleaseServer` (#20).
+
+## Capture a wrapper pointer, not `*time.Timer`, to avoid a self-referential local var
+
+The natural shape — `var t *time.Timer; t = time.AfterFunc(d, func() { ... uses t ... })` — assigns `t` *after* `AfterFunc` returns, so the closure reads `t` from the outer frame. Under stress, the race detector flags this as a write/read race on the local var. Hoisting the timer pointer into a heap-allocated wrapper (`entry := &graceEntry{}; r.timers[id] = entry; entry.timer = time.AfterFunc(d, func() { ... uses entry ... })`) sidesteps the issue: the closure captures `entry`, the field assignment on `entry` is visibility-sealed by the lock the AfterFunc body must acquire. Source: `Registry.ScheduleReleaseServer` (#20).
+
 ## A long-lived WS handler that does not read frames will never observe peer close
 
 A WebSocket connection only sees a peer-side close when *something* on this side reads from the conn — control frames (ping/pong/close) are processed inline with reads. A handler that just blocks forever (e.g. `select {}` or `<-r.Context().Done()`) keeps the goroutine alive but does not move the close machinery: the conn stays "open" until the kernel TCP timeout, and `r.Context()` does not cancel on peer close (it cancels on *server* shutdown / client TCP RST seen by the http server). Use `c.CloseRead(r.Context())` to spawn a drain-and-discard goroutine and block on the returned context — that goroutine processes control frames and cancels the context on close. When the real frame loop lands later, swap `<-readCtx.Done()` for the loop body. Source: `/v1/server` (#16).
