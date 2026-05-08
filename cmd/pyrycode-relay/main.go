@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -47,7 +48,15 @@ func main() {
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
-		if err := http.ListenAndServe(*insecureListen, mux); err != nil {
+		srv := &http.Server{
+			Addr:              *insecureListen,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil {
 			logger.Error("listen failed", "err", err)
 			os.Exit(1)
 		}
