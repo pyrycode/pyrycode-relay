@@ -4,6 +4,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Features
 
+- [`/healthz` JSON endpoint](features/healthz.md) — unauthenticated `GET /healthz` returning `{status, version, connected_binaries, connected_phones, uptime_seconds}`; `Cache-Control: no-store`, body bounded ≈135 bytes.
 - [WSConn adapter](features/ws-conn-adapter.md) — wraps `nhooyr.io/websocket.Conn` to satisfy the registry's `Conn`; owns the per-conn write mutex and a `Close`-cancelled context with a 10s per-`Send` deadline.
 - [Connection registry](features/connection-registry.md) — thread-safe `Registry` (server-id → binary 1:1, server-id → phones 1:N) with `Conn` interface, snapshot-returning `PhonesFor`, sentinel errors for `4409` / `4404`.
 - [Autocert TLS](features/autocert-tls.md) — `--domain` mode wiring: `:443` WSS via Let's Encrypt + `:80` ACME http-01, host gates, cache-dir permission policy, TLS 1.2 floor.
