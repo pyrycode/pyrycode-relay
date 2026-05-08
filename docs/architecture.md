@@ -32,4 +32,4 @@ The wire protocol lives in [`pyrycode/pyrycode/docs/protocol-mobile.md`](https:/
 
 ## Threat model
 
-To be written. Will live at `docs/threat-model.md`. Wire-protocol-level threats are already in the protocol spec's Security model section.
+Wire-protocol threats live in the protocol spec's [Security model](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#security-model). Operational threats specific to the relay binary as a deployed process — deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error-leakage — live in [`docs/threat-model.md`](./threat-model.md).
