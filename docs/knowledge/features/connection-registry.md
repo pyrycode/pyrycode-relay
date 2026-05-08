@@ -99,6 +99,6 @@ go test -race -count=20 -run TestRegistry_RaceFreedom ./internal/relay
 
 ## Related
 
-- [ADR-0002: Connection registry as a passive store](../decisions/0002-connection-registry-passive-store.md) — single RWMutex, snapshot returns, no callbacks, why grace logic lives outside.
+- [ADR-0003: Connection registry as a passive store](../decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, no callbacks, why grace logic lives outside.
 - [Routing envelope](routing-envelope.md) — the wrapper used by frame forwarding (#6) once the registry is wired up.
 - [Architecture overview](../../architecture.md) — where the registry fits in the data flow.

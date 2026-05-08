@@ -1,4 +1,4 @@
-# ADR-0002: Connection registry as a passive store
+# ADR-0003: Connection registry as a passive store
 
 **Status:** Accepted (#3)
 **Date:** 2026-05-08

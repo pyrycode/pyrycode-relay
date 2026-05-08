@@ -30,8 +30,18 @@ make lint          # gosec + govulncheck (requires both installed locally)
 
 ## Run
 
+Production (autocert):
+
 ```bash
-./bin/pyrycode-relay --domain relay.example.com
+sudo ./bin/pyrycode-relay --domain relay.example.com
+```
+
+The relay binds `:443` (WSS) and `:80` (ACME http-01 challenge). Both ports must be reachable from the public internet — Let's Encrypt issues the cert by hitting `:80` on first request to the domain. The first WSS request after a fresh start may take ~10–20s while the cert is issued and cached to `--cert-cache`. Subsequent restarts reuse the cached cert.
+
+Behind a reverse proxy (TLS terminated upstream):
+
+```bash
+./bin/pyrycode-relay --insecure-listen :8080
 ```
 
 Flags:
@@ -39,7 +49,7 @@ Flags:
 | Flag | Default | Notes |
 |---|---|---|
 | `--domain` | (required for autocert) | Public domain for Let's Encrypt cert issuance. Required when `--insecure-listen` is unset. |
-| `--cert-cache` | `~/.pyrycode-relay/certs` | Directory for autocert's TLS certificate cache. |
+| `--cert-cache` | `~/.pyrycode-relay/certs` | Directory for autocert's TLS certificate cache. Created with `0700` if missing; refuses to start if an existing dir is world- or group-readable. |
 | `--insecure-listen` | (unset) | Listen address for plain HTTP (e.g. `:8080`). Disables autocert. Use only when fronted by a reverse proxy. |
 | `--version` | | Print version and exit. |
 
