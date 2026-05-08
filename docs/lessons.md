@@ -2,6 +2,22 @@
 
 Gotchas worth carrying forward. Each entry: what bit us (or nearly did), and what we do about it.
 
+## A long-lived WS handler that does not read frames will never observe peer close
+
+A WebSocket connection only sees a peer-side close when *something* on this side reads from the conn — control frames (ping/pong/close) are processed inline with reads. A handler that just blocks forever (e.g. `select {}` or `<-r.Context().Done()`) keeps the goroutine alive but does not move the close machinery: the conn stays "open" until the kernel TCP timeout, and `r.Context()` does not cancel on peer close (it cancels on *server* shutdown / client TCP RST seen by the http server). Use `c.CloseRead(r.Context())` to spawn a drain-and-discard goroutine and block on the returned context — that goroutine processes control frames and cancels the context on close. When the real frame loop lands later, swap `<-readCtx.Done()` for the loop body. Source: `/v1/server` (#16).
+
+## `*websocket.Conn.Close(code, reason)` emits an application close code; the `WSConn` adapter does not
+
+The registry's `WSConn.Close()` is fixed to `StatusNormalClosure` by contract. To emit `4409` / `4401` / `4404`, call `Close` directly on the underlying `*websocket.Conn` from the upgrade handler — but only in the stillborn-WSConn window (after construction, before any `Send`, before the close `defer` is registered). Outside that window you'd race the adapter's `closeOnce` and `writeMu`. The handler comments name the exception so it doesn't read as a "use the underlying conn whenever you like" pattern. Captured as ADR-0005. Source: `/v1/server` conflict path (#16).
+
+## `defer ReleaseServer(...)` must be registered AFTER the successful `ClaimServer`
+
+If you `defer reg.ReleaseServer(serverID)` before `ClaimServer` returns, the conflict path (`ErrServerIDConflict`) ends up calling `ReleaseServer` on a slot it does not hold — currently a no-op (returns false) but a structural foot-gun if a future grace-period wrapper from #8 starts a timer on every `ReleaseServer` call. Order: claim, then log success, then `defer`. Source: `/v1/server` (#16).
+
+## `crypto/rand.Read` failure is fatal-by-design on Linux/macOS
+
+The OS RNG (`getrandom` / `/dev/urandom`) does not block once the kernel pool is initialised at boot. A failure at runtime means the host is broken in a way the relay cannot meaningfully recover from. Stdlib `crypto/rand` examples treat it as fatal; `panic("crypto/rand: " + err.Error())` is the idiom. The http server's panic recovery terminates the connection cleanly; other connections continue. Source: `randHex8` in `/v1/server` (#16).
+
 ## `json.Valid` rejects nil and empty bytes
 
 `encoding/json.Valid(nil)` and `json.Valid([]byte{})` both return `false`. Useful: a single `if !json.Valid(frame)` check covers nil, empty, and malformed bytes — no need for separate length guards. Source: routing-envelope `Marshal` (#1).
