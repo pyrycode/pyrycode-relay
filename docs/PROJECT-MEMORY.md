@@ -11,6 +11,7 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 | Routing envelope wrapper type (`Envelope`, `Marshal`, `Unmarshal`, sentinel errors) | Done (#1) | `internal/relay/envelope.go` |
 | Connection registry (`Conn`, `Registry`; 1:1 binary, 1:N phones; sentinel errors for `4409`/`4404`; race-tested) | Done (#3) | `internal/relay/registry.go` |
 | TLS via autocert in `--domain` mode (`NewAutocertManager`, `EnforceHost`, `TLSConfig`, `ErrCacheDirInsecure`) | Done (#9) | `internal/relay/tls.go`, `cmd/pyrycode-relay/main.go` |
+| `WSConn` adapter (`nhooyr.io/websocket.Conn` → registry `Conn`; per-conn write mutex; `Close`-cancelled context; 10s `Send` deadline) | Done (#15) | `internal/relay/ws_conn.go` |
 | WS upgrade on `/v1/server` and `/v1/client` | Not started | — |
 | Header validation (`x-pyrycode-server`, `x-pyrycode-token`) | Not started | — |
 | Frame forwarding using the routing envelope | Not started | — |
@@ -22,11 +23,12 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 - **Sentinel errors, branched via `errors.Is`** for validation failures at protocol boundaries. New routing-layer code follows the `Err...` naming and wraps with `fmt.Errorf("…: %w", err, sentinel)` when adding context.
 - **Opacity by type.** Inner-frame payloads are carried as `json.RawMessage`. The relay never deserialises payloads; the type makes that hard to violate accidentally.
 - **Validate at the envelope boundary, not deeper.** Structural checks (presence, non-empty, JSON well-formedness) belong here; semantic checks (token validity, message kind) belong to the binary.
-- **Stdlib + `golang.org/x/crypto`.** First non-stdlib dep arrived in #9 (`acme/autocert`). Keep the dependency surface deliberate; new deps need a justification.
+- **Stdlib + `golang.org/x/crypto` + `nhooyr.io/websocket`.** Direct deps arrived in #9 (`acme/autocert`) and #15 (`nhooyr.io/websocket` v1.8.x). Keep the dependency surface deliberate; new deps need a justification (the ADR is the justification).
 - **Loud failure over silent correction.** `--domain` and `--insecure-listen` are mutually exclusive and explicit. `ErrCacheDirInsecure` refuses to start on a world/group-readable cert cache rather than re-chmoding it. `:80` returns `404` for non-challenge traffic instead of redirecting to HTTPS (ADR-0002).
 - **Tests live in the same package** (`package relay`, not `relay_test`) so they can `errors.Is` against unexported sentinels if needed and reach private helpers without re-exporting.
 - **Passive in-memory stores guard mutation under one RWMutex; reads return copies, never references.** `PhonesFor` allocates a fresh slice so callers do slow work (broadcast, `Send` over the network) without holding the registry lock. Adopted in `internal/relay/registry.go` (#3); the same shape applies to any future "shared map of conns" type.
 - **Interface methods called under the lock are documented as non-blocking getters.** The registry's `Conn.ConnID()` is invoked under the write lock during `UnregisterPhone`; `Send` and `Close` are never called while the lock is held. Pattern: state the contract on the interface, never call something that could block on I/O while a mutex is held.
+- **Adapters bridge interface↔library API mismatches by owning policy locally.** When a library method needs a `context.Context` but the registry's `Conn` interface doesn't take one (and shouldn't — most callers don't have a context to thread), the adapter owns its own context: derived in the constructor, cancelled by `Close`, narrowed per-call with `WithTimeout` for deadline policy. Adopted in `WSConn` (#15); avoids forcing context-plumbing changes into upstream interfaces.
 
 ## Conventions
 
