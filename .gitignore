@@ -22,3 +22,6 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
+
+# Nested agents repo (pyrycode/pyrycode-relay-agents) — gitignored here, lives in its own repo
+agents/
