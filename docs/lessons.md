@@ -26,6 +26,14 @@ The AC asked for `go test -race -count=20` coverage. `count` belongs on the comm
 
 When a shared map holds connection handles (or anything you'll iterate to do I/O over), the read accessor should allocate and return a fresh copy. Callers can then `Send` / `Close` / fan out without holding the lock — and concurrent mutators don't trip the iteration. The cost is one allocation per call; the benefit is no foot-gun where a slow `Send` blocks every other registry caller. Source: `Registry.PhonesFor` (#3).
 
+## To close cleanly through a serialised writer, cancel a context — don't take the write mutex
+
+Wrapping a library whose `Write` is *not* concurrency-safe forces a per-conn write mutex. The naive `Close` then takes the same mutex to ensure no `Write` is in flight — and that deadlocks against a slow peer holding the mutex inside an in-flight `Write`. The fix: give the adapter a `closeCtx` cancelled by `Close`; `Send` derives `WithTimeout(closeCtx, …)` per call. `Close` cancels the context *without taking the write mutex*; the in-flight `Write` aborts on cancellation and releases the mutex on its own. Requires the underlying library to document `Close`-safe-with-in-flight-`Write` (the case for `nhooyr.io/websocket`). Source: `internal/relay/ws_conn.go` (#15).
+
+## `nhooyr.io/websocket` is the v1.8.x line under a vanity import path
+
+Vanity import path is `nhooyr.io/websocket`. Upstream development moved to `github.com/coder/websocket`, but the `nhooyr.io/websocket` line continues to be published. Use the vanity path; do not opportunistically switch to the coder fork without an ADR. `go get nhooyr.io/websocket@latest` resolves into v1.8.x. Source: ADR-0004 (#15).
+
 ## `autocert.Manager.HTTPHandler(nil)` redirects to HTTPS — it does not 404
 
 The autocert docs and the `nil` argument are easy to misread as "no fallback → 404." Actual behaviour: GET/HEAD get a `302` to HTTPS; other methods get `400`. To get an explicit 404 (or any other handler), pass it explicitly: `mgr.HTTPHandler(http.NotFoundHandler())`. See ADR-0002. Source: autocert TLS wiring (#9).
