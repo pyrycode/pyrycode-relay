@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/pyrycode/pyrycode-relay/internal/relay"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -63,11 +65,48 @@ func main() {
 		return
 	}
 
-	// TLS path (autocert) is intentionally not implemented yet — first
-	// real ticket wires it up. Refuse to start so misconfiguration is loud.
-	logger.Error("autocert TLS path not yet implemented; use --insecure-listen for now",
+	mgr, err := relay.NewAutocertManager(*domain, *certCache)
+	if err != nil {
+		logger.Error("autocert setup failed", "err", err)
+		os.Exit(1)
+	}
+
+	httpsSrv := &http.Server{
+		Addr:              ":443",
+		Handler:           relay.EnforceHost(*domain, mux),
+		TLSConfig:         relay.TLSConfig(mgr),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	httpSrv := &http.Server{
+		Addr: ":80",
+		// NotFoundHandler — NOT nil. autocert.Manager.HTTPHandler(nil)
+		// would 302 GET/HEAD to HTTPS; the AC requires explicit 404 for
+		// non-challenge traffic.
+		Handler:           mgr.HTTPHandler(http.NotFoundHandler()),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	logger.Info("starting", "version", Version, "mode", "autocert",
 		"domain", *domain, "cert_cache", *certCache)
-	os.Exit(2)
+
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil {
+			logger.Error("http-01 listener failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	if err := httpsSrv.ListenAndServeTLS("", ""); err != nil {
+		logger.Error("https listener failed", "err", err)
+		os.Exit(1)
+	}
 }
 
 func defaultCertCache() string {
