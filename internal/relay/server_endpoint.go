@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"nhooyr.io/websocket"
 )
@@ -24,7 +25,13 @@ import (
 // WebSocket upgrade endpoint. It validates required headers, upgrades the
 // connection, claims the server-id slot in reg, and holds the connection
 // open until the binary closes it (or the slot is released).
-func ServerHandler(reg *Registry, logger *slog.Logger) http.Handler {
+//
+// On binary disconnect (clean close, network error, ping timeout) the
+// server-id slot is scheduled for release after grace; a reconnect within
+// that window inherits the slot atomically (registry-side reclaim path,
+// see Registry.ScheduleReleaseServer). Production passes 30*time.Second
+// per protocol spec § Authentication → Binary → relay.
+func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		versionHeader := r.Header.Get("X-Pyrycode-Version")
@@ -77,7 +84,7 @@ func ServerHandler(reg *Registry, logger *slog.Logger) http.Handler {
 			"remote", remoteHost(r))
 
 		defer func() {
-			reg.ReleaseServer(serverID)
+			reg.ScheduleReleaseServer(serverID, grace)
 			wsconn.Close()
 			logger.Info("server_released", "server_id", serverID)
 		}()
