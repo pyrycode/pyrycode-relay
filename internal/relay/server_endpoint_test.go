@@ -16,12 +16,13 @@ import (
 )
 
 // startServer spins up an httptest.NewServer running ServerHandler against a
-// fresh registry. It returns the registry, the WS URL, and a cleanup.
-func startServer(t *testing.T) (*Registry, string, func()) {
+// fresh registry. The grace duration is the third arg to ServerHandler;
+// tests that don't exercise the disconnect path can pass a small duration.
+func startServer(t *testing.T, grace time.Duration) (*Registry, string, func()) {
 	t.Helper()
 	reg := NewRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(ServerHandler(reg, logger))
+	srv := httptest.NewServer(ServerHandler(reg, logger, grace))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	return reg, wsURL, srv.Close
 }
@@ -42,7 +43,7 @@ func validHeaders(serverID string) http.Header {
 }
 
 func TestServerEndpoint_ValidUpgrade_RegistersBinary(t *testing.T) {
-	reg, wsURL, cleanup := startServer(t)
+	reg, wsURL, cleanup := startServer(t, 100*time.Millisecond)
 	defer cleanup()
 
 	c, _, err := dialWith(t, wsURL, validHeaders("s1"))
@@ -102,7 +103,7 @@ func TestServerEndpoint_HeaderGate_400(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ServerHandler(reg, logger))
+			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond))
 			defer srv.Close()
 
 			req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -145,7 +146,7 @@ func TestServerEndpoint_HeaderGate_400(t *testing.T) {
 }
 
 func TestServerEndpoint_DuplicateClaim_4409(t *testing.T) {
-	reg, wsURL, cleanup := startServer(t)
+	reg, wsURL, cleanup := startServer(t, 100*time.Millisecond)
 	defer cleanup()
 
 	c1, _, err := dialWith(t, wsURL, validHeaders("s1"))
@@ -195,7 +196,7 @@ func TestServerEndpoint_DuplicateClaim_4409(t *testing.T) {
 }
 
 func TestServerEndpoint_PeerClose_ReleasesSlot(t *testing.T) {
-	reg, wsURL, cleanup := startServer(t)
+	reg, wsURL, cleanup := startServer(t, 100*time.Millisecond)
 	defer cleanup()
 
 	c, _, err := dialWith(t, wsURL, validHeaders("s1"))
@@ -247,6 +248,55 @@ func TestServerEndpoint_PeerClose_ReleasesSlot(t *testing.T) {
 	t.Fatalf("re-claim did not register")
 }
 
+func TestServerEndpoint_PeerClose_SchedulesGraceRelease(t *testing.T) {
+	grace := 200 * time.Millisecond
+	reg, wsURL, cleanup := startServer(t, grace)
+	defer cleanup()
+
+	c, _, err := dialWith(t, wsURL, validHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := reg.BinaryFor("s1"); ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := reg.BinaryFor("s1"); !ok {
+		t.Fatalf("BinaryFor(s1) not registered before close")
+	}
+
+	closeAt := time.Now()
+	if err := c.Close(websocket.StatusNormalClosure, ""); err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+
+	// Phase 1: scheduled, NOT immediate. For ~grace/4 after closeAt the
+	// binary entry must remain in the registry. The pre-#21 path (immediate
+	// ReleaseServer) would flip BinaryFor to false within milliseconds of
+	// the handler observing the close.
+	earlyDeadline := closeAt.Add(grace / 4)
+	for time.Now().Before(earlyDeadline) {
+		if _, ok := reg.BinaryFor("s1"); !ok {
+			t.Fatalf("BinaryFor(s1) released at T+%v < grace=%v (handler used immediate ReleaseServer, not scheduled)", time.Since(closeAt), grace)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Phase 2: timer fires within grace + slack.
+	lateDeadline := closeAt.Add(2*grace + 500*time.Millisecond)
+	for time.Now().Before(lateDeadline) {
+		if _, ok := reg.BinaryFor("s1"); !ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("BinaryFor(s1) still registered at T+%v; expected scheduled release to have fired (grace=%v)", time.Since(closeAt), grace)
+}
+
 func TestServerEndpoint_WrongMethod_NoPanic(t *testing.T) {
 	cases := []struct {
 		name string
@@ -286,7 +336,7 @@ func TestServerEndpoint_WrongMethod_NoPanic(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ServerHandler(reg, logger))
+			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond))
 			defer srv.Close()
 
 			resp, err := tc.do(srv.URL)
