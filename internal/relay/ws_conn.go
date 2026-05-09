@@ -75,8 +75,36 @@ func (w *WSConn) Send(msg []byte) error {
 // underlying *websocket.Conn; subsequent calls are no-ops. Safe to call
 // concurrently with Send.
 func (w *WSConn) Close() {
+	w.CloseWithCode(websocket.StatusNormalClosure, "")
+}
+
+// CloseWithCode cancels in-flight writes and closes the WebSocket with
+// the given code and reason. Idempotent under the same closeOnce guard
+// as Close: only the first Close-family call reaches the underlying
+// *websocket.Conn; later calls (whether Close or CloseWithCode) are
+// no-ops. Safe to call concurrently with Send.
+//
+// Used by paths that need to signal a non-normal close on an *active*
+// WSConn — e.g. the heartbeat goroutine emitting 1011 "heartbeat
+// timeout" when a peer stops responding to pings. See ADR-0007 for why
+// this lives on WSConn rather than at the call site (ADR-0005 covers
+// the stillborn-WSConn handler-side pattern that this method extends).
+func (w *WSConn) CloseWithCode(code websocket.StatusCode, reason string) {
 	w.closeOnce.Do(func() {
 		w.cancel()
-		_ = w.conn.Close(websocket.StatusNormalClosure, "")
+		_ = w.conn.Close(code, reason)
 	})
+}
+
+// Ping sends an RFC 6455 ping control frame and blocks until the
+// matching pong returns or ctx expires. Pure forwarder over the
+// library's Conn.Ping; does not take writeMu — nhooyr.io/websocket
+// serialises control frames against data writes internally.
+//
+// Used by runHeartbeat. A non-nil return is the caller's signal that
+// the peer is unresponsive (ctx-deadline elapsed without a pong) or
+// that the conn has died; runHeartbeat translates this into a
+// CloseWithCode(1011, "heartbeat timeout").
+func (w *WSConn) Ping(ctx context.Context) error {
+	return w.conn.Ping(ctx)
 }

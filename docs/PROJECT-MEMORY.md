@@ -17,6 +17,7 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 | WS upgrade on `/v1/server` (header gate pre-upgrade; `ClaimServer`; `4409` on conflict; `CloseRead`-held until #6; disconnect defers a 30s grace release via `ScheduleReleaseServer`) | Done (#16, #21) | `internal/relay/server_endpoint.go`, `cmd/pyrycode-relay/main.go` |
 | WS upgrade on `/v1/client` (header gate pre-upgrade; `RegisterPhone`; `4404` if no binary; `CloseRead`-held until #6; disconnect calls `UnregisterPhone`; token never parsed or logged) | Done (#5) | `internal/relay/client_endpoint.go`, `cmd/pyrycode-relay/main.go` |
 | Header validation (`x-pyrycode-server`, `x-pyrycode-version`, `user-agent` on `/v1/server`; `x-pyrycode-server`, `x-pyrycode-token`, `user-agent` on `/v1/client`; optional `x-pyrycode-device-name` on `/v1/client`) | Done (#16, #5) | `internal/relay/server_endpoint.go`, `internal/relay/client_endpoint.go` |
+| WS heartbeat (per-conn goroutine, RFC 6455 ping every 30s, `1011 "heartbeat timeout"` close at 30s pong-window; `WSConn.Ping` / `WSConn.CloseWithCode` added; both endpoints) | Done (#7) | `internal/relay/heartbeat.go`, `internal/relay/ws_conn.go`, `internal/relay/server_endpoint.go`, `internal/relay/client_endpoint.go` |
 | Frame forwarding using the routing envelope | Not started | — |
 | `conn_id` generation scheme | Not started | — |
 | Threat model doc — operational surface (deploy, supply chain, DoS, log hygiene, cert handling, TLS, error leakage) | Done (#11) | `docs/threat-model.md` |

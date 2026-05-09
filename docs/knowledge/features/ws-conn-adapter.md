@@ -16,6 +16,8 @@ func NewWSConn(c *websocket.Conn, connID string) *WSConn
 func (w *WSConn) ConnID() string
 func (w *WSConn) Send(msg []byte) error
 func (w *WSConn) Close()
+func (w *WSConn) CloseWithCode(code websocket.StatusCode, reason string)  // #7
+func (w *WSConn) Ping(ctx context.Context) error                           // #7
 ```
 
 Plus one package-level constant:
@@ -25,6 +27,8 @@ const writeTimeout = 10 * time.Second
 ```
 
 `writeTimeout` bounds a single `Send`. A slow peer cannot stall a caller past this deadline.
+
+`CloseWithCode` and `Ping` were added in #7 (heartbeat). `Close()` now delegates to `CloseWithCode(StatusNormalClosure, "")` — both share the `closeOnce` funnel, so whichever close-family call fires first wins. `Ping` is a pure forwarder over `*websocket.Conn.Ping`; it does not take `writeMu` because `nhooyr.io/websocket` serialises control frames against data writes internally. See [ADR-0007](../decisions/0007-wsconn-closewithcode-for-active-conn.md) for why active-conn application close codes go on `WSConn` while stillborn-WSConn close codes (`4409`/`4404`/`4401`, [ADR-0005](../decisions/0005-application-close-codes-via-underlying-conn.md)) keep the underlying-`*websocket.Conn` pattern.
 
 ## Concurrency model
 
@@ -56,7 +60,7 @@ These are documented so the next contributor doesn't add defensive code that doe
 
 - **No `connID` validation.** Length, charset, uniqueness are owned by the conn-id-scheme ticket. The adapter treats the id as opaque.
 - **No handshake / header validation / subprotocol selection.** Lives at the upgrade boundary (#4/#16, #5).
-- **No ping/pong.** Heartbeat is #7.
+- **No heartbeat policy.** The adapter exposes `Ping(ctx)` as a pure forwarder; the *policy* (interval, timeout, what to do on failure) lives in `runHeartbeat` in `internal/relay/heartbeat.go` (#7). The adapter does not own the heartbeat goroutine, the ticker, or the close decision — it only provides the pinging primitive.
 - **No read-side frame loop or envelope wrap/unwrap.** That is #6.
 - **No per-conn send queue / backpressure / rate limit.** `Send` writes synchronously and returns. None of those are in the registry's `Conn` contract.
 - **No close-on-`Send`-error.** Caller observes the error and chooses to call `Close`.

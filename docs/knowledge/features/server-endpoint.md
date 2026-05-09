@@ -110,7 +110,7 @@ Shutdown: `http.Server` cancels `r.Context()` → `CloseRead`'s read errors → 
 - **No log on `websocket.Accept` errors.** Library writes a 4xx; the failure is visible in the http access log. A per-failure log would invite log-flood from misconfigured clients. A counter (Prometheus, future) is the right shape if observability later wants this.
 - **No connection caps (per-IP or global).** Documented residual in `docs/threat-model.md` § DoS resistance; the WS upgrade path is named there. Inherited gap, not widened.
 - **No frame loop.** `CloseRead` discards frames until #6 replaces it.
-- **No heartbeat / ping-pong.** #7.
+- **No heartbeat policy in the handler.** The handler launches `go runHeartbeat(...)` after the successful claim and registers `defer cancelHB()` so the goroutine exits cleanly under handler unwind (#7). The heartbeat policy itself — 30s interval, 30s pong timeout, `1011 "heartbeat timeout"` close — lives in `heartbeat.go`. See [Heartbeat feature](heartbeat.md).
 - **No frame-forward error handling during grace.** A phone whose `Send` errors against the closed binary `Conn` during the grace window is #6's territory; the handler does not observe these.
 - **No token validation.** `/v1/server` is unauthenticated by design — the binary owns the trust relationship with phones.
 - **No log-line sanitisation.** `slog`'s text handler quotes string values, so a newline in `binary_version` cannot forge a log line. JSON handler in production preserves the property.

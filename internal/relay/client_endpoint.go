@@ -11,6 +11,7 @@ package relay
 // binary's responsibility (per protocol-mobile.md § Phone → relay → binary).
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -77,6 +78,16 @@ func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler {
 				"server_id", serverID,
 				"conn_id", connID)
 		}()
+
+		// Heartbeat: per-conn goroutine sends RFC 6455 pings at
+		// heartbeatInterval and closes the conn with 1011 "heartbeat
+		// timeout" if a pong does not arrive within heartbeatTimeout.
+		// cancelHB runs first under LIFO defer order: it signals the
+		// goroutine to exit cleanly before the unregister defer closes
+		// the conn. closeOnce ensures whichever close fires first wins.
+		hbCtx, cancelHB := context.WithCancel(r.Context())
+		defer cancelHB()
+		go runHeartbeat(hbCtx, wsconn, heartbeatInterval, heartbeatTimeout)
 
 		// Hold the connection open until the peer closes it (or the
 		// registry tears it down on binary-grace expiry). CloseRead drains
