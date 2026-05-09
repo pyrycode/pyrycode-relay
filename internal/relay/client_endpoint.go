@@ -78,11 +78,12 @@ func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler {
 				"conn_id", connID)
 		}()
 
-		// Hold the connection open until the peer closes it (or the
-		// registry tears it down on binary-grace expiry). CloseRead drains
-		// control frames so the conn observes peer-close. The frame loop
-		// (#6) replaces this block with a real read loop later.
-		readCtx := c.CloseRead(r.Context())
-		<-readCtx.Done()
+		// Phone-side read pump: wraps each inbound frame in the routing
+		// envelope and writes it to the binary holding serverID. Blocks
+		// until the phone closes the WS, ctx cancels, the binary
+		// disappears, or a Send to the binary fails. The handler's defer
+		// above runs when this returns. Return value is observability-
+		// only; the forwarder logs the cause.
+		_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)
 	})
 }
