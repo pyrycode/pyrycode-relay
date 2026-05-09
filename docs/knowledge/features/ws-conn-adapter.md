@@ -15,6 +15,7 @@ func NewWSConn(c *websocket.Conn, connID string) *WSConn
 
 func (w *WSConn) ConnID() string
 func (w *WSConn) Send(msg []byte) error
+func (w *WSConn) Read(ctx context.Context) ([]byte, error)
 func (w *WSConn) Close()
 ```
 
@@ -31,12 +32,15 @@ const writeTimeout = 10 * time.Second
 | Method | Lock | Context | Concurrent-safe with |
 |---|---|---|---|
 | `ConnID` | none | none | every other method |
-| `Send` | `writeMu` (held across one frame write) | `WithTimeout(closeCtx, writeTimeout)` | other `Send` (serialised), `Close` (cancellation breaks it), `ConnID` |
-| `Close` | `closeOnce` (one shot) | cancels `closeCtx` | `Send` (in-flight write is cancelled), other `Close` (no-op), `ConnID` |
+| `Send` | `writeMu` (held across one frame write) | `WithTimeout(closeCtx, writeTimeout)` | other `Send` (serialised), `Close` (cancellation breaks it), `ConnID`, `Read` |
+| `Read` | none | caller-supplied `ctx` (NOT joined with `closeCtx`) | `Send`, `Close` (underlying `Close` aborts in-flight `Read`), `ConnID`. **NOT** safe with another `Read` — single-caller only. |
+| `Close` | `closeOnce` (one shot) | cancels `closeCtx` | `Send` (in-flight write is cancelled), `Read` (underlying `*websocket.Conn.Close` aborts the read), other `Close` (no-op), `ConnID` |
 
 One mutex, one one-shot. The lock graph is a single node. There are no callbacks, no channels, no goroutines spawned by the adapter.
 
 `Close` deliberately does **not** take `writeMu`. Acquiring it would deadlock against a slow peer holding the mutex inside `Send`: the whole point of cancelling `closeCtx` is to abort the in-flight `Write` so it releases the mutex on its own. `nhooyr.io/websocket.Conn.Close` is documented to be safe with an in-flight `Write` — that property is why this library was chosen.
+
+`Read` takes only the caller-supplied `ctx`; it does **not** join `closeCtx`. Rationale (added in #25): when `Close` cancels `closeCtx` *and* closes the underlying `*websocket.Conn`, the in-flight library `Read` returns immediately with the close error. Plumbing `closeCtx` through the read path would be redundant. The single-caller contract makes the lock-free shape safe — only the per-WSConn forwarder goroutine (`internal/relay/forward.go`) calls `Read`.
 
 ## Context strategy
 
@@ -57,7 +61,8 @@ These are documented so the next contributor doesn't add defensive code that doe
 - **No `connID` validation.** Length, charset, uniqueness are owned by the conn-id-scheme ticket. The adapter treats the id as opaque.
 - **No handshake / header validation / subprotocol selection.** Lives at the upgrade boundary (#4/#16, #5).
 - **No ping/pong.** Heartbeat is #7.
-- **No read-side frame loop or envelope wrap/unwrap.** That is #6.
+- **No read-side frame loop or envelope wrap/unwrap.** `Read` is a single-frame primitive; the loop and envelope wrapping live in `internal/relay/forward.go` ([phone-forwarder.md](phone-forwarder.md)).
+- **No per-message size cap on `Read`.** Inherited from `*websocket.Conn`'s default (nhooyr's 32 MiB read limit). A deliberate `SetReadLimit` policy is a follow-up so it covers both forwarders.
 - **No per-conn send queue / backpressure / rate limit.** `Send` writes synchronously and returns. None of those are in the registry's `Conn` contract.
 - **No close-on-`Send`-error.** Caller observes the error and chooses to call `Close`.
 - **No close-code semantics beyond `StatusNormalClosure`.** The adapter doesn't know why the registry asked it to close. Close-code mapping (`4401`/`4404`/`4409`) is the upgrade handler's job.
@@ -101,4 +106,5 @@ What we deliberately do not test: the library's behaviour itself (we trust `Writ
 
 - [ADR-0004: WS library choice and adapter context strategy](../decisions/0004-ws-library-and-adapter-context-strategy.md)
 - [Connection registry](connection-registry.md) — the `Conn` interface this implements.
+- [Phone-side frame forwarder](phone-forwarder.md) — sole caller of `Read`; satisfies the local `phoneSource` interface.
 - [Threat model](../../threat-model.md) — slow-loris and supply-chain framings.

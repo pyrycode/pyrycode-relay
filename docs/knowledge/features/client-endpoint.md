@@ -4,7 +4,7 @@
 
 This is the public, internet-exposed endpoint. The peer is *less* trusted than `/v1/server`'s peer (which at least runs operator-issued software); anyone on the internet who learns the relay hostname can connect. Header validation runs **before** `websocket.Accept`; the token is presence-checked only and never logged.
 
-This is the phone side only. Frame forwarding is #6; heartbeat is #7. The handler currently holds the connection open by draining-and-discarding frames — #6 swaps in the real read loop in the same call site.
+This is the phone side only. Heartbeat is a future ticket. After header validation and `RegisterPhone`, the handler hands the connection to `StartPhoneForwarder` ([phone-forwarder.md](phone-forwarder.md), #25), which is the read pump for the data path.
 
 ## Wire shape
 
@@ -69,7 +69,7 @@ mux.Handle("/v1/client", relay.ClientHandler(reg, logger))
    - On any other error → `wsconn.Close()`, return (defensive; not currently reachable).
 7. Log `phone_registered`.
 8. `defer { reg.UnregisterPhone(serverID, connID); wsconn.Close(); log phone_unregistered }`. Registered **after** the successful `RegisterPhone` so a no-server path never tries to unregister a slot we never owned.
-9. `readCtx := c.CloseRead(r.Context()); <-readCtx.Done()` — block until the peer closes (or until the registry tears the conn down on binary-grace expiry).
+9. `_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)` — synchronous read pump that wraps inbound frames and `Send`s them to the binary holding `serverID`. Returns on phone close, ctx cancel, missing binary, or `Send` failure. The handler discards the return; the forwarder logs the cause. See [phone-forwarder.md](phone-forwarder.md).
 
 `randHex8` and `remoteHost` are reused verbatim from `server_endpoint.go` — same package, no duplication.
 
@@ -102,8 +102,7 @@ Header gate failures (`400`) are not logged — same hygiene rationale as `/v1/s
 | Header validation | request goroutine | none | pre-upgrade; no resources held |
 | `websocket.Accept` | request goroutine | none | conn allocated on success |
 | `RegisterPhone` | request goroutine | registry write lock (held internally) | one-shot |
-| `CloseRead` | spawns one read-discard goroutine | none | terminates on conn close / `r.Context()` cancel |
-| `<-readCtx.Done()` | request goroutine, blocking | none | unblocks on (a) peer close, (b) registry-driven `Close` from binary-grace expiry, (c) server shutdown |
+| `StartPhoneForwarder` | request goroutine, blocking; sole reader of the WS | per-frame `BinaryFor` RLock + `WSConn.writeMu` on the binary | returns on (a) phone-side close, (b) `r.Context()` cancel, (c) `Send` failure to the binary, (d) registry-driven `Close` from binary-grace expiry |
 | `defer` (unregister/close/log) | request goroutine | `wsconn.closeOnce` | runs only on the success path; idempotent |
 
 The handler takes no lock of its own. `WSConn.Close`'s `closeOnce` is a `sync.Once`, not a held lock. `UnregisterPhone` is a no-op on unknown `(serverID, connID)`. **No lock-order risk; no goroutine-leak path.**
@@ -117,7 +116,7 @@ When a binary disconnects, `/v1/server`'s defer arms `ScheduleReleaseServer(serv
 3. deletes the phones entry from the map,
 4. calls `Close()` on every snapshotted phone.
 
-The phone handler's `<-readCtx.Done()` then unblocks (the underlying conn's context was cancelled by `WSConn.Close`), the defer runs, and:
+The phone handler's in-flight `WSConn.Read` then aborts with the library's close error (the underlying `*websocket.Conn.Close` was invoked by `WSConn.Close`), `StartPhoneForwarder` returns, the defer runs, and:
 
 - `reg.UnregisterPhone(serverID, connID)` no-ops (entry already deleted in step 3).
 - `wsconn.Close()` no-ops (`sync.Once` already fired in step 4).
@@ -131,7 +130,7 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **Direct `c.Close` on the no-server path, not `wsconn.Close()`.** `WSConn.Close` always emits `StatusNormalClosure`; `4404` requires the underlying `*websocket.Conn`. The no-server case is a stillborn WSConn — no `Send` was attempted, no goroutine holds `writeMu` — so the WSConn invariant is preserved in spirit. See [ADR-0005](../decisions/0005-application-close-codes-via-underlying-conn.md).
 - **`defer` after `RegisterPhone` succeeds.** If `RegisterPhone` returns `ErrNoServer`, the handler must NOT call `UnregisterPhone` on a slot it never claimed. The registry tolerates it as a no-op today, but the structural rule sharpens once any cleanup grows side effects beyond a no-op (e.g. metrics increment in a future ticket).
 - **No `RegisterPhone` retry on `ErrNoServer` even during a binary's grace window.** During grace, `BinaryFor` still returns the (closed) binary, so `RegisterPhone` succeeds and `handleGraceExpiry` later closes the phone cleanly on expiry. If the slot is empty when `RegisterPhone` runs, that's a true 4404 — no other binary will pick up this phone's claim before the phone re-dials. The handler does not retry, does not poll, does not double-check.
-- **`CloseRead` instead of `for { c.Read() }`.** Same as `/v1/server`: keep the goroutine alive, drain control frames so the conn observes peer-close, defer to #6 for the real read loop. Swap site is `<-readCtx.Done()` → real loop body in the same goroutine.
+- **`StartPhoneForwarder` is the sole reader; `CloseRead` is gone.** Pre-#25 the handler used `c.CloseRead(r.Context())` to drain control frames pending the real read loop. With the forwarder in place, the read loop processes control frames inline with data; retaining `CloseRead` would race the sole-reader contract. See [phone-forwarder.md](phone-forwarder.md).
 - **`crypto/rand`-backed `connID` suffix.** 32 bits is sufficient — scoped per server-id, used only as an opaque map key in `UnregisterPhone`. `RegisterPhone` does not dedupe by `ConnID` (registry contract); collision odds at v1 scale are negligible. Using `crypto/rand` over `math/rand` is forward-compat hardening: if a future ticket exposes the conn-id, unguessable bytes avoid creating an oracle.
 - **No length cap or charset check on `device_name`.** Informational only; slog escapes control characters; no observed failure motivates a check. If oversized headers ever become an issue, mitigation lives upstream (per-IP rate limit, per-header byte cap) — both deferred to the DoS ticket.
 
@@ -140,8 +139,8 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **No token validation.** The relay is not the trust boundary for the phone token; the binary owns it. The relay's authorization model on `/v1/client` is purely "is there a binary holding this server-id?"
 - **No connection caps (per-IP or global).** Documented residual in `docs/threat-model.md` § DoS resistance. Same gap as `/v1/server`, named there, not widened.
 - **No phone-count-per-server-id cap.** `phones[serverID]` grows under attack; the broadcast cost (when #6 lands) is the DoS shape that owns it.
-- **No frame loop.** `CloseRead` discards frames until #6 replaces it.
-- **No heartbeat / ping-pong.** #7.
+- **No inner-frame parsing.** `StartPhoneForwarder` wraps each frame in the routing envelope and forwards opaque bytes; the binary owns inner-frame validation.
+- **No heartbeat / ping-pong.** Future ticket.
 - **No phone-side reconnect grace.** The binary-side grace from #20 already closes orphan phones cleanly on expiry; phone-side grace is not in the protocol spec and is out of scope.
 - **No `400` log line.** Avoids amplifying header-floods into log volume.
 - **No log on `websocket.Accept` errors.** Library writes a 4xx; the failure is visible in the http access log.
@@ -151,7 +150,7 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **Server-id enumeration via 4404 vs success.** `4404` confirms "no binary holds that id"; success confirms "a binary holds that id, and the relay accepted my token's *presence*." Both are protocol-spec-defined responses; the relay cannot withhold the signal without breaking phones. The token's *value* is validated by the binary on the first frame post-upgrade — an invalid token surfaces as `4401` from the binary forwarded by the relay (#6's territory). At the relay layer, server-id existence is observable by design.
 - **Token leak via crafted log line.** The token is never logged, never put into an error string, never compared with `fmt.Errorf`. Log-field set is enumerated; structurally the handler does not reach for the token after the presence-check. The defence is layered: spec, code review, and the absence of any code path that uses the token after the gate.
 - **Crafted `X-Pyrycode-Device-Name` to forge log lines.** slog's text and JSON handlers quote string values and escape control characters. Log-line forging is structurally blocked.
-- **Slow-loris on upgrade.** Same as `/v1/server`: peer that completes handshake but never sends frames consumes one goroutine; `CloseRead` waits. Connection caps deferred.
+- **Slow-loris on upgrade.** Peer that completes handshake but never sends frames parks one goroutine in `WSConn.Read` indefinitely. Connection caps deferred.
 - **Race: binary disconnects between phone's `RegisterPhone` and phone observing its conn live.** `RegisterPhone` succeeds; the binary's grace timer arms in parallel; if grace expires, `handleGraceExpiry` closes this phone; the handler's defer runs cleanly. Phone observes `StatusNormalClosure` and reconnects.
 - **Phone re-dials thousands of times to grow the phones slice forever.** Each successful register appends; each disconnect removes via `UnregisterPhone`. The slice does not leak across connections. Steady state is "concurrent live phones" — bounded by file descriptors / connection cap (deferred).
 - **Token-presence oracle via 4404.** Token-absent → 400; token-present + no binary → 4404; token-present + binary → success. The 400 vs 4404 difference is gated on token presence, but the *validity* of the token is not testable through the relay (the binary owns that). 4404 is not a presence oracle — it confirms the gate passed, which an attacker already knew because they sent a non-empty value.
@@ -179,6 +178,7 @@ Not tested: registry mocks (use the real one — race-tested in #3); library moc
 ## Related
 
 - [`/v1/server`](server-endpoint.md) — sibling ingress; this handler reuses its `randHex8`, `remoteHost`, validate-pre-upgrade shape, and stillborn-WSConn close-code pattern.
+- [Phone-side frame forwarder](phone-forwarder.md) — the data-path read pump this handler hands the conn to after registration.
 - [Connection registry](connection-registry.md) — `RegisterPhone` / `UnregisterPhone` / `ErrNoServer` are the primitives this handler routes through. Its `handleGraceExpiry` closes phones registered here when a binary's grace window expires.
 - [WSConn adapter](ws-conn-adapter.md) — what the handler hands to `RegisterPhone`. The direct-`c.Close` on no-server is the documented exception to the WSConn-only invariant.
 - [ADR-0005](../decisions/0005-application-close-codes-via-underlying-conn.md) — close-code emission on the underlying `*websocket.Conn`.
