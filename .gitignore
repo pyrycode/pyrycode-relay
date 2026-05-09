@@ -27,5 +27,10 @@ Thumbs.db
 agents/
 
 # CodeGraph index (used by dispatcher worktree symlink + interactive
-# Claude Code sessions for symbol-level code intel — local cache only)
-.codegraph/
+# Claude Code sessions for symbol-level code intel — local cache only).
+# No trailing slash: matches both directories AND symlinks. The trailing
+# slash variant `.codegraph/` only matches directories, which let the
+# dispatcher's worktree symlink at `<wt>/.codegraph` slip past gitignore
+# and get auto-committed in pyrycode (commit 30f3d53). Same fix here
+# defensively before the same chain bites this repo.
+.codegraph
