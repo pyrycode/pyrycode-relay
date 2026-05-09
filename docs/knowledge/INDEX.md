@@ -4,6 +4,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Features
 
+- [`/v1/client` WS upgrade](features/client-endpoint.md) — phone-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Token` / `User-Agent` pre-upgrade (token presence-only, never parsed/logged); registers phone on the binary's slot, emits `4404` if no binary holds the id, holds the conn via `CloseRead` until #6's frame loop replaces it (#5).
 - [`/v1/server` WS upgrade](features/server-endpoint.md) — binary-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Version` / `User-Agent` pre-upgrade, claims the slot, emits `4409` on conflict, holds the conn via `CloseRead` until #6's frame loop replaces it; on disconnect schedules a 30s grace release so a quick reconnect inherits the slot (#21).
 - [`/healthz` JSON endpoint](features/healthz.md) — unauthenticated `GET /healthz` returning `{status, version, connected_binaries, connected_phones, uptime_seconds}`; `Cache-Control: no-store`, body bounded ≈135 bytes.
 - [WSConn adapter](features/ws-conn-adapter.md) — wraps `nhooyr.io/websocket.Conn` to satisfy the registry's `Conn`; owns the per-conn write mutex and a `Close`-cancelled context with a 10s per-`Send` deadline.
