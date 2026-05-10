@@ -4,6 +4,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Features
 
+- [WebSocket heartbeat](features/heartbeat.md) — per-conn goroutine on both endpoints sends RFC 6455 ping every 30s; closes with `1011 "heartbeat timeout"` if no pong within 30s. Detects half-open TCP within 60s; ctx-cancel exit path leaves close to the handler defer (#7).
 - [Phone-side frame forwarder](features/phone-forwarder.md) — per-phone read pump: wraps each inbound phone frame in the routing envelope keyed by the phone's `conn_id` and `Send`s it to the binary holding `serverID`; opaque inner bytes; synchronous (handler discards the return); replaced `/v1/client`'s `CloseRead` placeholder; added `WSConn.Read` (single-caller) (#25).
 - [`/v1/client` WS upgrade](features/client-endpoint.md) — phone-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Token` / `User-Agent` pre-upgrade (token presence-only, never parsed/logged); registers phone on the binary's slot, emits `4404` if no binary holds the id, hands the conn to `StartPhoneForwarder` for the data path (#5, #25).
 - [`/v1/server` WS upgrade](features/server-endpoint.md) — binary-side ingress: validates `X-Pyrycode-Server` / `X-Pyrycode-Version` / `User-Agent` pre-upgrade, claims the slot, emits `4409` on conflict, holds the conn via `CloseRead` until #6's frame loop replaces it; on disconnect schedules a 30s grace release so a quick reconnect inherits the slot (#21).
@@ -15,6 +16,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Decisions
 
+- [ADR-0007: `WSConn.CloseWithCode` for active-conn application close codes](decisions/0007-wsconn-closewithcode-for-active-conn.md) — extends ADR-0005 for the post-claim window: heartbeat (#7) needs `1011 "heartbeat timeout"` on a live WSConn; `Close()` delegates to `CloseWithCode(StatusNormalClosure, "")`, both share `closeOnce`.
 - [ADR-0006: Grace window IS the reclaim path](decisions/0006-grace-period-as-reclaim-path.md) — `ClaimServer` during a pending grace timer succeeds (not `4409`); pointer-identity wrapper defends against stale `time.AfterFunc` fires after `Stop()`.
 - [ADR-0005: Application WS close codes go through the underlying `*websocket.Conn`](decisions/0005-application-close-codes-via-underlying-conn.md) — `WSConn.Close()` stays minimal (`StatusNormalClosure`); handlers emit `4409` / `4401` / `4404` directly on the `*websocket.Conn` in stillborn-WSConn paths.
 - [ADR-0004: WS library choice and adapter context strategy](decisions/0004-ws-library-and-adapter-context-strategy.md) — `nhooyr.io/websocket` v1.8.x; adapter-owned context cancelled by `Close`, 10s per-`Send` deadline; registry's `Send` signature stays context-free.

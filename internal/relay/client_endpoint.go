@@ -11,6 +11,7 @@ package relay
 // binary's responsibility (per protocol-mobile.md § Phone → relay → binary).
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -78,12 +79,22 @@ func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler {
 				"conn_id", connID)
 		}()
 
-		// Phone-side read pump: wraps each inbound frame in the routing
-		// envelope and writes it to the binary holding serverID. Blocks
-		// until the phone closes the WS, ctx cancels, the binary
-		// disappears, or a Send to the binary fails. The handler's defer
-		// above runs when this returns. Return value is observability-
-		// only; the forwarder logs the cause.
+		// Heartbeat: per-conn goroutine sends RFC 6455 pings at
+		// heartbeatInterval and closes the conn with 1011 "heartbeat
+		// timeout" if a pong does not arrive within heartbeatTimeout.
+		// cancelHB runs first under LIFO defer order: it signals the
+		// goroutine to exit cleanly before the unregister defer closes
+		// the conn. closeOnce ensures whichever close fires first wins.
+		hbCtx, cancelHB := context.WithCancel(r.Context())
+		defer cancelHB()
+		go runHeartbeat(hbCtx, wsconn, heartbeatInterval, heartbeatTimeout)
+
+		// Phone-side read pump (#25): wraps each inbound frame in the
+		// routing envelope and writes it to the binary holding serverID.
+		// Blocks until the phone closes the WS, ctx cancels, the binary
+		// disappears, or a Send to the binary fails. Replaces the old
+		// CloseRead+Done placeholder. Return value is observability-only;
+		// the forwarder logs the cause.
 		_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)
 	})
 }

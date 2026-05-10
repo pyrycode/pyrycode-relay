@@ -5,6 +5,14 @@ bin/
 *.out
 coverage.txt
 
+# Default `go build ./...` from repo root emits a binary named after the
+# module's last path segment ("pyrycode-relay") into CWD. Anchored with
+# leading slash so it matches the repo-root binary only, not any future
+# package directory of the same name. Same shape as the .codegraph fix
+# below — auto-commit safety nets need a trustworthy gitignore. Salvage
+# on PR #27 swept the binary in before this entry existed.
+/pyrycode-relay
+
 # Go
 go.work
 go.work.sum

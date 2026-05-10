@@ -4,7 +4,7 @@
 
 This is the public, internet-exposed endpoint. The peer is *less* trusted than `/v1/server`'s peer (which at least runs operator-issued software); anyone on the internet who learns the relay hostname can connect. Header validation runs **before** `websocket.Accept`; the token is presence-checked only and never logged.
 
-This is the phone side only. Heartbeat is a future ticket. After header validation and `RegisterPhone`, the handler hands the connection to `StartPhoneForwarder` ([phone-forwarder.md](phone-forwarder.md), #25), which is the read pump for the data path.
+This is the phone side only. After header validation and `RegisterPhone`, the handler hands the connection to `StartPhoneForwarder` ([phone-forwarder.md](phone-forwarder.md), #25), which is the read pump for the data path. The heartbeat goroutine ([Heartbeat feature](heartbeat.md), #7) runs alongside the handler — see § Concurrency below for the LIFO defer ordering.
 
 ## Wire shape
 
@@ -140,7 +140,7 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **No connection caps (per-IP or global).** Documented residual in `docs/threat-model.md` § DoS resistance. Same gap as `/v1/server`, named there, not widened.
 - **No phone-count-per-server-id cap.** `phones[serverID]` grows under attack; the broadcast cost (when #6 lands) is the DoS shape that owns it.
 - **No inner-frame parsing.** `StartPhoneForwarder` wraps each frame in the routing envelope and forwards opaque bytes; the binary owns inner-frame validation.
-- **No heartbeat / ping-pong.** Future ticket.
+- **No heartbeat policy in the handler.** The handler launches `go runHeartbeat(...)` after the successful register and registers `defer cancelHB()` so the goroutine exits cleanly under handler unwind (#7). The heartbeat policy itself — 30s interval, 30s pong timeout, `1011 "heartbeat timeout"` close — lives in `heartbeat.go`. See [Heartbeat feature](heartbeat.md).
 - **No phone-side reconnect grace.** The binary-side grace from #20 already closes orphan phones cleanly on expiry; phone-side grace is not in the protocol spec and is out of scope.
 - **No `400` log line.** Avoids amplifying header-floods into log volume.
 - **No log on `websocket.Accept` errors.** Library writes a 4xx; the failure is visible in the http access log.
