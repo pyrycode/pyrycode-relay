@@ -18,9 +18,10 @@ const writeTimeout = 10 * time.Second
 // (the underlying library forbids concurrent Write) and a per-connection
 // cancellation context that Close trips to abort in-flight writes.
 //
-// All exported methods are safe for concurrent use. Send serialises
+// Send, ConnID, and Close are safe for concurrent use: Send serialises
 // concurrent callers; ConnID is a pure getter; Close is idempotent and
-// may run concurrently with Send.
+// may run concurrently with Send. Read is single-caller — the per-WSConn
+// forwarder goroutine is the sole reader (see internal/relay/forward.go).
 type WSConn struct {
 	conn   *websocket.Conn
 	connID string
@@ -68,6 +69,18 @@ func (w *WSConn) Send(msg []byte) error {
 	ctx, cancel := context.WithTimeout(w.closeCtx, writeTimeout)
 	defer cancel()
 	return w.conn.Write(ctx, websocket.MessageBinary, msg)
+}
+
+// Read returns the next inbound message as opaque bytes. ctx bounds the
+// wait; cancellation aborts the read with the library's wrapped error.
+// The message type (binary vs text) is discarded — the relay treats
+// inner frames as opaque bytes. Concurrent Read callers are NOT
+// supported; the per-WSConn forwarder goroutine is the sole reader.
+// After Close, an in-flight Read returns with the library's close
+// error from the underlying *websocket.Conn.
+func (w *WSConn) Read(ctx context.Context) ([]byte, error) {
+	_, data, err := w.conn.Read(ctx)
+	return data, err
 }
 
 // Close cancels in-flight writes and closes the WebSocket with
