@@ -70,6 +70,14 @@ A client can complete the TLS handshake using SNI for `relay.example.com` and th
 
 RFC 7230 §5.4 allows it. When comparing to a configured hostname, strip the port via `net.SplitHostPort` first (it errors out cleanly if there's no port — use the original string in that case). Compare with `strings.EqualFold` because hostnames are case-insensitive. Source: `EnforceHost` (#9).
 
+## `nhooyr.io/websocket.Conn.Close` performs a 5s close-handshake, gating goroutine exit
+
+`Conn.Close(code, reason)` writes the close frame (5s write timeout) then **waits up to 5s for the peer's reciprocal close frame** before tearing down the TCP. If the peer has stopped reading entirely (the heartbeat-target case — that's why heartbeat fired), the reciprocal close never arrives and `Close` blocks for the full 5s. Implication for callers: the close frame reaches the wire promptly, but the goroutine sitting inside `Close` (e.g. `runHeartbeat`'s `CloseWithCode` path) only returns when the handshake's 5s grace expires. Tests that assert "the goroutine exited" need a >5s deadline; tests that assert "the close frame arrived" can use a much shorter window. Operationally this adds at most ~5s onto the worst-case dead-conn detection window before the handler unwinds and the registry slot releases. Source: `internal/relay/heartbeat_test.go` `TestHeartbeat_UnresponsivePeer_TriggersClose` (#7).
+
+## A WebSocket peer that does not read frames cannot pong
+
+The library's auto-pong machinery runs inline with `Read` (or `CloseRead`'s background drain). A peer that completes the handshake and then never reads — even just to discard — cannot respond to incoming pings, because the ping frame sits in the kernel's TCP buffer unobserved. This is exactly what makes RFC 6455 ping/pong a useful liveness signal: a wedged peer that has stopped processing the conn fails the heartbeat structurally, not just because it "chose not to" pong. Implication for tests: to test the *unresponsive-peer* path, the test client must NOT read; to test the *healthy-peer* path, the client must read (or `CloseRead`) so the library auto-pongs. Reverse the two and the assertions swap meanings. Source: `internal/relay/heartbeat_test.go` (#7).
+
 ## `autocert.Manager.TLSConfig()` doesn't set `MinVersion`
 
 `gosec` G402 fires on `make lint` if you use it raw. Wrap it in a helper that pins `MinVersion = tls.VersionTLS12` (or 1.3) before handing it to `http.Server`. Centralising the override means a future bump is a one-line change. Source: `relay.TLSConfig` (#9).
