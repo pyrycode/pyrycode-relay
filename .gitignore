@@ -23,9 +23,6 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
-# Nested agents repo (pyrycode/pyrycode-relay-agents) — gitignored here, lives in its own repo
-agents/
-
 # CodeGraph index (used by dispatcher worktree symlink + interactive
 # Claude Code sessions for symbol-level code intel — local cache only).
 # No trailing slash: matches both directories AND symlinks. The trailing
