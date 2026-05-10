@@ -100,14 +100,15 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration) http
 		defer cancelHB()
 		go runHeartbeat(hbCtx, wsconn, heartbeatInterval, heartbeatTimeout)
 
-		// Hold the connection open until the peer closes it. CloseRead
-		// spawns a goroutine that drains-and-discards frames (including
-		// control frames like ping/pong, which must be processed for the
-		// connection to observe a peer-side close) and returns a context
-		// cancelled when the conn ends. The frame loop (#6) replaces this
-		// block with a real read loop later.
-		readCtx := c.CloseRead(r.Context())
-		<-readCtx.Done()
+		// Binary-side read pump (#26): unwraps each inbound routing
+		// envelope and writes its inner frame to the phone matching
+		// env.ConnID under serverID. Blocks until the binary closes the
+		// WS or ctx cancels. Per-frame errors (malformed envelope,
+		// unknown conn_id, phone Send failure) log+drop and continue —
+		// the binary connection is not torn down for a single bad frame.
+		// Return value is observability-only; the forwarder logs the
+		// cause.
+		_ = StartBinaryForwarder(r.Context(), reg, serverID, wsconn, logger)
 	})
 }
 
