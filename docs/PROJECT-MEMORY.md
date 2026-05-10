@@ -4,6 +4,8 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 
 ## What's built
 
+> **Convention (2026-05-10 onwards):** Per-ticket implementation summaries live in [`docs/knowledge/codebase/<ticket-number>.md`](knowledge/codebase/), one file per ticket. The table below is pre-2026-05-10 history — frozen, kept for context. See [`docs/knowledge/codebase/README.md`](knowledge/codebase/README.md) for the convention rationale.
+
 | Area | Status | Where |
 |---|---|---|
 | Go skeleton | Done | `cmd/pyrycode-relay/main.go`, `internal/relay/doc.go` |
