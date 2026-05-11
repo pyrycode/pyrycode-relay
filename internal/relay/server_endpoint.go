@@ -32,7 +32,10 @@ import (
 // that window inherits the slot atomically (registry-side reclaim path,
 // see Registry.ScheduleReleaseServer). Production passes 30*time.Second
 // per protocol spec § Authentication → Binary → relay.
-func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration) http.Handler {
+//
+// maxFrameBytes is the per-frame read cap threaded into NewWSConn; see
+// docs/specs/architecture/29-wsconn-read-limit.md for the derivation.
+func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxFrameBytes int64) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		versionHeader := r.Header.Get("X-Pyrycode-Version")
@@ -56,7 +59,7 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration) http
 		}
 
 		connID := "server-" + serverID + "-" + randHex8()
-		wsconn := NewWSConn(c, connID)
+		wsconn := NewWSConn(c, connID, maxFrameBytes)
 
 		if err := reg.ClaimServer(serverID, wsconn); err != nil {
 			if errors.Is(err, ErrServerIDConflict) {

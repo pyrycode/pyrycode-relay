@@ -45,10 +45,16 @@ func main() {
 	startedAt := time.Now()
 	reg := relay.NewRegistry()
 
+	// maxFrameBytes: 256 KiB per-frame read cap. Derivation:
+	// docs/specs/architecture/29-wsconn-read-limit.md (≤50-message
+	// message_chunk envelope + routing wrapper, headroom for outliers,
+	// four orders of magnitude below nhooyr's 32 MiB default).
+	const maxFrameBytes int64 = 256 * 1024
+
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
-	mux.Handle("/v1/server", relay.ServerHandler(reg, logger, 30*time.Second))
-	mux.Handle("/v1/client", relay.ClientHandler(reg, logger))
+	mux.Handle("/v1/server", relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes))
+	mux.Handle("/v1/client", relay.ClientHandler(reg, logger, maxFrameBytes))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)

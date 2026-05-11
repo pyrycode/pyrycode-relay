@@ -22,7 +22,7 @@ func startServer(t *testing.T, grace time.Duration) (*Registry, string, func()) 
 	t.Helper()
 	reg := NewRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(ServerHandler(reg, logger, grace))
+	srv := httptest.NewServer(ServerHandler(reg, logger, grace, 256*1024))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	return reg, wsURL, srv.Close
 }
@@ -103,7 +103,7 @@ func TestServerEndpoint_HeaderGate_400(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond))
+			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond, 256*1024))
 			defer srv.Close()
 
 			req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -336,7 +336,7 @@ func TestServerEndpoint_WrongMethod_NoPanic(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond))
+			srv := httptest.NewServer(ServerHandler(reg, logger, 100*time.Millisecond, 256*1024))
 			defer srv.Close()
 
 			resp, err := tc.do(srv.URL)
