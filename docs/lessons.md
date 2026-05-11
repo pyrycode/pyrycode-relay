@@ -93,3 +93,15 @@ The runtime image used in #32 ships with the binary and nothing else: no `sh`, n
 ## `autocert.Manager.TLSConfig()` doesn't set `MinVersion`
 
 `gosec` G402 fires on `make lint` if you use it raw. Wrap it in a helper that pins `MinVersion = tls.VersionTLS12` (or 1.3) before handing it to `http.Server`. Centralising the override means a future bump is a one-line change. Source: `relay.TLSConfig` (#9).
+
+## Integer token-bucket refill: advance the anchor by token-sized chunks, not to `now`
+
+After crediting `tokensAdd := int(elapsed / refillEvery)` tokens, the natural-looking move is `refillLast = now`. That discards the fractional remainder of `elapsed` (the slice less than one `refillEvery`), over-throttling slightly because the next call has to wait the full interval again instead of just the leftover. The correct move is `refillLast += time.Duration(tokensAdd) * refillEvery`, which preserves the fractional time for the next call and keeps the steady-state rate exactly `1 / refillEvery`. Security-positive either way (the bug only over-throttles, never under), but the chunked form is the one that matches the documented rate. Source: `IPRateLimiter.Allow` (#50).
+
+## `wg.Wait()` belongs OUTSIDE `closeOnce.Do(close(done))`
+
+The natural shape for "idempotent close that stops one goroutine" is `closeOnce.Do(func(){ close(done); wg.Wait() })`. That works for a single caller, but a second concurrent `Close()` skips the `Do` body entirely and returns immediately — while the goroutine is still running and the first caller is still inside `wg.Wait()`. Caller two now races past `Close` thinking shutdown is complete. Hoist `wg.Wait()` outside the once: `closeOnce.Do(func(){ close(done) }); wg.Wait()`. Now both callers block on the WaitGroup until the goroutine exits; both return synchronously. Matches the "Close is idempotent and synchronous" expectation on `WSConn.Close`. Source: `IPRateLimiter.Close` (#50).
+
+## Map iteration with `delete(m, k)` is spec-safe; `for range` snapshot is not required
+
+The Go spec guarantees that deleting the current key during `for k, v := range m { ... delete(m, k) ... }` is safe — the deleted entry is omitted from subsequent iterations, and entries not yet visited may or may not be visited (which is fine when you're filtering by a predicate that any-order eviction satisfies). No need to build a `toDelete` slice first. Source: `IPRateLimiter.sweep` (#50); confirmed by the Go spec §"For statements with `range` clause".
