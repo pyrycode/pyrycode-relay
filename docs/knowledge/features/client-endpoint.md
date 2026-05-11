@@ -1,6 +1,6 @@
 # `/v1/client` — phone-side WebSocket upgrade
 
-`/v1/client` is the relay's ingress for mobile phones. A phone opens an outbound WSS to the relay, sends three required headers (one of which is the device token, opaque to the relay), and — if a binary currently holds the requested `serverID` — gets registered on that binary's phone slice in the connection registry. If no binary holds the slot, the WS is closed with application code `4404`.
+`/v1/client` is the relay's ingress for mobile phones. A phone opens an outbound WSS to the relay, sends three required headers (one of which is the device token, opaque to the relay), and — if a binary currently holds the requested `serverID` and the per-server-id phone cap is not reached — gets registered on that binary's phone slice in the connection registry. If no binary holds the slot, the WS is closed with application code `4404`; if the slot is at cap, with `4429`.
 
 This is the public, internet-exposed endpoint. The peer is *less* trusted than `/v1/server`'s peer (which at least runs operator-issued software); anyone on the internet who learns the relay hostname can connect. Header validation runs **before** `websocket.Accept`; the token is presence-checked only and never logged.
 
@@ -38,24 +38,27 @@ The relay does not validate the token — the binary does. The token is read int
 |---|---|
 | `1000` (`StatusNormalClosure`) | clean close on shutdown / unregister / binary-grace expiry. |
 | `4404` | no binary currently holds the requested `serverID`. Reason: `"no server with that id"`. |
+| `4429` | per-server-id phone cap reached (#30). Reason: `"too many phones for server-id"`. |
 
-`4404` is application-defined per RFC 6455 (4000–4999 range); mirrors the `4409` pattern on `/v1/server`. The close-reason is the protocol-spec literal — it deliberately does not echo the requested server-id back (that would invite probing).
+`4404` / `4429` are application-defined per RFC 6455 (4000–4999 range); both mirror the `4409` pattern on `/v1/server` (the convention is `WS app code = HTTP status code value` — 4404 → 404, 4409 → 409, 4429 → 429). The close-reasons are protocol-spec literals — they deliberately do not echo the requested server-id (or the exact cap value) back, to avoid probe oracles. `4429` is pending a coordinated addition to `pyrycode/pyrycode/docs/protocol-mobile.md`'s close-code table; per RFC 6455 a phone client that does not recognise it sees a generic abort.
 
 ## API
 
 Package `internal/relay` (`client_endpoint.go`):
 
 ```go
-func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler
+func ClientHandler(reg *Registry, logger *slog.Logger, maxPhones int) http.Handler
 ```
 
-One exported symbol. No new types, no new sentinel errors, no new package-level constants. No `grace` parameter — phone disconnect is immediate (`UnregisterPhone`); the only grace concept on this endpoint lives entirely inside the registry's `handleGraceExpiry`, which closes orphan phones when a binary's grace window expires (see § Concurrency below).
+One exported symbol. No new types. `maxPhones` is the per-server-id cap on concurrent phone registrations (#30); `<= 0` disables the cap and is the contract test fixtures pass to opt out. No `grace` parameter — phone disconnect is immediate (`UnregisterPhone`); the only grace concept on this endpoint lives entirely inside the registry's `handleGraceExpiry`, which closes orphan phones when a binary's grace window expires (see § Concurrency below).
 
 Wired in `cmd/pyrycode-relay/main.go` next to `/v1/server`:
 
 ```go
-mux.Handle("/v1/client", relay.ClientHandler(reg, logger))
+mux.Handle("/v1/client", relay.ClientHandler(reg, logger, 16))
 ```
+
+The literal `16` lives at the wiring site, mirroring `30*time.Second` on the `ServerHandler` line above — "policy values live at the wiring site" (#21). `16` is sized for phone + tablet + several desktops + headroom; an attacker who maximally exploits it incurs a 16× memory amplification per server-id, not unbounded.
 
 ## Algorithm
 
@@ -64,9 +67,12 @@ mux.Handle("/v1/client", relay.ClientHandler(reg, logger))
 3. `websocket.Accept` with `OriginPatterns: []string{"*"}`. On error, the library has already written a 4xx; return silently.
 4. Construct `connID = "client-" + serverID + "-" + randHex8()` (8 hex chars from `crypto/rand`).
 5. Wrap with `NewWSConn(c, connID)`.
-6. `reg.RegisterPhone(serverID, wsconn)`:
+6. `reg.RegisterPhoneCapped(serverID, wsconn, maxPhones)`:
    - On `ErrNoServer` → close the underlying `*websocket.Conn` with code `4404` and reason `"no server with that id"`, log `phone_register_no_server`, return.
+   - On `ErrPhonesAtCap` → close the underlying `*websocket.Conn` with code `4429` and reason `"too many phones for server-id"`, log `phone_register_at_cap`, return.
    - On any other error → `wsconn.Close()`, return (defensive; not currently reachable).
+
+   Branch order is `ErrNoServer` first, then `ErrPhonesAtCap` — mirrors the registry's internal check order so an empty slot yields `4404`, not `4429`, even when the cap would otherwise apply.
 7. Log `phone_registered`.
 8. `defer { reg.UnregisterPhone(serverID, connID); wsconn.Close(); log phone_unregistered }`. Registered **after** the successful `RegisterPhone` so a no-server path never tries to unregister a slot we never owned.
 9. `_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)` — synchronous read pump that wraps inbound frames and `Send`s them to the binary holding `serverID`. Returns on phone close, ctx cancel, missing binary, or `Send` failure. The handler discards the return; the forwarder logs the cause. See [phone-forwarder.md](phone-forwarder.md).
@@ -81,6 +87,7 @@ Three structured event types. Field set is fixed; nothing else (token, full head
 |---|---|
 | `phone_registered` | `server_id`, `conn_id`, `device_name`, `remote` |
 | `phone_register_no_server` | `server_id`, `remote` |
+| `phone_register_at_cap` | `server_id`, `remote` |
 | `phone_unregistered` | `server_id`, `conn_id` |
 
 Explicitly **not logged on any path:**
@@ -91,7 +98,7 @@ Explicitly **not logged on any path:**
 
 `device_name` is the user-supplied label (e.g. `"Juhana's iPhone"`); the threat model's MAY-be-logged list names it explicitly. Empty string on absence; logged literally — slog's text/JSON handlers escape control characters, so log-line forging via crafted device names is structurally blocked. `remote` is the IP host portion of `r.RemoteAddr`, no port.
 
-`conn_id` is logged on register and unregister so operators can correlate a session across both events. `phone_register_no_server` deliberately omits `conn_id` because no `WSConn` was constructed before the close on that path.
+`conn_id` is logged on register and unregister so operators can correlate a session across both events. `phone_register_no_server` and `phone_register_at_cap` deliberately omit `conn_id` and `device_name`: a rejected registration has nothing to correlate against — `server_id` and `remote` (the IP) are the operator-actionable fields. Both rejection lines carry the same field set verbatim.
 
 Header gate failures (`400`) are not logged — same hygiene rationale as `/v1/server`: avoid amplifying header-floods into log volume.
 
@@ -137,8 +144,8 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 ## What this handler deliberately does NOT do
 
 - **No token validation.** The relay is not the trust boundary for the phone token; the binary owns it. The relay's authorization model on `/v1/client` is purely "is there a binary holding this server-id?"
-- **No connection caps (per-IP or global).** Documented residual in `docs/threat-model.md` § DoS resistance. Same gap as `/v1/server`, named there, not widened.
-- **No phone-count-per-server-id cap.** `phones[serverID]` grows under attack; the broadcast cost (when #6 lands) is the DoS shape that owns it.
+- **No connection caps (per-IP or global).** Documented residual in `docs/threat-model.md` § DoS resistance. Same gap as `/v1/server`, named there, not widened. Per-IP rate-limit is tracked in #34.
+- **No global (across-server-ids) phone cap.** Only the per-server-id cap (#30) is enforced here; an attacker can still register many distinct server-ids (each within its own cap) and grow the registry — owned by #34 and any future total-connection cap.
 - **No inner-frame parsing.** `StartPhoneForwarder` wraps each frame in the routing envelope and forwards opaque bytes; the binary owns inner-frame validation.
 - **No heartbeat policy in the handler.** The handler launches `go runHeartbeat(...)` after the successful register and registers `defer cancelHB()` so the goroutine exits cleanly under handler unwind (#7). The heartbeat policy itself — 30s interval, 30s pong timeout, `1011 "heartbeat timeout"` close — lives in `heartbeat.go`. See [Heartbeat feature](heartbeat.md).
 - **No phone-side reconnect grace.** The binary-side grace from #20 already closes orphan phones cleanly on expiry; phone-side grace is not in the protocol spec and is out of scope.
@@ -152,7 +159,8 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **Crafted `X-Pyrycode-Device-Name` to forge log lines.** slog's text and JSON handlers quote string values and escape control characters. Log-line forging is structurally blocked.
 - **Slow-loris on upgrade.** Peer that completes handshake but never sends frames parks one goroutine in `WSConn.Read` indefinitely. Connection caps deferred.
 - **Race: binary disconnects between phone's `RegisterPhone` and phone observing its conn live.** `RegisterPhone` succeeds; the binary's grace timer arms in parallel; if grace expires, `handleGraceExpiry` closes this phone; the handler's defer runs cleanly. Phone observes `StatusNormalClosure` and reconnects.
-- **Phone re-dials thousands of times to grow the phones slice forever.** Each successful register appends; each disconnect removes via `UnregisterPhone`. The slice does not leak across connections. Steady state is "concurrent live phones" — bounded by file descriptors / connection cap (deferred).
+- **Phone re-dials thousands of times to grow the phones slice forever.** Each successful register appends; each disconnect removes via `UnregisterPhone`. The slice does not leak across connections. Concurrent live phones per server-id are bounded by `maxPhones = 16` (#30); total concurrent phones across the relay are bounded by file descriptors / per-IP rate-limit (#34, deferred).
+- **Many devices share a leaked binary token to balloon `phones[serverID]`.** Past 16 concurrent registrations on the same server-id, the next attempt closes with `4429`. The in-cap 16 remain unaffected; the data-path fanout in `StartBinaryForwarder` (#26) is bounded by the same 16. Slot churn (disconnect-then-re-register) is allowed by design — a legitimate user re-pairing after a network blip must not be permanently locked out.
 - **Token-presence oracle via 4404.** Token-absent → 400; token-present + no binary → 4404; token-present + binary → success. The 400 vs 4404 difference is gated on token presence, but the *validity* of the token is not testable through the relay (the binary owns that). 4404 is not a presence oracle — it confirms the gate passed, which an attacker already knew because they sent a non-empty value.
 - **`crypto/rand` panic.** Same posture as `/v1/server`: panic terminates the connection, http server recovers, defer is not yet registered (panic fires inside `randHex8`, before `RegisterPhone`), registry stays clean.
 
@@ -160,7 +168,7 @@ Verdict from the security review: **PASS**. Reuses `/v1/server`'s audited shape 
 
 ## Testing
 
-`internal/relay/client_endpoint_test.go`, `package relay`. Same harness as `server_endpoint_test.go`: `httptest.NewServer(ClientHandler(reg, logger))` with `websocket.Dial` clients, `slog.NewTextHandler(io.Discard, nil)` for logs.
+`internal/relay/client_endpoint_test.go`, `package relay`. Same harness as `server_endpoint_test.go`: `httptest.NewServer(ClientHandler(reg, logger, 0))` with `websocket.Dial` clients, `slog.NewTextHandler(io.Discard, nil)` for logs. Tests that do not exercise the cap pass `0` (the no-cap contract); the cap-integration test uses a dedicated `startClientWithCap(t, maxPhones)` helper.
 
 `fakeConn` is reused from `registry_test.go` to seed a binary on tests that exercise the success path; tests for the 4404 path skip the seed.
 
@@ -169,6 +177,7 @@ Tests (1:1 with AC bullets):
 - `TestClientEndpoint_ValidUpgrade_RegistersPhone` — seed binary; dial with valid headers; poll `reg.PhonesFor` until populated; assert `ConnID()` matches `"client-<id>-<8 hex>"`.
 - `TestClientEndpoint_HeaderGate_400` — table-driven over the three required headers; expect `400`; registry empty.
 - `TestClientEndpoint_NoBinary_4404` — no seed; dial; one `Read` returns `*websocket.CloseError` with `Code == 4404` and `Reason == "no server with that id"`; registry empty.
+- `TestClientEndpoint_AtCap_4429` (#30) — `startClientWithCap(t, 2)`; seed; dial 2 phones (in-cap, succeed); dial a 3rd; one `Read` on it returns `*websocket.CloseError` with `Code == 4429` and `Reason == "too many phones for server-id"`; in-cap phones remain registered.
 - `TestClientEndpoint_PeerClose_UnregistersPhone` — seed; dial; close client; poll `reg.PhonesFor` until empty; binary remains claimed.
 - `TestClientEndpoint_MultiplePhones_IndependentLifecycle` — seed; dial three phones; close them in non-FIFO order; assert removal order does not corrupt other entries (covers `UnregisterPhone`'s swap-with-last-then-truncate).
 - `TestClientEndpoint_DeviceNameOptional_HandlerAccepts` — dial without and with `X-Pyrycode-Device-Name`; both succeed.
