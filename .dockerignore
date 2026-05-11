@@ -1,0 +1,7 @@
+.git
+bin/
+dist/
+coverage.txt
+*.test
+Dockerfile
+.dockerignore
