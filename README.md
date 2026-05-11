@@ -28,6 +28,15 @@ make vet           # go vet
 make lint          # gosec + govulncheck (requires both installed locally)
 ```
 
+### Docker
+
+```bash
+docker build -t pyrycode-relay:dev .
+docker run --rm pyrycode-relay:dev --version
+```
+
+The image is host-agnostic: it exposes `:80` and `:443` for autocert, and declares a volume mount point at `/var/lib/relay/autocert` for the cert cache. Host-specific deploy wiring (TLS termination policy, port publishing, volume backing, single-instance enforcement) lives in #38.
+
 ## Run
 
 Production (autocert):
