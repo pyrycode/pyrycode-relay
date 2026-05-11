@@ -78,6 +78,10 @@ RFC 7230 §5.4 allows it. When comparing to a configured hostname, strip the por
 
 The library's auto-pong machinery runs inline with `Read` (or `CloseRead`'s background drain). A peer that completes the handshake and then never reads — even just to discard — cannot respond to incoming pings, because the ping frame sits in the kernel's TCP buffer unobserved. This is exactly what makes RFC 6455 ping/pong a useful liveness signal: a wedged peer that has stopped processing the conn fails the heartbeat structurally, not just because it "chose not to" pong. Implication for tests: to test the *unresponsive-peer* path, the test client must NOT read; to test the *healthy-peer* path, the client must read (or `CloseRead`) so the library auto-pongs. Reverse the two and the assertions swap meanings. Source: `internal/relay/heartbeat_test.go` (#7).
 
+## `nhooyr.io/websocket` ships with a 32 MiB default per-frame read limit — explicit cap, applied at the constructor
+
+The library's `*websocket.Conn` accepts frames up to ~32 MiB out of the box. For a relay routing typed envelopes (worst-case `message_chunk` ≈ 200 KiB), that default lets a misbehaving peer pin two orders of magnitude more read buffer than any legitimate message needs. `SetReadLimit(n)` adjusts the cap; on an over-cap frame the library closes with `StatusMessageTooBig` (1009) and surfaces a non-nil error on the next `Read`. Apply it inside the wrapping adapter's constructor *before the struct returns* — that closes the window where a `Read` could fire against an uncapped conn without each handler having to remember. The cap value belongs at the composition root (`cmd/.../main.go` as a `const`), threaded through the handler constructor: one literal, one place, no package-level constant in the relay package. Source: `NewWSConn(c, connID, maxFrameBytes)` (#29).
+
 ## `autocert.Manager.TLSConfig()` doesn't set `MinVersion`
 
 `gosec` G402 fires on `make lint` if you use it raw. Wrap it in a helper that pins `MinVersion = tls.VersionTLS12` (or 1.3) before handing it to `http.Server`. Centralising the override means a future bump is a one-line change. Source: `relay.TLSConfig` (#9).

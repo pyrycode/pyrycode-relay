@@ -24,7 +24,10 @@ import (
 // connection, registers the phone in reg under the requested server-id, and
 // holds the connection open until the phone closes it (or the registry tears
 // it down on binary-grace expiry).
-func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler {
+//
+// maxFrameBytes is the per-frame read cap threaded into NewWSConn; see
+// docs/specs/architecture/29-wsconn-read-limit.md for the derivation.
+func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		token := r.Header.Get("X-Pyrycode-Token")
@@ -48,7 +51,7 @@ func ClientHandler(reg *Registry, logger *slog.Logger) http.Handler {
 		}
 
 		connID := "client-" + serverID + "-" + randHex8()
-		wsconn := NewWSConn(c, connID)
+		wsconn := NewWSConn(c, connID, maxFrameBytes)
 
 		if err := reg.RegisterPhone(serverID, wsconn); err != nil {
 			if errors.Is(err, ErrNoServer) {

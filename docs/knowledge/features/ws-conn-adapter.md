@@ -11,7 +11,7 @@ Package `internal/relay` (`ws_conn.go`):
 ```go
 type WSConn struct { /* *websocket.Conn + connID + writeMu + closeOnce + closeCtx */ }
 
-func NewWSConn(c *websocket.Conn, connID string) *WSConn
+func NewWSConn(c *websocket.Conn, connID string, maxFrameBytes int64) *WSConn
 
 func (w *WSConn) ConnID() string
 func (w *WSConn) Send(msg []byte) error
@@ -66,7 +66,6 @@ These are documented so the next contributor doesn't add defensive code that doe
 - **No handshake / header validation / subprotocol selection.** Lives at the upgrade boundary (#4/#16, #5).
 - **No heartbeat policy.** The adapter exposes `Ping(ctx)` as a pure forwarder; the *policy* (interval, timeout, what to do on failure) lives in `runHeartbeat` in `internal/relay/heartbeat.go` (#7). The adapter does not own the heartbeat goroutine, the ticker, or the close decision — it only provides the pinging primitive.
 - **No read-side frame loop or envelope wrap/unwrap.** `Read` is a single-frame primitive; the loop and envelope wrapping live in `internal/relay/forward.go` ([phone-forwarder.md](phone-forwarder.md)).
-- **No per-message size cap on `Read`.** Inherited from `*websocket.Conn`'s default (nhooyr's 32 MiB read limit). A deliberate `SetReadLimit` policy is a follow-up so it covers both forwarders.
 - **No per-conn send queue / backpressure / rate limit.** `Send` writes synchronously and returns. None of those are in the registry's `Conn` contract.
 - **No close-on-`Send`-error.** Caller observes the error and chooses to call `Close`.
 - **No close-code semantics beyond `StatusNormalClosure`.** The adapter doesn't know why the registry asked it to close. Close-code mapping (`4401`/`4404`/`4409`) is the upgrade handler's job.
@@ -86,12 +85,13 @@ The adapter is on the hot path: every routed frame passes through `WSConn.Send`.
 - **`Close` racing with mid-`Write` `Send`.** Library is documented to handle this; relying on that property is explicit. If the property regresses in a future library version, the race test surfaces a `DATA RACE`.
 - **Same `*websocket.Conn` wrapped by two `WSConn` constructors.** Each gets its own `writeMu`; serial-write guarantee is broken; the wire interleaves. Caller-invariant; not enforced.
 - **Adversarial `connID` bytes.** Stored and returned as-is; no interpretation. Charset/length is the conn-id-scheme ticket's job.
+- **Per-frame read cap.** `NewWSConn` applies `*websocket.Conn.SetReadLimit(maxFrameBytes)` before returning. Production wires **256 KiB** as a `const` in `cmd/pyrycode-relay/main.go` (derivation: `pyrycode/pyrycode/docs/protocol-mobile.md` § *Backfill semantics* — `message_chunk` envelopes are bounded at ≤50 messages with text-only payloads, worst case comfortably under 256 KiB once routing-envelope overhead is added; see `docs/specs/architecture/29-wsconn-read-limit.md`). Setting the cap at the constructor — the single chokepoint both forwarders reach — discharges the "cover every reader" guarantee without per-handler code. On an over-cap frame the library closes with `StatusMessageTooBig` (1009); subsequent `Read` calls surface a non-nil error. The relay does not emit its own close code on this path.
 
 The `security-sensitive` label was applied because `Send` is on every routed-frame path. Verdict from review: PASS — one new code-level slow-loris mitigation, no widening of documented threat surface beyond the supply-chain cost the threat model already names for adding any WS library.
 
 ## Testing
 
-`internal/relay/ws_conn_test.go`, `package relay`. End-to-end against a real `*websocket.Conn` via `httptest.NewServer` — no library mocks. The `startEcho` helper spins up a server whose handler runs a tiny read-loop pushing received frames onto a buffered channel; the test gets back a connected `*WSConn` (client side) and the channel.
+`internal/relay/ws_conn_test.go`, `package relay`. End-to-end against a real `*websocket.Conn` via `httptest.NewServer` — no library mocks. The `startEcho` helper spins up a server whose handler runs a tiny read-loop pushing received frames onto a buffered channel *and* echoing them back to the client; the test gets back a connected `*WSConn` (client side, capped at the caller-supplied `maxFrameBytes`) and the channel. The echo path lets cap tests round-trip a frame so the client-side cap surfaces on `Read`.
 
 Tests (1:1 with the AC):
 
@@ -99,6 +99,8 @@ Tests (1:1 with the AC):
 - `TestWSConn_ConcurrentSend_ProducesIntactFrames` — N=16 goroutines each `Send` a unique tagged payload; the test asserts N intact, distinct frames. Race detector under `-race` is the primary signal; interleaved frames would surface as malformed messages or corrupted writes.
 - `TestWSConn_DoubleClose_DoesNotPanic`.
 - `TestWSConn_SendAfterClose_ReturnsError` — non-nil error is the contract; the specific error type is library-dependent (any of `context.Canceled`, a closed-connection error, or a wrapped variant) and not asserted on.
+- `TestWSConn_Read_FrameExceedingCap_ReturnsError` — round-trips an oversize frame and asserts the first AND a subsequent `Read` both return non-nil. The error type is not asserted on (library-dependent close-error wrapping).
+- `TestWSConn_Read_FrameAtCap_DeliveredIntact` — round-trips a frame whose payload is exactly at the cap; asserts the server-side channel receives the bytes intact and the client-side `Read` of the echoed frame returns the same bytes with `err == nil`.
 
 What we deliberately do not test: the library's behaviour itself (we trust `Write` to honour `ctx` and `Close` to be safe with in-flight `Write`); unit-level mocks of the library; performance.
 

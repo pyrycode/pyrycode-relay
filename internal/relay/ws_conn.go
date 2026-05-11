@@ -33,15 +33,25 @@ type WSConn struct {
 	cancel    context.CancelFunc
 }
 
-// NewWSConn wraps c with the relay-assigned connection id. The caller
-// retains responsibility for the WebSocket handshake and for choosing
-// connID; this constructor neither validates connID nor inspects c.
+// NewWSConn wraps c with the relay-assigned connection id and applies a
+// per-frame read-size cap. The caller retains responsibility for the
+// WebSocket handshake and for choosing connID; this constructor neither
+// validates connID nor inspects c.
+//
+// maxFrameBytes bounds every inbound WebSocket frame read through this
+// WSConn. Applied before the constructor returns — i.e. before any
+// goroutine other than the constructor holds a reference — so the first
+// Read against the underlying *websocket.Conn already sees the cap. If a
+// peer sends a frame whose payload exceeds the cap, the library closes
+// the conn with StatusMessageTooBig (1009) and the next Read surfaces a
+// non-nil error.
 //
 // After construction, the WSConn owns c: callers must reach the
 // connection only through WSConn methods. Calling c.Write or c.Close
 // directly defeats the adapter's serialisation and cancellation
 // guarantees.
-func NewWSConn(c *websocket.Conn, connID string) *WSConn {
+func NewWSConn(c *websocket.Conn, connID string, maxFrameBytes int64) *WSConn {
+	c.SetReadLimit(maxFrameBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &WSConn{
 		conn:     c,

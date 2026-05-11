@@ -45,7 +45,7 @@ func startHeartbeatPair(t *testing.T, interval, timeout time.Duration) (
 			close(handlerReady)
 			return
 		}
-		serverWS = NewWSConn(c, "test-hb")
+		serverWS = NewWSConn(c, "test-hb", 256*1024)
 		// CloseRead drains control frames (so the server side auto-
 		// processes incoming pongs and pings). Mirrors the production
 		// /v1/server and /v1/client handler shape.
