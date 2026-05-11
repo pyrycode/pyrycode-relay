@@ -32,6 +32,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Cross-cutting
 
+- [Log-key allowlist (test-time gate)](../../internal/relay/log_allowlist.go) — closed `allowedLogKeys` set in `internal/relay/log_allowlist.go` paired with `TestLogKeysAreAllowlisted` in `internal/relay/log_keys_test.go`; AST-walks every non-test `.go` file in the package and fails if a `logger.{Info,Warn,Error,Debug}` call carries a key absent from the set, a non-string-literal key, or a `Logger.With/LogAttrs/Log` selector the walker can't parse. Fourth defence layer for threat-model § *Log hygiene* (alongside spec, code review, structural absence) (#36).
 - [Threat model](../threat-model.md) — operational threats to the relay-as-deployed-process: deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error leakage. Complements (does not replace) the protocol spec's wire-protocol Security model.
 - [Project memory](../PROJECT-MEMORY.md) — what's built, patterns established, current state.
 - [Lessons](../lessons.md) — gotchas worth carrying forward.
