@@ -102,6 +102,18 @@ After crediting `tokensAdd := int(elapsed / refillEvery)` tokens, the natural-lo
 
 The natural shape for "idempotent close that stops one goroutine" is `closeOnce.Do(func(){ close(done); wg.Wait() })`. That works for a single caller, but a second concurrent `Close()` skips the `Do` body entirely and returns immediately — while the goroutine is still running and the first caller is still inside `wg.Wait()`. Caller two now races past `Close` thinking shutdown is complete. Hoist `wg.Wait()` outside the once: `closeOnce.Do(func(){ close(done) }); wg.Wait()`. Now both callers block on the WaitGroup until the goroutine exits; both return synchronously. Matches the "Close is idempotent and synchronous" expectation on `WSConn.Close`. Source: `IPRateLimiter.Close` (#50).
 
+## `r.Header.Get("X-Forwarded-For")` returns only the FIRST header value when XFF arrives as multiple separate headers
+
+`r.Header` is a `map[string][]string`. `Get` returns `values[0]`. If a request carries `X-Forwarded-For: a` and a second `X-Forwarded-For: b` as distinct headers (legal per RFC 7230 §3.2.2 for list-valued headers), `Get` returns only `a` and the helper takes the left-most token of that. Most real proxies emit a single comma-joined `X-Forwarded-For`, so this is structurally fine *today*; the de-facto-correct fix when a real proxy emits two-header XFF is `r.Header.Values("X-Forwarded-For")` + `strings.Join(..., ",")` before splitting. Documented as deferred in `ClientIP`'s spec under § Open questions; not fixed pre-emptively per *Evidence-Based Fix Selection*. Source: `internal/relay/client_ip.go` (#51).
+
+## For allocation-free "first comma-separated token" parsing, use `strings.IndexByte` + slice, not `strings.SplitN`
+
+`strings.SplitN(s, ",", 2)` allocates a `[]string` of length 1 or 2 every call. At rate-limit-decision frequency (one call per WS upgrade), the allocation isn't free. The equivalent `if i := strings.IndexByte(s, ','); i >= 0 { s = s[:i] }` is a single slice-header rewrite — no heap traffic, identical semantics, identical readability. Use `SplitN` when you need *both* halves; use `IndexByte` + slice when you only need the prefix. Source: `ClientIP` (#51).
+
+## `net.SplitHostPort` is the right tool for "host portion of a `host:port` string" — handles `[ipv6]:port` and errors cleanly on malformed input
+
+Manual `strings.LastIndex(s, ":")` parsing breaks on bracketed IPv6 literals (`[::1]:443`). `net.SplitHostPort` handles both forms, strips the brackets from IPv6 (returning `::1`, not `[::1]`), and returns a non-nil error on missing colon or empty input — which doubles as the discriminator for "I have a usable source IP" vs "I do not." Prefer it over hand-rolled splitting whenever both IPv4 and IPv6 are in scope (i.e. almost always). Same call sites: `ClientIP` (#51), `EnforceHost` (#9), the unexported `remoteHost` logging helper (`server_endpoint.go`).
+
 ## Map iteration with `delete(m, k)` is spec-safe; `for range` snapshot is not required
 
 The Go spec guarantees that deleting the current key during `for k, v := range m { ... delete(m, k) ... }` is safe — the deleted entry is omitted from subsequent iterations, and entries not yet visited may or may not be visited (which is fine when you're filtering by a predicate that any-order eviction satisfies). No need to build a `toDelete` slice first. Source: `IPRateLimiter.sweep` (#50); confirmed by the Go spec §"For statements with `range` clause".
