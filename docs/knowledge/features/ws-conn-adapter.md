@@ -11,7 +11,7 @@ Package `internal/relay` (`ws_conn.go`):
 ```go
 type WSConn struct { /* *websocket.Conn + connID + writeMu + closeOnce + closeCtx */ }
 
-func NewWSConn(c *websocket.Conn, connID string) *WSConn
+func NewWSConn(c *websocket.Conn, connID string, maxFrameBytes int64) *WSConn
 
 func (w *WSConn) ConnID() string
 func (w *WSConn) Send(msg []byte) error
