@@ -1,6 +1,10 @@
-# Lessons
+# Lessons (frozen)
 
-Gotchas worth carrying forward. Each entry: what bit us (or nearly did), and what we do about it.
+**Frozen 2026-05-11.** This file is historical reference only. New lessons go into the relevant ticket's `docs/knowledge/codebase/<N>.md` under a "Lessons learned" section.
+
+The pre-2026-05-11 entries below were collected before the per-ticket file convention. They remain unchanged so existing cross-references still resolve. Future tickets do not append here — the per-ticket file convention eliminates the shared-append conflict surface (same fix shape as `PROJECT-MEMORY.md`'s sections, frozen the same day).
+
+---
 
 ## `time.Timer.Stop()` returns false if the func has already started — a mutex alone won't save you
 
