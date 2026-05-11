@@ -108,6 +108,95 @@ func TestRegisterPhone_RequiresBinary(t *testing.T) {
 	}
 }
 
+func TestRegisterPhoneCapped_BoundaryAndRejection(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	const max = 3
+	for i := 0; i < max; i++ {
+		p := &fakeConn{id: fmt.Sprintf("p-%d", i)}
+		if err := r.RegisterPhoneCapped("s1", p, max); err != nil {
+			t.Fatalf("RegisterPhoneCapped #%d at <=cap: got %v, want nil", i, err)
+		}
+	}
+	over := &fakeConn{id: "p-over"}
+	if err := r.RegisterPhoneCapped("s1", over, max); !errors.Is(err, ErrPhonesAtCap) {
+		t.Fatalf("RegisterPhoneCapped at cap: got %v, want errors.Is(_, ErrPhonesAtCap)", err)
+	}
+	if got := r.PhonesFor("s1"); len(got) != max {
+		t.Errorf("PhonesFor after rejection: got len=%d, want %d", len(got), max)
+	}
+}
+
+func TestRegisterPhoneCapped_RecoveryAfterUnregister(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	const max = 2
+	p1 := &fakeConn{id: "p-1"}
+	p2 := &fakeConn{id: "p-2"}
+	if err := r.RegisterPhoneCapped("s1", p1, max); err != nil {
+		t.Fatalf("RegisterPhoneCapped p1: %v", err)
+	}
+	if err := r.RegisterPhoneCapped("s1", p2, max); err != nil {
+		t.Fatalf("RegisterPhoneCapped p2: %v", err)
+	}
+	if err := r.RegisterPhoneCapped("s1", &fakeConn{id: "p-3"}, max); !errors.Is(err, ErrPhonesAtCap) {
+		t.Fatalf("RegisterPhoneCapped at cap: got %v, want errors.Is(_, ErrPhonesAtCap)", err)
+	}
+	r.UnregisterPhone("s1", "p-1")
+	p3 := &fakeConn{id: "p-3"}
+	if err := r.RegisterPhoneCapped("s1", p3, max); err != nil {
+		t.Fatalf("RegisterPhoneCapped after unregister: got %v, want nil", err)
+	}
+}
+
+func TestRegisterPhoneCapped_PerServerIDIndependent(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer s1: %v", err)
+	}
+	if err := r.ClaimServer("s2", &fakeConn{id: "b-2"}); err != nil {
+		t.Fatalf("ClaimServer s2: %v", err)
+	}
+	const max = 2
+	for i := 0; i < max; i++ {
+		if err := r.RegisterPhoneCapped("s1", &fakeConn{id: fmt.Sprintf("p-s1-%d", i)}, max); err != nil {
+			t.Fatalf("RegisterPhoneCapped s1 #%d: %v", i, err)
+		}
+	}
+	if err := r.RegisterPhoneCapped("s1", &fakeConn{id: "p-s1-over"}, max); !errors.Is(err, ErrPhonesAtCap) {
+		t.Fatalf("RegisterPhoneCapped s1 over: got %v, want ErrPhonesAtCap", err)
+	}
+	for i := 0; i < max; i++ {
+		if err := r.RegisterPhoneCapped("s2", &fakeConn{id: fmt.Sprintf("p-s2-%d", i)}, max); err != nil {
+			t.Fatalf("RegisterPhoneCapped s2 #%d (s1 at cap): %v", i, err)
+		}
+	}
+}
+
+// TestRegisterPhone_NoCapAfterDelegation pins the wrapper-delegation
+// contract: RegisterPhone passes max=0 to RegisterPhoneCapped, which
+// disables the cap. A regression that hard-codes a cap into the wrapper
+// would trip this test.
+func TestRegisterPhone_NoCapAfterDelegation(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		if err := r.RegisterPhone("s1", &fakeConn{id: fmt.Sprintf("p-%d", i)}); err != nil {
+			t.Fatalf("RegisterPhone #%d: %v", i, err)
+		}
+	}
+}
+
 func TestUnregisterPhone_RemovesByConnID(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
@@ -473,8 +562,10 @@ func TestRegistry_RaceFreedom(t *testing.T) {
 				_ = r.ClaimServer(sid, bin)
 				_, _ = r.BinaryFor(sid)
 				_ = r.RegisterPhone(sid, &fakeConn{id: fmt.Sprintf("p-%d-%d", g, i)})
+				_ = r.RegisterPhoneCapped(sid, &fakeConn{id: fmt.Sprintf("pc-%d-%d", g, i)}, 16)
 				_ = r.PhonesFor(sid)
 				r.UnregisterPhone(sid, fmt.Sprintf("p-%d-%d", g, i))
+				r.UnregisterPhone(sid, fmt.Sprintf("pc-%d-%d", g, i))
 				_, _ = r.Counts()
 				_ = r.ReleaseServer(sid)
 			}

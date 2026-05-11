@@ -5,6 +5,8 @@ package relay
 //
 //   - 1000 (StatusNormalClosure)        clean close on shutdown / unregister.
 //   - 4404 (no server with that id)     no binary currently holds the slot.
+//   - 4429 (too many phones for server-id)
+//                                       phones-per-server-id cap exceeded.
 //
 // The relay treats x-pyrycode-token as opaque — its presence is required,
 // its value is never parsed, compared, or logged. Token verification is the
@@ -27,7 +29,12 @@ import (
 //
 // maxFrameBytes is the per-frame read cap threaded into NewWSConn; see
 // docs/specs/architecture/29-wsconn-read-limit.md for the derivation.
-func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64) http.Handler {
+//
+// maxPhones caps the number of phones that may register against a single
+// server-id at one time; an over-cap registration is rejected with WS close
+// code 4429. maxPhones <= 0 disables the cap (used by tests that do not
+// exercise the boundary).
+func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxPhones int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		token := r.Header.Get("X-Pyrycode-Token")
@@ -53,13 +60,20 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64) http
 		connID := "client-" + serverID + "-" + randHex8()
 		wsconn := NewWSConn(c, connID, maxFrameBytes)
 
-		if err := reg.RegisterPhone(serverID, wsconn); err != nil {
+		if err := reg.RegisterPhoneCapped(serverID, wsconn, maxPhones); err != nil {
 			if errors.Is(err, ErrNoServer) {
 				// Stillborn WSConn — close directly on the underlying
 				// *websocket.Conn so the 4404 application code reaches the
 				// wire (WSConn.Close always emits StatusNormalClosure).
 				_ = c.Close(websocket.StatusCode(4404), "no server with that id")
 				logger.Info("phone_register_no_server",
+					"server_id", serverID,
+					"remote", remoteHost(r))
+				return
+			}
+			if errors.Is(err, ErrPhonesAtCap) {
+				_ = c.Close(websocket.StatusCode(4429), "too many phones for server-id")
+				logger.Info("phone_register_at_cap",
 					"server_id", serverID,
 					"remote", remoteHost(r))
 				return
