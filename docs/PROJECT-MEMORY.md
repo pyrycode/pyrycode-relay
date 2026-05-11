@@ -2,9 +2,11 @@
 
 Stateless WebSocket router between mobile clients and pyry binaries. Internet-exposed; adversarial input is the default assumption. Authoritative wire spec lives in `pyrycode/pyrycode/docs/protocol-mobile.md`.
 
+> **READ-ONLY FOR AGENTS (as of 2026-05-11).** All five pipeline agents have explicit "Never Update docs/PROJECT-MEMORY.md" rules. Per-ticket content (implementation, patterns, lessons) goes in [`docs/knowledge/codebase/<ticket>.md`](knowledge/codebase/). Humans maintain this file directly.
+
 ## What's built
 
-> **Convention (2026-05-10 onwards):** Per-ticket implementation summaries live in [`docs/knowledge/codebase/<ticket-number>.md`](knowledge/codebase/), one file per ticket. The table below is pre-2026-05-10 history — frozen, kept for context. See [`docs/knowledge/codebase/README.md`](knowledge/codebase/README.md) for the convention rationale.
+> **FROZEN.** Pre-2026-05-10 history. Per-ticket implementation summaries live in [`docs/knowledge/codebase/<ticket-number>.md`](knowledge/codebase/). The table below is kept for context — do not append.
 
 | Area | Status | Where |
 |---|---|---|
@@ -25,7 +27,9 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 | `conn_id` generation scheme | Not started | — |
 | Threat model doc — operational surface (deploy, supply chain, DoS, log hygiene, cert handling, TLS, error leakage) | Done (#11) | `docs/threat-model.md` |
 
-## Patterns established
+## Patterns established (frozen 2026-05-11)
+
+> **FROZEN.** Pre-2026-05-11 patterns. New per-ticket patterns live in `docs/knowledge/codebase/<N>.md`. Do not append here.
 
 - **Sentinel errors, branched via `errors.Is`** for validation failures at protocol boundaries. New routing-layer code follows the `Err...` naming and wraps with `fmt.Errorf("…: %w", err, sentinel)` when adding context.
 - **Opacity by type.** Inner-frame payloads are carried as `json.RawMessage`. The relay never deserialises payloads; the type makes that hard to violate accidentally.
