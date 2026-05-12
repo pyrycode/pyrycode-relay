@@ -1,0 +1,79 @@
+name: security-scan
+
+# Re-runs the same two security scanners that gate PRs (ci.yml's
+# `image-scan` job from #68 and `govulncheck` from `security` in #41)
+# against the latest `main` SHA on a daily schedule. The goal is to
+# surface CVEs disclosed against deps that have NOT changed since the
+# last PR — without a periodic re-scan these are invisible until the
+# next time someone bumps the affected dep. A failing run produces a
+# red row in the Actions list; auto-issue filing on top of that signal
+# lands in #73.
+on:
+  schedule:
+    # 06:00 UTC daily. Off-peak for US/EU/JP and keeps the
+    # disclosure-to-detection window under ~24h. See § Schedule
+    # cadence in 72-periodic-security-scan.md for rationale.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+# `contents: read` is the only permission needed: checkout + read-only
+# scans. The `issues: write` widening that #73 needs lives in #73,
+# scoped to its single issue-filing step, NOT here.
+permissions:
+  contents: read
+
+jobs:
+  image-scan:
+    runs-on: ubuntu-latest
+    # Belt-and-suspenders mirror of ci.yml's image-scan job: even
+    # though the workflow-level block already grants only
+    # `contents: read`, a future top-level escalation must not
+    # silently widen this job. Same convention as ci.yml.
+    permissions:
+      contents: read
+    steps:
+      # Explicit `ref: main` so a future change to the default-branch
+      # name or a manual `workflow_dispatch` invocation from a feature
+      # branch still scans `main` (the ticket's AC #2 names `main`).
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: build image
+        # Same artifact construction as ci.yml's image-scan job.
+        run: docker build -t pyrycode-relay:${{ github.sha }} .
+      # Tracks: aquasecurity/trivy-action@v0.36.0
+      # Pinned by commit SHA so a tag-swap upstream cannot change
+      # what runs against our image between Renovate bumps. Mirror
+      # of ci.yml's image-scan pin — must move in lockstep with that
+      # file when Renovate bumps the action.
+      - name: trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: pyrycode-relay:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      # Tracks: golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # Mirror of ci.yml's `security` job pin — must move in lockstep
+      # with that file when Renovate bumps the tag. Same rationale
+      # for a semver tag vs commit SHA documented in #41's spec
+      # (Go module checksum-DB makes a tag effectively immutable for
+      # `go install`).
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - name: govulncheck
+        run: govulncheck ./...
