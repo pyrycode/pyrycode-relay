@@ -30,7 +30,7 @@ One-line pointers into the evergreen knowledge base. Newest entries at the top o
 
 ## Architecture
 
-- [System overview](../architecture.md) — top-level: stateless WS router between phones and pyry binaries. (Lives at `docs/architecture.md`; not yet split into `architecture/`.)
+- [System overview](../architecture.md) — top-level: stateless WS router between phones and pyry binaries. Names the v1 single-instance constraint (in-memory registry → two replicas hold disjoint registries → silent `4404`), the two multi-instance paths documented as future work (shared registry; sticky-on-`x-pyrycode-server`), and the `PYRYCODE_RELAY_SINGLE_INSTANCE=1` bypass for the #65 startup self-check (#64). (Lives at `docs/architecture.md`; not yet split into `architecture/`.)
 
 ## Cross-cutting
 
