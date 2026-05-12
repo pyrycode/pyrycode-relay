@@ -39,3 +39,4 @@ Thumbs.db
 # and get auto-committed in pyrycode (commit 30f3d53). Same fix here
 # defensively before the same chain bites this repo.
 .codegraph
+.dispatcher.lock
