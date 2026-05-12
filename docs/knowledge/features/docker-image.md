@@ -2,7 +2,7 @@
 
 Host-agnostic OCI image for the relay, produced by a multi-stage `Dockerfile` at the repo root. Image-layer hardening (small base, no shell, no package manager, non-root, digest-pinned bases, stripped static binary) is defence-in-depth on top of the runtime hardening already in place (autocert cache permission check, slow-loris timeouts, header-gate before WS upgrade, 256 KiB frame cap, opaque payload routing).
 
-The image is intentionally **portable, not deployable on its own**: it exposes both `:80` and `:443` and declares a volume mount at `/var/lib/relay/autocert`, but TLS termination policy, port publishing, volume backing, single-instance enforcement, and healthcheck wiring are decisions the host manifest owns (#38 / #39 / #42).
+The image is intentionally **portable, not deployable on its own**: it exposes both `:80` and `:443` and declares a volume mount at `/var/lib/relay/autocert`, but TLS termination policy, port publishing, volume backing, single-instance enforcement, and healthcheck wiring are decisions the host manifest owns. The host wiring landed as `fly.toml` + CI auto-deploy in #38 ([Feature: Fly.io deploy](fly-deploy.md)); single-instance binary-level self-check in #65 (#39 / #42 deferrals).
 
 ## Build and verification
 
@@ -28,7 +28,7 @@ go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
 - `CGO_ENABLED=0` → fully-static binary that runs on distroless/static (no glibc on the runtime image).
 - `-trimpath` → strips host build paths from the binary; defends against accidental disclosure of build-host directory structure via panic stack traces.
 - `-s -w` → strips symbol table and DWARF; reduces post-exploitation reverse-engineering convenience and signals build hygiene.
-- `-X main.Version=${VERSION}` → mirrors the `Makefile`'s `LDFLAGS`. Image builds default to `VERSION=dev` (matches the bare-binary default); release tooling lands in #38 and overrides via `--build-arg VERSION=…`.
+- `-X main.Version=${VERSION}` → mirrors the `Makefile`'s `LDFLAGS`. Image builds default to `VERSION=dev` (matches the bare-binary default); a release-tooling override via `--build-arg VERSION=…` remains available for future use (not wired into #38's CI deploy, which builds from `Dockerfile` defaults via `flyctl deploy --remote-only`).
 
 `go mod download` runs in a separate layer before `COPY . .` so source-only edits don't bust the dependency-cache layer.
 
@@ -37,7 +37,7 @@ go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
 `gcr.io/distroless/static-debian12:nonroot@sha256:…` (digest-pinned). The distroless `:nonroot` variant runs as uid `65532` upstream; the Dockerfile re-asserts `USER nonroot:nonroot` as belt-and-suspenders so a future base swap can't silently regress the invariant. The binary is the only thing in the runtime image — no shell, no package manager, no `apt`/`apk`, no `/etc/passwd` games.
 
 - `EXPOSE 80 443` — `:80` for autocert ACME http-01 challenges, `:443` for WSS. The portable artifact exposes both; the host manifest chooses publish-both (autocert mode) or publish-neither (`--insecure-listen` behind a reverse proxy).
-- `VOLUME ["/var/lib/relay/autocert"]` — documented mount point for the autocert cache. Without a mount, `--cert-cache` defaults to `/home/nonroot/.pyrycode-relay/certs` (degraded posture: cache vanishes on container restart, forces re-issuance). The host manifest (#38) wires a real backing store.
+- `VOLUME ["/var/lib/relay/autocert"]` — documented mount point for the autocert cache. Without a mount, `--cert-cache` defaults to `/home/nonroot/.pyrycode-relay/certs` (degraded posture: cache vanishes on container restart, forces re-issuance). `fly.toml`'s `[[mounts]]` block (#38) wires a Fly volume `relay_autocert` to this path; `[processes] app = "... --cert-cache /var/lib/relay/autocert"` is set explicitly so autocert writes into the persistent volume rather than the unmounted default.
 - `ENTRYPOINT ["/pyrycode-relay"]` — args at `docker run` go straight to the binary (`--domain …`, `--insecure-listen …`, etc.).
 
 ## Digest pinning convention
@@ -66,8 +66,8 @@ The image layer contributes hardening to three operational surfaces (see `docs/t
 
 ## What this artifact deliberately does NOT do
 
-- **No `HEALTHCHECK` directive.** `/healthz` (#10) is already exposed; platform health checks belong in the host manifest (#38), not in the portable artifact.
-- **No host-specific config.** No `fly.toml`, `compose.yaml`, k8s manifest, or systemd unit — those live in #38.
+- **No `HEALTHCHECK` directive.** `/healthz` (#10) is already exposed; platform health checks belong in the host manifest (`fly.toml`, #38), not in the portable artifact.
+- **No host-specific config inside the image.** `fly.toml` (#38) sits at the repo root, not in the build context (its contents land at deploy time via `flyctl`, not as image bytes).
 - **No single-instance enforcement.** The relay's binary-slot single-instance constraint is #39's problem; the image can be run N times, but only one will hold the slot.
 - **No startup security-posture self-check.** #42 covers runtime self-validation.
 - **No `--cert-cache` baked in.** The default (`/home/nonroot/.pyrycode-relay/certs`) is only relevant for `--version` smoke tests; real deployments pass `--cert-cache /var/lib/relay/autocert` via the host manifest.
@@ -87,4 +87,5 @@ On a red cron run, a third `file-issue` job (added in #73, scoped to `issues: wr
 - [Spec: 32-dockerfile-base-hardening](../../specs/architecture/32-dockerfile-base-hardening.md) — architect's design and security review.
 - [Threat model](../../threat-model.md) — § *Deploy security*, § *Supply chain*, § *Cert & key handling* are the surfaces this image layer hardens.
 - [Autocert TLS](autocert-tls.md) — what the `:80` / `:443` exposure and `/var/lib/relay/autocert` mount feed.
-- [`/healthz` endpoint](healthz.md) — what platform health checks will probe (wired in #38, not here).
+- [`/healthz` endpoint](healthz.md) — what platform health checks would probe (no `HEALTHCHECK` wired by #38; available for future use).
+- [Feature: Fly.io deploy](fly-deploy.md) — the host manifest + CI auto-deploy that wires this image to production (#38).

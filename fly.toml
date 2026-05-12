@@ -1,0 +1,73 @@
+# Fly.io manifest for pyrycode-relay.
+#
+# Decisions encoded here (see docs/architecture.md § Hosting):
+#   - Fly is a TCP-passthrough substrate; TLS terminates in the relay
+#     binary via autocert (#9). NO Fly HTTP proxy or Fly-managed certs.
+#   - Port 80 carries ACME HTTP-01 challenge traffic and the explicit
+#     404 fallback for non-challenge requests (ADR-0002). Both arrive at
+#     the relay verbatim — Fly must not insert any HTTP handler.
+#   - Single-machine hard cap. The relay's connection registry is
+#     in-process; multi-instance silently routes phones to the wrong
+#     replica. See docs/architecture.md § Single-instance constraint.
+#     `flyctl scale count > 1` violates this invariant — the platform
+#     itself does not enforce a ceiling, so operator discipline plus
+#     the in-binary self-check (#65) is the load-bearing control.
+
+app = "pyrycode-relay"
+primary_region = "__REGION__"   # operator fills at bootstrap; see docs/deploy.md.
+
+[build]
+  dockerfile = "Dockerfile"
+
+# --domain and --cert-cache passed as literal argv (distroless has no
+# shell; env-var expansion into argv is not available). A domain change
+# is a one-line edit to this file — config, not code — and rides the
+# next deploy.
+[processes]
+  app = "--domain __DOMAIN__ --cert-cache /var/lib/relay/autocert"
+
+[[mounts]]
+  source = "relay_autocert"
+  destination = "/var/lib/relay/autocert"
+  # initial_size omitted; default is sufficient for autocert's
+  # account-key + per-domain cert (≤ a few KiB). Resize is operator-side.
+
+# Raw TCP services. NO `handlers = ["http"]` / `handlers = ["tls"]` —
+# either would terminate at Fly's edge and break autocert.
+[[services]]
+  protocol = "tcp"
+  internal_port = 80
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    # handlers omitted on purpose: an unset list is pass-through. An
+    # explicit `handlers = ["http"]` here would steal port 80 from the
+    # autocert HTTP-01 listener and ADR-0002's 404 fallback.
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 443
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 443
+    # handlers omitted on purpose: any value here (e.g. ["tls"]) would
+    # terminate TLS at Fly's edge and require a Fly-managed cert,
+    # bypassing autocert.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[deploy]
+  # Single machine — rolling/canary are inapplicable. `immediate`
+  # replaces in place; a brief drop in availability during deploy is
+  # acceptable (clients reconnect; no state to drain).
+  strategy = "immediate"
+  # Redundant with a 1-machine fleet, but documents intent.
+  max_unavailable = 1
