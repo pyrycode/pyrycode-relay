@@ -2,7 +2,9 @@
 
 The relay holds a private `*prometheus.Registry` and serves it over a Prometheus-format `/metrics` handler. The registry is constructed per process; sibling tickets register counters / gauges / histograms against it. `prometheus.DefaultRegisterer` is never touched.
 
-This page documents the scaffolding only — what the seam is, why it has the shape it does, and where the rules are recorded. The first counter / gauge lands in sibling tickets; the `/metrics` listener wiring lives in #60.
+This page documents the scaffolding only — what the seam is, why it has the shape it does, and where the rules are recorded. The `/metrics` listener wiring lives in #60.
+
+The first collector to plug into the seam landed in #61: see [Connection-count gauges](connection-count-gauges.md) for the pull-based `connectionsCollector` exposing `pyrycode_relay_connected_{binaries,phones}` over `Registry.Counts()`. Sibling counter/histogram tickets (#57, #58) follow.
 
 ## API
 
@@ -77,7 +79,7 @@ Structurally out of bounds:
 
 ## What this deliberately does NOT do
 
-- No counters, no gauges, no histograms — siblings (#57, #58, future) own those.
+- No counters, no histograms here — siblings (#57, #58, future) own those. The first gauge collector (`connectionsCollector`) landed in #61 as a pull-based reader of `Registry.Counts()`; see [Connection-count gauges](connection-count-gauges.md).
 - No listener — `/metrics` is not bound to a `mux` in this ticket. #60 owns the listener (flag, bind-address validation, `http.Server` timeouts).
 - No process / Go-runtime collectors.
 - No `ErrorLog` wiring from `promhttp` into `slog`.
