@@ -74,7 +74,9 @@ The image layer contributes hardening to three operational surfaces (see `docs/t
 
 ## CI image scanning
 
-PR-time scanning is wired in `.github/workflows/ci.yml` as the `image-scan` job (#68). Each PR builds the image locally as `pyrycode-relay:${{ github.sha }}` and runs `aquasecurity/trivy-action` (commit-SHA pinned, `# Tracks: <upstream-tag>` comment alongside — same convention as the Dockerfile base-image digest pins) against it. The job fails on **fixable** CRITICAL/HIGH CVEs only (`ignore-unfixed: true`); unfixed CVEs print but don't block. Covers `os,library` vuln types — distroless's OS package set plus Go-binary content Trivy re-derives, intentionally overlapping with `govulncheck`'s source-reachability view. Periodic re-scan (catches CVEs disclosed after merge against unchanged bases) is a follow-up ticket.
+PR-time scanning is wired in `.github/workflows/ci.yml` as the `image-scan` job (#68). Each PR builds the image locally as `pyrycode-relay:${{ github.sha }}` and runs `aquasecurity/trivy-action` (commit-SHA pinned, `# Tracks: <upstream-tag>` comment alongside — same convention as the Dockerfile base-image digest pins) against it. The job fails on **fixable** CRITICAL/HIGH CVEs only (`ignore-unfixed: true`); unfixed CVEs print but don't block. Covers `os,library` vuln types — distroless's OS package set plus Go-binary content Trivy re-derives, intentionally overlapping with `govulncheck`'s source-reachability view.
+
+Post-merge scanning lives in `.github/workflows/security-scan.yml` as a separate workflow on a daily `0 6 * * *` UTC cron + `workflow_dispatch` (#72). Same scanner, same pins (lockstep with `ci.yml` via `# Tracks:` comments), same flags — re-runs both the image-side Trivy job and the source-side `govulncheck` job against the latest `main` SHA, so a CVE disclosed against deps that haven't changed since the last PR surfaces as a red row in the Actions list within ≤24h instead of staying invisible until the next dep bump. Auto-issue filing on a red cron run is a follow-up (#73).
 
 ## Cross-links
 
