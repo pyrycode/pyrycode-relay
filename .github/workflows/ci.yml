@@ -82,3 +82,31 @@ jobs:
           # Trivy audits what physically shipped in the image.
           vuln-type: os,library
           exit-code: '1'
+
+  deploy:
+    # Runs only on push to main. PRs (including from forks) never satisfy
+    # this condition, so `FLY_API_TOKEN` is structurally unreachable from
+    # any job that runs untrusted PR code.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, security, image-scan]
+    runs-on: ubuntu-latest
+    # Belt-and-suspenders: the workflow-level permissions block above
+    # already grants only `contents: read`, but a future top-level
+    # escalation would silently widen this job's scope. Pin the minimum
+    # here so the deploy job stays read-only against the repo even if
+    # the header drifts. `flyctl` itself authenticates to Fly via
+    # `FLY_API_TOKEN`, not via GitHub permissions.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      # Tracks: superfly/flyctl-actions/setup-flyctl@1.6
+      # Pinned by commit SHA so a tag-swap upstream cannot change what
+      # holds `FLY_API_TOKEN` during the next deploy. Refresh the comment
+      # in lockstep with the SHA. Same convention as the Trivy pin in
+      # `image-scan` (#68) and the govulncheck pin in `security` (#41).
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: flyctl deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
