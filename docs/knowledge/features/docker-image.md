@@ -70,12 +70,16 @@ The image layer contributes hardening to three operational surfaces (see `docs/t
 - **No host-specific config.** No `fly.toml`, `compose.yaml`, k8s manifest, or systemd unit — those live in #38.
 - **No single-instance enforcement.** The relay's binary-slot single-instance constraint is #39's problem; the image can be run N times, but only one will hold the slot.
 - **No startup security-posture self-check.** #42 covers runtime self-validation.
-- **No image scanning wiring.** Trivy / Grype in CI is a separate ticket, not yet filed.
 - **No `--cert-cache` baked in.** The default (`/home/nonroot/.pyrycode-relay/certs`) is only relevant for `--version` smoke tests; real deployments pass `--cert-cache /var/lib/relay/autocert` via the host manifest.
+
+## CI image scanning
+
+PR-time scanning is wired in `.github/workflows/ci.yml` as the `image-scan` job (#68). Each PR builds the image locally as `pyrycode-relay:${{ github.sha }}` and runs `aquasecurity/trivy-action` (commit-SHA pinned, `# Tracks: <upstream-tag>` comment alongside — same convention as the Dockerfile base-image digest pins) against it. The job fails on **fixable** CRITICAL/HIGH CVEs only (`ignore-unfixed: true`); unfixed CVEs print but don't block. Covers `os,library` vuln types — distroless's OS package set plus Go-binary content Trivy re-derives, intentionally overlapping with `govulncheck`'s source-reachability view. Periodic re-scan (catches CVEs disclosed after merge against unchanged bases) is a follow-up ticket.
 
 ## Cross-links
 
 - [Ticket #32 codebase notes](../codebase/32.md) — what landed in this ticket.
+- [Ticket #68 codebase notes](../codebase/68.md) — PR-time Trivy image CVE scan in CI.
 - [Spec: 32-dockerfile-base-hardening](../../specs/architecture/32-dockerfile-base-hardening.md) — architect's design and security review.
 - [Threat model](../../threat-model.md) — § *Deploy security*, § *Supply chain*, § *Cert & key handling* are the surfaces this image layer hardens.
 - [Autocert TLS](autocert-tls.md) — what the `:80` / `:443` exposure and `/var/lib/relay/autocert` mount feed.
