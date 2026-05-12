@@ -62,6 +62,14 @@ Intended uses:
 
 **NOT recommended for production.** Setting it permanently silences a check whose entire purpose is to catch the silent-routing-failure mode described above.
 
+## Hosting
+
+Production deploys to a single **Fly.io** machine in one region. TLS terminates in the relay binary (autocert, #9) — Fly runs the substrate in raw-TCP passthrough mode on `:80` and `:443`, with a dedicated IPv4 so Let's Encrypt's HTTP-01 challenge resolves deterministically. The autocert cache lives on a Fly volume at `/var/lib/relay/autocert`.
+
+The single-machine cap is platform-enforced via `min_machines_running = 1`, `auto_start_machines = false`, and `auto_stop_machines = "off"` in `fly.toml`, and binary-enforced via the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65). Multi-instance scaling is out of scope for v1 — see § *Single-instance constraint* above.
+
+Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). CI deploy job: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
 ## Threat model
 
 Wire-protocol threats live in the protocol spec's [Security model](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#security-model). Operational threats specific to the relay binary as a deployed process — deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error-leakage — live in [`docs/threat-model.md`](./threat-model.md).
