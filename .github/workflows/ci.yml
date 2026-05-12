@@ -32,8 +32,15 @@ jobs:
           go-version: '1.26.x'
       - name: install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+      # Tracks: golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # Pinned to an explicit version so a compromised or buggy upstream
+      # release cannot silently land in CI between Renovate bumps. The
+      # tracked tag in this comment must move in lockstep with the
+      # `@vX.Y.Z` below — same convention as the Trivy action pin in the
+      # `image-scan` job (#68) and the Dockerfile base-image digest pins
+      # (#32).
       - name: install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
       - name: gosec
         run: gosec ./...
       - name: govulncheck
