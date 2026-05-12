@@ -38,3 +38,40 @@ jobs:
         run: gosec ./...
       - name: govulncheck
         run: govulncheck ./...
+
+  image-scan:
+    runs-on: ubuntu-latest
+    # Belt-and-suspenders: the workflow-level permissions block above
+    # already grants only `contents: read`, but a future top-level
+    # escalation would silently widen this job's scope without the
+    # explicit declaration. Pin the minimum here so a regression in the
+    # workflow header doesn't grant the scanner write tokens.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: build image
+        # The scan operates on the same artifact a PR would publish.
+        run: docker build -t pyrycode-relay:${{ github.sha }} .
+      # Tracks: aquasecurity/trivy-action@v0.36.0
+      # Pinned by commit SHA so a tag-swap upstream cannot change what
+      # runs against our image between Renovate bumps. Refresh the
+      # comment in lockstep with the SHA so a reviewer can sanity-check
+      # which release the digest refers to. Same convention as the
+      # Dockerfile base-image digest pins (#32).
+      - name: trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: pyrycode-relay:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          # Only fixable CVEs fail the build. CVEs with no upstream
+          # patch produce no actionable work and would block every PR
+          # until someone unrelated to the change fixes them.
+          ignore-unfixed: true
+          # Cover both OS packages and language manifests / Go binary
+          # content Trivy can re-derive. Some overlap with govulncheck
+          # (#41) is intentional: govulncheck audits source + reachability;
+          # Trivy audits what physically shipped in the image.
+          vuln-type: os,library
+          exit-code: '1'
