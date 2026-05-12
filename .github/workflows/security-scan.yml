@@ -5,9 +5,10 @@ name: security-scan
 # against the latest `main` SHA on a daily schedule. The goal is to
 # surface CVEs disclosed against deps that have NOT changed since the
 # last PR — without a periodic re-scan these are invisible until the
-# next time someone bumps the affected dep. A failing run produces a
-# red row in the Actions list; auto-issue filing on top of that signal
-# lands in #73.
+# next time someone bumps the affected dep. A failing scanner job
+# produces a red row in the Actions list AND triggers `file-issue`
+# below, which opens a labelled GitHub issue so the regression has an
+# owner (see #73).
 on:
   schedule:
     # 06:00 UTC daily. Off-peak for US/EU/JP and keeps the
@@ -16,11 +17,21 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
 
-# `contents: read` is the only permission needed: checkout + read-only
-# scans. The `issues: write` widening that #73 needs lives in #73,
-# scoped to its single issue-filing step, NOT here.
+# `contents: read` is the only workflow-level permission. The
+# `issues: write` widening this workflow needs lives in the
+# `file-issue` job below, scoped to that single job (NOT widened
+# here). AC #3 on #73 mandates job-level scoping; a future
+# maintainer should NOT promote `issues: write` to this block.
 permissions:
   contents: read
+
+# Coalesce overlapping runs (a manual `workflow_dispatch` firing
+# while a scheduled run is in flight, or vice versa). Queueing rather
+# than cancelling avoids leaving artifacts half-uploaded between the
+# scanner jobs and `file-issue`.
+concurrency:
+  group: security-scan
+  cancel-in-progress: false
 
 jobs:
   image-scan:
@@ -46,15 +57,73 @@ jobs:
       # what runs against our image between Renovate bumps. Mirror
       # of ci.yml's image-scan pin — must move in lockstep with that
       # file when Renovate bumps the action.
+      #
+      # `format: json` + `output: trivy.json` differs from ci.yml's
+      # `format: table`: the cron path machine-parses the output to
+      # render an issue body, the PR path only needs human-readable
+      # console output. Policy flags (severity, ignore-unfixed,
+      # vuln-type, exit-code) are unchanged.
       - name: trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           image-ref: pyrycode-relay:${{ github.sha }}
-          format: table
+          format: json
+          output: trivy.json
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           vuln-type: os,library
           exit-code: '1'
+      - name: render issue from trivy output
+        if: failure()
+        run: |
+          set -euo pipefail
+          primary_cve=$(jq -r '
+            [ .Results[]?.Vulnerabilities[]? ]
+            | sort_by(.Severity) | reverse | .[0].VulnerabilityID // empty
+          ' trivy.json)
+          primary_pkg=$(jq -r '
+            [ .Results[]?.Vulnerabilities[]? ]
+            | sort_by(.Severity) | reverse | .[0]
+            | "\(.PkgName // "unknown")@\(.InstalledVersion // "unknown")"
+          ' trivy.json)
+          # If trivy.json has no parseable vulnerabilities (e.g. the
+          # action failed before producing output, or produced an
+          # empty results array), there is nothing to file — skip
+          # rendering and leave the red workflow row as the sole
+          # signal. The upload step's hashFiles() guard ensures no
+          # artifact is uploaded in this case.
+          if [ -z "$primary_cve" ]; then
+            echo "no parseable CVEs in trivy.json — skipping issue render"
+            exit 0
+          fi
+          printf 'security-scan regression: %s in image package %s\n' \
+            "$primary_cve" "$primary_pkg" > issue-title.txt
+          {
+            printf '## Periodic security-scan regression\n\n'
+            printf '**Scanner:** Trivy (image scan)\n'
+            printf '**Primary finding:** `%s` in `%s`\n' "$primary_cve" "$primary_pkg"
+            printf '**Workflow run:** %s/%s/actions/runs/%s\n\n' \
+              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+            printf '### All findings\n\n```\n'
+            jq -r '
+              .Results[]?.Vulnerabilities[]?
+              | "\(.Severity)\t\(.VulnerabilityID)\t\(.PkgName)@\(.InstalledVersion)\t\(.FixedVersion // "no fix")"
+            ' trivy.json | sort -u | head -100
+            printf '```\n\n### Triage\n'
+            printf -- '- Bump the offending dependency or base-image digest.\n'
+            printf -- '- Verify the next `security-scan` workflow run is green.\n'
+            printf -- '- Close this issue once the next run passes.\n'
+          } > issue-body.md
+      - name: upload issue artifact
+        if: failure() && hashFiles('issue-title.txt') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: regression-image-scan
+          path: |
+            issue-title.txt
+            issue-body.md
+          retention-days: 7
+          if-no-files-found: ignore
 
   govulncheck:
     runs-on: ubuntu-latest
@@ -75,5 +144,119 @@ jobs:
       # `go install`).
       - name: install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # `-json` differs from ci.yml's plain `govulncheck ./...`: the
+      # cron path machine-parses the output to render an issue body.
+      # `set -o pipefail` documents intent and protects future
+      # refactors that pipe through `tee` for log visibility.
       - name: govulncheck
-        run: govulncheck ./...
+        run: |
+          set -o pipefail
+          govulncheck -json ./... > govulncheck.json
+      - name: render issue from govulncheck output
+        if: failure()
+        run: |
+          set -euo pipefail
+          # govulncheck -json emits newline-delimited records; pick
+          # out the OSV.id from the "osv" record kind.
+          primary_id=$(jq -rs '
+            [ .[] | select(.osv?.id?) | .osv.id ] | .[0] // empty
+          ' govulncheck.json)
+          primary_mod=$(jq -rs '
+            [ .[] | select(.osv?.affected?) | .osv.affected[0].package.name ]
+            | .[0] // "unknown"
+          ' govulncheck.json)
+          if [ -z "$primary_id" ]; then
+            echo "no parseable vulns in govulncheck.json — skipping issue render"
+            exit 0
+          fi
+          printf 'security-scan regression: %s in Go module %s\n' \
+            "$primary_id" "$primary_mod" > issue-title.txt
+          {
+            printf '## Periodic security-scan regression\n\n'
+            printf '**Scanner:** govulncheck (Go modules)\n'
+            printf '**Primary finding:** `%s` in `%s`\n' "$primary_id" "$primary_mod"
+            printf '**Workflow run:** %s/%s/actions/runs/%s\n\n' \
+              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+            printf '### All findings\n\n```\n'
+            jq -rs '
+              .[] | select(.osv?.id?)
+              | "\(.osv.id)\t\(.osv.affected[0].package.name // "unknown")"
+            ' govulncheck.json | sort -u | head -100
+            printf '```\n\n### Triage\n'
+            printf -- '- Run `govulncheck ./...` locally against the named module to see call-site traces.\n'
+            printf -- '- Bump the offending dependency.\n'
+            printf -- '- Verify the next `security-scan` workflow run is green.\n'
+            printf -- '- Close this issue once the next run passes.\n'
+          } > issue-body.md
+      - name: upload issue artifact
+        if: failure() && hashFiles('issue-title.txt') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: regression-govulncheck
+          path: |
+            issue-title.txt
+            issue-body.md
+          retention-days: 7
+          if-no-files-found: ignore
+
+  file-issue:
+    needs: [image-scan, govulncheck]
+    if: failure()
+    runs-on: ubuntu-latest
+    # `issues: write` is granted at the JOB level — per AC #3 on #73
+    # it must NOT be promoted to the workflow-level permissions block.
+    # The scanner jobs above run untrusted scanner code and keep
+    # `contents: read` only; this job does no scanning and only posts
+    # pre-rendered content via `gh`.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: download regression artifacts
+        uses: actions/download-artifact@v5
+        with:
+          # Matches both `regression-image-scan` and
+          # `regression-govulncheck`. Missing artifacts (e.g. one
+          # scanner failed for a non-CVE reason and produced no
+          # artifact) are silently absent.
+          pattern: regression-*
+          path: artifacts
+          merge-multiple: false
+      - name: file issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for dir in artifacts/regression-*; do
+            title=$(cat "$dir/issue-title.txt")
+            body_file="$dir/issue-body.md"
+            # Dedup: search open security-sensitive issues for one
+            # whose title matches the full deterministic string we
+            # are about to file. `in:title` avoids matching unrelated
+            # issues whose body happens to mention the CVE id. State
+            # filter is `open` so a regression of a previously-closed
+            # CVE files a fresh issue.
+            existing=$(gh issue list \
+              --repo "$REPO" \
+              --state open \
+              --label security-sensitive \
+              --search "in:title \"$title\"" \
+              --json number \
+              --jq 'length')
+            if [ "$existing" -gt 0 ]; then
+              echo "duplicate suppressed for: $title"
+              continue
+            fi
+            # `--body-file` (not `--body "<...>"`) so scanner-derived
+            # content (CVE descriptions, package version strings with
+            # backticks or `$`) never passes through shell-argument
+            # expansion. Title is the rendered single-line string we
+            # wrote ourselves — ASCII by construction.
+            gh issue create \
+              --repo "$REPO" \
+              --title "$title" \
+              --body-file "$body_file" \
+              --label security-sensitive
+          done
