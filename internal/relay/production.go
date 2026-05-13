@@ -44,3 +44,34 @@ func CheckInsecureListenInProduction(insecureListen string, getenv func(string) 
 	}
 	return nil
 }
+
+// ErrRunningAsRoot is returned by CheckRunningAsRoot when the relay is
+// configured for production mode (PYRYCODE_RELAY_PRODUCTION=1) AND the
+// effective uid is 0. Running an internet-exposed process as root in
+// production is a fail-fast misconfiguration, not a runtime degradation:
+// a `docker run --user 0` at deploy time or a missing/overridden USER
+// directive escapes the CI non-root-build check, and any RCE in the relay
+// would then escalate to a root RCE on the host. The relay refuses to
+// start so the misconfigured deploy fails its health check rather than
+// serving traffic.
+var ErrRunningAsRoot = errors.New("relay: effective uid is 0 with PYRYCODE_RELAY_PRODUCTION=1; refusing to start")
+
+// CheckRunningAsRoot returns ErrRunningAsRoot when production mode is on
+// (per IsProductionMode) AND geteuid returns 0. Returns nil otherwise.
+// Intended to be called from main after flag parse, before any listener
+// is started.
+//
+// geteuid is the effective-uid lookup function; pass syscall.Geteuid at
+// the call site, an injected func in tests. The seam exists because no
+// stdlib equivalent of t.Setenv exists for uid (a process cannot change
+// its own euid mid-test without re-exec), so the uid-0 branch can only
+// be exercised in a unit test via an injected function.
+//
+// getenv is the env-var lookup function; pass os.Getenv at the call
+// site, an injected func in tests.
+func CheckRunningAsRoot(geteuid func() int, getenv func(string) string) error {
+	if IsProductionMode(getenv) && geteuid() == 0 {
+		return ErrRunningAsRoot
+	}
+	return nil
+}

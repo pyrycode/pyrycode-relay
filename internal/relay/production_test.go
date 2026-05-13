@@ -117,3 +117,82 @@ func TestErrInsecureListenInProduction_IsBranchable(t *testing.T) {
 		t.Errorf("returned error %v should satisfy errors.Is(err, ErrInsecureListenInProduction)", err)
 	}
 }
+
+func fakeGeteuid(n int) func() int {
+	return func() int { return n }
+}
+
+func TestCheckRunningAsRoot_Matrix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		productionMode string // "" with setEnv=false means unset
+		setEnv         bool
+		uid            int
+		wantSentinel   bool
+	}{
+		{
+			name:         "non-production + uid 0 returns nil",
+			setEnv:       false,
+			uid:          0,
+			wantSentinel: false,
+		},
+		{
+			name:           "production + uid 1000 returns nil",
+			productionMode: "1",
+			setEnv:         true,
+			uid:            1000,
+			wantSentinel:   false,
+		},
+		{
+			name:           "production + uid 0 returns sentinel",
+			productionMode: "1",
+			setEnv:         true,
+			uid:            0,
+			wantSentinel:   true,
+		},
+		{
+			name:           "production + nobody uid 65534 returns nil",
+			productionMode: "1",
+			setEnv:         true,
+			uid:            65534,
+			wantSentinel:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := map[string]string{}
+			if tc.setEnv {
+				env[envProductionMode] = tc.productionMode
+			}
+			err := CheckRunningAsRoot(fakeGeteuid(tc.uid), fakeGetenv(env))
+			if tc.wantSentinel {
+				if !errors.Is(err, ErrRunningAsRoot) {
+					t.Errorf("got err %v, want errors.Is(err, ErrRunningAsRoot)", err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("got err %v, want nil", err)
+				}
+			}
+		})
+	}
+}
+
+func TestErrRunningAsRoot_IsBranchable(t *testing.T) {
+	t.Parallel()
+
+	if !errors.Is(ErrRunningAsRoot, ErrRunningAsRoot) {
+		t.Fatal("ErrRunningAsRoot should be errors.Is itself")
+	}
+
+	env := map[string]string{envProductionMode: "1"}
+	err := CheckRunningAsRoot(fakeGeteuid(0), fakeGetenv(env))
+	if !errors.Is(err, ErrRunningAsRoot) {
+		t.Errorf("returned error %v should satisfy errors.Is(err, ErrRunningAsRoot)", err)
+	}
+}
