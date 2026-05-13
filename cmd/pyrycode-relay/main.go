@@ -29,7 +29,11 @@ func main() {
 		certCache      = flag.String("cert-cache", defaultCertCache(), "Directory for autocert's TLS certificate cache.")
 		insecureListen = flag.String("insecure-listen", "", "Listen address for plain HTTP (e.g. :8080). Disables autocert; use only when fronted by a reverse proxy.")
 		metricsListen  = flag.String("metrics-listen", "127.0.0.1:9090", "Listen address for the /metrics endpoint. Must be a loopback IP literal (e.g. 127.0.0.1:9090, [::1]:9090). Empty disables.")
-		showVersion    = flag.Bool("version", false, "Print version and exit.")
+		trustXFF       = flag.Bool("trust-x-forwarded-for", false,
+			"Trust the X-Forwarded-For header as the source IP for per-IP rate limiting. "+
+				"WARNING: enabling this without a trusted reverse proxy in front of the relay "+
+				"allows clients to spoof their source IP and bypass per-IP rate limits.")
+		showVersion = flag.Bool("version", false, "Print version and exit.")
 	)
 	flag.Parse()
 
@@ -121,12 +125,33 @@ func main() {
 	// four orders of magnitude below nhooyr's 32 MiB default).
 	const maxFrameBytes int64 = 256 * 1024
 
+	// Per-IP rate-limit policy: ~10 attempts/IP/minute steady-state, burst
+	// 20. Derivation: docs/threat-model.md § DoS resistance future-hardening
+	// line names ~10/min/IP and burst headroom for retry storms; the 5-min
+	// eviction sweep keeps the bucket map's resident size bounded under
+	// address-space scanning (docs/specs/architecture/50-ip-rate-limiter.md
+	// § Adversarial walk). All three values must be positive — NewIPRateLimiter
+	// panics on a zero/negative evictionInterval via time.NewTicker.
+	const (
+		rateLimitRefillEvery      = 6 * time.Second
+		rateLimitBurst            = 20
+		rateLimitEvictionInterval = 5 * time.Minute
+	)
+	limiter := relay.NewIPRateLimiter(rateLimitRefillEvery, rateLimitBurst, rateLimitEvictionInterval)
+	// Best-effort: the current listener block calls os.Exit on error, which
+	// skips defers. A real graceful-shutdown path (signal handler + server
+	// Shutdown) is out of scope per #47; this defer runs on clean returns
+	// (e.g. --version above does not reach here, but future test entry
+	// points might).
+	defer limiter.Close()
+	rateLimit := relay.NewRateLimitMiddleware(limiter, logger, *trustXFF)
+
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
-	mux.Handle("/v1/server", relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes))
+	mux.Handle("/v1/server", rateLimit(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes)))
 	// maxPhones=16 caps phones per server-id; over-cap registrations are
 	// rejected with WS close 4429. Per #30 architect spec.
-	mux.Handle("/v1/client", relay.ClientHandler(reg, logger, maxFrameBytes, 16))
+	mux.Handle("/v1/client", rateLimit(relay.ClientHandler(reg, logger, maxFrameBytes, 16)))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
