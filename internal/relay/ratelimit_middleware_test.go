@@ -260,7 +260,7 @@ func TestRateLimitMiddleware_RegistryNotTouchedOnDeny(t *testing.T) {
 	l := newMiddlewareTestLimiter(t, 1)
 	reg := NewRegistry()
 	logger := discardLogger()
-	wrapped := NewRateLimitMiddleware(l, logger, false)(ServerHandler(reg, logger, time.Second, 256*1024))
+	wrapped := NewRateLimitMiddleware(l, logger, false)(ServerHandler(reg, logger, time.Second, 256*1024, nil))
 
 	// Exhaust the bucket without going through the WS handler (no headers,
 	// so even if it did run it would 400 — but the deny must short-circuit

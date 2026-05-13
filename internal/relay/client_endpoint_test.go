@@ -22,7 +22,7 @@ func startClient(t *testing.T) (*Registry, string, func()) {
 	t.Helper()
 	reg := NewRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0))
+	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0, nil))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	return reg, wsURL, srv.Close
 }
@@ -33,7 +33,7 @@ func startClientWithCap(t *testing.T, maxPhones int) (*Registry, string, func())
 	t.Helper()
 	reg := NewRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, maxPhones))
+	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, maxPhones, nil))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	return reg, wsURL, srv.Close
 }
@@ -122,7 +122,7 @@ func TestClientEndpoint_HeaderGate_400(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0))
+			srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0, nil))
 			defer srv.Close()
 
 			req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)

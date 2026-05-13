@@ -35,13 +35,17 @@ import (
 //
 // maxFrameBytes is the per-frame read cap threaded into NewWSConn; see
 // docs/specs/architecture/29-wsconn-read-limit.md for the derivation.
-func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxFrameBytes int64) http.Handler {
+//
+// metrics is nil-safe: callers that don't observe upgrade outcomes pass
+// nil and every counter call no-ops.
+func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxFrameBytes int64, metrics *UpgradeMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		versionHeader := r.Header.Get("X-Pyrycode-Version")
 		userAgent := r.Header.Get("User-Agent")
 		if serverID == "" || versionHeader == "" || userAgent == "" {
 			http.Error(w, "", http.StatusBadRequest)
+			metrics.ServerHeaderReject()
 			return
 		}
 
@@ -70,6 +74,7 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxF
 				// "reach the connection only through WSConn methods"
 				// invariant is preserved in spirit.
 				_ = c.Close(websocket.StatusCode(4409), "server-id already claimed")
+				metrics.ServerIDConflict()
 				logger.Info("server_id_conflict",
 					"server_id", serverID,
 					"remote", remoteHost(r))
@@ -82,6 +87,7 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxF
 			return
 		}
 
+		metrics.ServerAccept()
 		logger.Info("server_claimed",
 			"server_id", serverID,
 			"binary_version", versionHeader,

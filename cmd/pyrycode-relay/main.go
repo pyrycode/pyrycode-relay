@@ -106,6 +106,7 @@ func main() {
 	relay.NewConnectionsMetrics(metricsReg, reg)
 	relay.NewForwardMetrics(metricsReg, reg)
 	relay.NewGraceMetrics(metricsReg, reg)
+	upgradeMetrics := relay.NewUpgradeMetrics(metricsReg)
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", relay.NewMetricsHandler(metricsReg))
@@ -148,10 +149,14 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
-	mux.Handle("/v1/server", rateLimit(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes)))
+	// upgradeMetrics.WrapXxxRateLimitDeny sits OUTSIDE the rate-limit
+	// middleware so it observes the middleware's HTTP 429 (the only
+	// HTTP-429 source in either pipe — header-gate writes 400, success
+	// is 101, WS application close codes travel inside the upgrade).
+	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))
 	// maxPhones=16 caps phones per server-id; over-cap registrations are
 	// rejected with WS close 4429. Per #30 architect spec.
-	mux.Handle("/v1/client", rateLimit(relay.ClientHandler(reg, logger, maxFrameBytes, 16)))
+	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
