@@ -75,12 +75,12 @@ Both `httpsSrv` and `httpSrv` mirror the insecure path's timeouts:
 
 | Setting | Value |
 |---|---|
-| `ReadHeaderTimeout` | 10s |
+| `ReadHeaderTimeout` | 5s |
 | `ReadTimeout` | 60s |
 | `WriteTimeout` | 60s |
 | `IdleTimeout` | 120s |
 
-`ReadHeaderTimeout` bounds slow-loris on both ports and keeps `gosec` G114 quiet.
+`ReadHeaderTimeout` bounds slow-loris on the pre-upgrade window on both ports and keeps `gosec` G114 quiet. Tightened from 10s to 5s in #35; post-upgrade slow peers are covered by per-frame deadlines (#15) and heartbeat (#7).
 
 ## TLS version
 

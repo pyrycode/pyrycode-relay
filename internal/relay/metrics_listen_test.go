@@ -102,7 +102,7 @@ func TestNewMetricsServer_Matrix(t *testing.T) {
 		// listener and the public listener share a policy today but may
 		// drift independently in a future ticket; assert on the values,
 		// not on a shared constant.
-		if got, want := srv.ReadHeaderTimeout, 10*time.Second; got != want {
+		if got, want := srv.ReadHeaderTimeout, 5*time.Second; got != want {
 			t.Errorf("ReadHeaderTimeout = %v; want %v", got, want)
 		}
 		if got, want := srv.ReadTimeout, 60*time.Second; got != want {
