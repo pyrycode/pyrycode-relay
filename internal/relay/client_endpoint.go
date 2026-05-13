@@ -34,13 +34,17 @@ import (
 // server-id at one time; an over-cap registration is rejected with WS close
 // code 4429. maxPhones <= 0 disables the cap (used by tests that do not
 // exercise the boundary).
-func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxPhones int) http.Handler {
+//
+// metrics is nil-safe: callers that don't observe upgrade outcomes pass
+// nil and every counter call no-ops.
+func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxPhones int, metrics *UpgradeMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.Header.Get("X-Pyrycode-Server")
 		token := r.Header.Get("X-Pyrycode-Token")
 		userAgent := r.Header.Get("User-Agent")
 		if serverID == "" || token == "" || userAgent == "" {
 			http.Error(w, "", http.StatusBadRequest)
+			metrics.ClientHeaderReject()
 			return
 		}
 		// token goes out of scope here unread: never parsed, compared, or
@@ -66,6 +70,7 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 				// *websocket.Conn so the 4404 application code reaches the
 				// wire (WSConn.Close always emits StatusNormalClosure).
 				_ = c.Close(websocket.StatusCode(4404), "no server with that id")
+				metrics.ClientNoServer()
 				logger.Info("phone_register_no_server",
 					"server_id", serverID,
 					"remote", remoteHost(r))
@@ -73,6 +78,7 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 			}
 			if errors.Is(err, ErrPhonesAtCap) {
 				_ = c.Close(websocket.StatusCode(4429), "too many phones for server-id")
+				metrics.ClientPhonesAtCap()
 				logger.Info("phone_register_at_cap",
 					"server_id", serverID,
 					"remote", remoteHost(r))
@@ -82,6 +88,7 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 			return
 		}
 
+		metrics.ClientAccept()
 		logger.Info("phone_registered",
 			"server_id", serverID,
 			"conn_id", connID,
