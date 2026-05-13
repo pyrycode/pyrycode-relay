@@ -182,10 +182,20 @@ func run(args []string, sigCtx context.Context) int {
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
+		// ReadHeaderTimeout (5s) bounds the pre-upgrade WebSocket
+		// handshake window — the gap between TCP accept and full HTTP
+		// request-header receipt. After header parse,
+		// nhooyr.io/websocket.Accept hijacks the connection and
+		// ReadTimeout/WriteTimeout no longer apply; post-upgrade slow
+		// peers are covered by per-frame deadlines (#15) and heartbeat
+		// ping/pong (#7). Caps slow-loris exposure on the internet-
+		// exposed surface (docs/threat-model.md § DoS resistance).
+		// Lives at each wiring site per the policy-values-in-main
+		// convention (docs/PROJECT-MEMORY.md "Project-level conventions").
 		srv := &http.Server{
 			Addr:              *insecureListen,
 			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       60 * time.Second,
 			WriteTimeout:      60 * time.Second,
 			IdleTimeout:       120 * time.Second,
@@ -236,7 +246,7 @@ func run(args []string, sigCtx context.Context) int {
 		Addr:              ":443",
 		Handler:           relay.EnforceHost(*domain, mux),
 		TLSConfig:         relay.TLSConfig(mgr),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -248,7 +258,7 @@ func run(args []string, sigCtx context.Context) int {
 		// would 302 GET/HEAD to HTTPS; the AC requires explicit 404 for
 		// non-challenge traffic.
 		Handler:           mgr.HTTPHandler(http.NotFoundHandler()),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
