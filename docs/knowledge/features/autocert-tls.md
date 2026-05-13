@@ -98,7 +98,7 @@ Two goroutines, no shared mutable state:
 1. Main — `httpsSrv.ListenAndServeTLS("", "")`. The empty cert/key paths defer to `TLSConfig.GetCertificate`, which `manager.TLSConfig()` populates. This is the documented autocert pattern.
 2. Background — `httpSrv.ListenAndServe()` for ACME http-01.
 
-Either listener failing → log + `os.Exit(1)`. No graceful shutdown (mirrors the insecure path).
+Either listener failing → first error wins via #31's buffered `listenerErr` channel; `relay.Shutdown` drains both listeners (and the metrics listener) together; `run` returns exit 1. On SIGTERM/SIGINT both listeners drain via the same path and `run` returns exit 0.
 
 The `*autocert.Manager` is constructed once and used read-only; its internal locking is autocert's contract.
 

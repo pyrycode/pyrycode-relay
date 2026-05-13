@@ -85,7 +85,7 @@ One `*IPRateLimiter`, one middleware, applied to both `mux.Handle` registrations
 
 ### `defer limiter.Close()` is best-effort
 
-The current listener block calls `os.Exit` on bind/serve errors, which skips defers. A real graceful-shutdown path (signal handler + `Server.Shutdown`) is out of scope; the defer runs on clean returns and any future shutdown sequence picks it up for free.
+`defer limiter.Close()` now runs on every shutdown path: #31's `runServers` collapses the per-listener `os.Exit(1)` calls into a buffered-error channel, so `main` returns normally on signal or listener error and the deferred limiter stop fires.
 
 ## Why middleware, not constructor injection
 
@@ -102,7 +102,6 @@ The middleware is stateless aside from the shared `*IPRateLimiter`. Concurrency 
 - **Multi-instance shared-state rate limiting**: v1 is single-instance; multi-instance would need Redis or equivalent.
 - **Rate-limit metrics counter**: a future ticket, parallel to #58's frame-forward / grace-expiry counters.
 - **Adaptive (load-aware) policy**: fixed token-bucket is sufficient for v1.
-- **Graceful-shutdown signal handler**: pre-existing gap, deferred until WS lifecycle work justifies it.
 
 ## Related
 
