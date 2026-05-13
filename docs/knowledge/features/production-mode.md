@@ -25,7 +25,7 @@ The check takes a `func(string) string` rather than calling `os.Getenv` directly
 
 ## Wiring (`cmd/pyrycode-relay/main.go`)
 
-Boot-time check ordering, top to bottom: `CheckEnvConfig` (#80) → `CheckInsecureListenInProduction` (#77) → `CheckRunningAsRoot` (#78) → `CheckCapabilities` (#79). Each `if err != nil` branch logs at error level and `os.Exit(2)`s; no listener has been opened yet at any point in the sequence.
+Boot-time check ordering, top to bottom: `CheckEnvConfig` (#80) → `CheckSingleInstance` (#65) → `CheckInsecureListenInProduction` (#77) → `CheckRunningAsRoot` (#78) → `CheckCapabilities` (#79). Each `if err != nil` branch logs at error level and `os.Exit(2)`s; no listener has been opened yet at any point in the sequence.
 
 ```go
 if err := relay.CheckInsecureListenInProduction(*insecureListen, os.Getenv); err != nil {
@@ -84,7 +84,7 @@ The checks are fail-closed: if any precondition trips, the relay refuses to boot
 
 ## Out of scope (deferred)
 
-- **No `Config` struct.** A bundled `relay.Config` with `Validate()` returning a multi-error is a natural extension once ~5 startup checks exist. With four today (`CheckEnvConfig`, `CheckInsecureListenInProduction`, `CheckRunningAsRoot`, `CheckCapabilities`), the wiring boilerplate is approaching the cost threshold; a follow-up ticket will consolidate when it crosses.
+- **No `Config` struct.** A bundled `relay.Config` with `Validate()` returning a multi-error is a natural extension once ~5 startup checks exist. With five today (`CheckEnvConfig`, `CheckSingleInstance`, `CheckInsecureListenInProduction`, `CheckRunningAsRoot`, `CheckCapabilities`), the wiring boilerplate has reached the cost threshold; a follow-up ticket will consolidate.
 - **No fork-exec integration test on `main.go`.** The `main` wiring is observable via package-level unit tests; one `if err != nil { os.Exit(2) }` block does not warrant a binary-spawning test.
 - **No `IsRunningAsRoot` bool helper.** A second consumer hasn't appeared (no log line branches on it, no metric labels it); exporting it today would be dead surface area and a temptation to call it without the production-mode guard tomorrow. Inline the predicate inside `CheckRunningAsRoot` until a second consumer materialises.
 
