@@ -28,6 +28,7 @@ func main() {
 		domain         = flag.String("domain", "", "Public domain for Let's Encrypt cert issuance (required unless --insecure-listen is set).")
 		certCache      = flag.String("cert-cache", defaultCertCache(), "Directory for autocert's TLS certificate cache.")
 		insecureListen = flag.String("insecure-listen", "", "Listen address for plain HTTP (e.g. :8080). Disables autocert; use only when fronted by a reverse proxy.")
+		metricsListen  = flag.String("metrics-listen", "127.0.0.1:9090", "Listen address for the /metrics endpoint. Must be a loopback IP literal (e.g. 127.0.0.1:9090, [::1]:9090). Empty disables.")
 		showVersion    = flag.Bool("version", false, "Print version and exit.")
 	)
 	flag.Parse()
@@ -97,6 +98,21 @@ func main() {
 	startedAt := time.Now()
 	reg := relay.NewRegistry()
 
+	metricsReg := relay.NewMetricsRegistry()
+	relay.NewConnectionsMetrics(metricsReg, reg)
+
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", relay.NewMetricsHandler(metricsReg))
+
+	metricsSrv, err := relay.NewMetricsServer(*metricsListen, metricsMux)
+	if err != nil {
+		logger.Error("refusing to start: invalid --metrics-listen address",
+			"err", err,
+			"value", *metricsListen,
+			"fix", "use a loopback IP literal such as 127.0.0.1:9090 or [::1]:9090, or pass --metrics-listen= to disable")
+		os.Exit(2)
+	}
+
 	// maxFrameBytes: 256 KiB per-frame read cap. Derivation:
 	// docs/specs/architecture/29-wsconn-read-limit.md (≤50-message
 	// message_chunk envelope + routing wrapper, headroom for outliers,
@@ -128,6 +144,16 @@ func main() {
 		}
 		expected := map[uint16]struct{}{port: {}}
 		actual := map[uint16]struct{}{port: {}}
+		if metricsSrv != nil {
+			mp, err := relay.ListenerPort(metricsSrv.Addr)
+			if err != nil {
+				logger.Error("refusing to start: invalid listener address",
+					"err", err, "addr", metricsSrv.Addr)
+				os.Exit(2)
+			}
+			expected[mp] = struct{}{}
+			actual[mp] = struct{}{}
+		}
 		if err := relay.CheckListenerPorts(expected, actual); err != nil {
 			surplus, expectedList := listenerPortLists(expected, actual)
 			logger.Error("refusing to start: unexpected listener",
@@ -135,6 +161,15 @@ func main() {
 				"unexpected_ports", surplus,
 				"expected_ports", expectedList)
 			os.Exit(2)
+		}
+		if metricsSrv != nil {
+			logger.Info("starting metrics listener", "listen", metricsSrv.Addr)
+			go func() {
+				if err := metricsSrv.ListenAndServe(); err != nil {
+					logger.Error("metrics listener failed", "err", err)
+					os.Exit(1)
+				}
+			}()
 		}
 		if err := srv.ListenAndServe(); err != nil {
 			logger.Error("listen failed", "err", err)
@@ -185,6 +220,16 @@ func main() {
 	}
 	expected := map[uint16]struct{}{443: {}, 80: {}}
 	actual := map[uint16]struct{}{httpsPort: {}, httpPort: {}}
+	if metricsSrv != nil {
+		mp, err := relay.ListenerPort(metricsSrv.Addr)
+		if err != nil {
+			logger.Error("refusing to start: invalid listener address",
+				"err", err, "addr", metricsSrv.Addr)
+			os.Exit(2)
+		}
+		expected[mp] = struct{}{}
+		actual[mp] = struct{}{}
+	}
 	if err := relay.CheckListenerPorts(expected, actual); err != nil {
 		surplus, expectedList := listenerPortLists(expected, actual)
 		logger.Error("refusing to start: unexpected listener",
@@ -196,6 +241,16 @@ func main() {
 
 	logger.Info("starting", "version", Version, "mode", "autocert",
 		"domain", *domain, "cert_cache", *certCache)
+
+	if metricsSrv != nil {
+		logger.Info("starting metrics listener", "listen", metricsSrv.Addr)
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil {
+				logger.Error("metrics listener failed", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
 
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil {
