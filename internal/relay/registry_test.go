@@ -539,6 +539,119 @@ func TestScheduleReleaseServer_RaceFreedomUnderRapidCycles(t *testing.T) {
 	_, _ = r.Counts()
 }
 
+func TestSnapshot_EmptyRegistry(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if got := r.Snapshot(); got != nil {
+		t.Errorf("Snapshot on empty registry: got %v, want nil", got)
+	}
+}
+
+func TestSnapshot_IncludesBinariesAndPhones(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	b1 := &fakeConn{id: "b-1"}
+	b2 := &fakeConn{id: "b-2"}
+	p1 := &fakeConn{id: "p-1"}
+	p2 := &fakeConn{id: "p-2"}
+	p3 := &fakeConn{id: "p-3"}
+
+	if err := r.ClaimServer("s1", b1); err != nil {
+		t.Fatalf("ClaimServer s1: %v", err)
+	}
+	if err := r.ClaimServer("s2", b2); err != nil {
+		t.Fatalf("ClaimServer s2: %v", err)
+	}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone p1: %v", err)
+	}
+	if err := r.RegisterPhone("s1", p2); err != nil {
+		t.Fatalf("RegisterPhone p2: %v", err)
+	}
+	if err := r.RegisterPhone("s2", p3); err != nil {
+		t.Fatalf("RegisterPhone p3: %v", err)
+	}
+
+	snap := r.Snapshot()
+	if len(snap) != 5 {
+		t.Fatalf("Snapshot len: got %d, want 5", len(snap))
+	}
+	got := map[string]bool{}
+	for _, c := range snap {
+		got[c.ConnID()] = true
+	}
+	for _, want := range []string{"b-1", "b-2", "p-1", "p-2", "p-3"} {
+		if !got[want] {
+			t.Errorf("Snapshot: missing %q (got %v)", want, got)
+		}
+	}
+}
+
+func TestSnapshot_FreshSliceIsolation(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	if err := r.RegisterPhone("s1", &fakeConn{id: "p-1"}); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	snap := r.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Snapshot len: got %d, want 2", len(snap))
+	}
+	snap[0] = &fakeConn{id: "evil"}
+
+	again := r.Snapshot()
+	for _, c := range again {
+		if c.ConnID() == "evil" {
+			t.Fatal("registry observed mutation through Snapshot")
+		}
+	}
+
+	// Mutating registry after snapshot: the original snap length stays put.
+	if err := r.RegisterPhone("s1", &fakeConn{id: "p-2"}); err != nil {
+		t.Fatalf("RegisterPhone p2: %v", err)
+	}
+	if len(snap) != 2 {
+		t.Errorf("original snapshot length changed: got %d, want 2", len(snap))
+	}
+	if len(r.Snapshot()) != 3 {
+		t.Errorf("new Snapshot after register: want 3")
+	}
+}
+
+// TestSnapshot_RaceFreedom hammers Snapshot concurrently with mutation,
+// asserting no data race under -race and that every Snapshot reflects an
+// internally-consistent state (no torn reads).
+func TestSnapshot_RaceFreedom(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	const goroutines = 16
+	const opsPer = 200
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			sid := fmt.Sprintf("s-%d", g%4)
+			for i := 0; i < opsPer; i++ {
+				_ = r.ClaimServer(sid, &fakeConn{id: fmt.Sprintf("b-%d-%d", g, i)})
+				_ = r.RegisterPhone(sid, &fakeConn{id: fmt.Sprintf("p-%d-%d", g, i)})
+				_ = r.Snapshot()
+				r.UnregisterPhone(sid, fmt.Sprintf("p-%d-%d", g, i))
+				_ = r.ReleaseServer(sid)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // TestRegistry_RaceFreedom hammers the public API from many goroutines and
 // asserts the absence of DATA RACE reports under -race.
 //

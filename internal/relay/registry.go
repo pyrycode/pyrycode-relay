@@ -323,6 +323,36 @@ func (r *Registry) PhonesFor(serverID string) []Conn {
 	return out
 }
 
+// Snapshot returns a freshly-allocated slice of every Conn currently
+// registered as a binary or a phone. The caller may iterate, append, or
+// otherwise mutate the slice without affecting the registry's internal
+// state or holding any registry lock. Returns nil when no conns are
+// registered. Used by the graceful-shutdown path (#31) to fan close
+// frames out without exposing internal maps.
+//
+// Order is unspecified (map-iteration order); callers don't care. The
+// Conn handles inside the slice are the same references the registry
+// holds; calling Close on them affects the live connection.
+func (r *Registry) Snapshot() []Conn {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	total := len(r.binaries)
+	for _, s := range r.phones {
+		total += len(s)
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]Conn, 0, total)
+	for _, c := range r.binaries {
+		out = append(out, c)
+	}
+	for _, s := range r.phones {
+		out = append(out, s...)
+	}
+	return out
+}
+
 // Counts returns the number of binaries currently claimed and the total
 // number of phone connections summed across all server-ids. For the health
 // endpoint (#10). One call is internally consistent; two concurrent calls
