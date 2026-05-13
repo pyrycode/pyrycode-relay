@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"syscall"
 	"time"
 
@@ -119,6 +120,22 @@ func main() {
 			WriteTimeout:      60 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
+		port, err := relay.ListenerPort(srv.Addr)
+		if err != nil {
+			logger.Error("refusing to start: invalid listener address",
+				"err", err, "addr", srv.Addr)
+			os.Exit(2)
+		}
+		expected := map[uint16]struct{}{port: {}}
+		actual := map[uint16]struct{}{port: {}}
+		if err := relay.CheckListenerPorts(expected, actual); err != nil {
+			surplus, expectedList := listenerPortLists(expected, actual)
+			logger.Error("refusing to start: unexpected listener",
+				"err", err,
+				"unexpected_ports", surplus,
+				"expected_ports", expectedList)
+			os.Exit(2)
+		}
 		if err := srv.ListenAndServe(); err != nil {
 			logger.Error("listen failed", "err", err)
 			os.Exit(1)
@@ -154,6 +171,29 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	httpsPort, err := relay.ListenerPort(httpsSrv.Addr)
+	if err != nil {
+		logger.Error("refusing to start: invalid listener address",
+			"err", err, "addr", httpsSrv.Addr)
+		os.Exit(2)
+	}
+	httpPort, err := relay.ListenerPort(httpSrv.Addr)
+	if err != nil {
+		logger.Error("refusing to start: invalid listener address",
+			"err", err, "addr", httpSrv.Addr)
+		os.Exit(2)
+	}
+	expected := map[uint16]struct{}{443: {}, 80: {}}
+	actual := map[uint16]struct{}{httpsPort: {}, httpPort: {}}
+	if err := relay.CheckListenerPorts(expected, actual); err != nil {
+		surplus, expectedList := listenerPortLists(expected, actual)
+		logger.Error("refusing to start: unexpected listener",
+			"err", err,
+			"unexpected_ports", surplus,
+			"expected_ports", expectedList)
+		os.Exit(2)
+	}
+
 	logger.Info("starting", "version", Version, "mode", "autocert",
 		"domain", *domain, "cert_cache", *certCache)
 
@@ -168,6 +208,26 @@ func main() {
 		logger.Error("https listener failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+// listenerPortLists returns the ascending-sorted surplus (actual\expected)
+// and expected port slices, suitable for emission as []uint16 fields on
+// the boot-refusal log line. Computed in main (not in relay) so the
+// CheckListenerPorts API stays a single error return — the duplicate
+// pass is cheap at boot and runs at most once.
+func listenerPortLists(expected, actual map[uint16]struct{}) (surplus, expectedSorted []uint16) {
+	for p := range actual {
+		if _, ok := expected[p]; !ok {
+			surplus = append(surplus, p)
+		}
+	}
+	slices.Sort(surplus)
+	expectedSorted = make([]uint16, 0, len(expected))
+	for p := range expected {
+		expectedSorted = append(expectedSorted, p)
+	}
+	slices.Sort(expectedSorted)
+	return surplus, expectedSorted
 }
 
 func defaultCertCache() string {
