@@ -85,7 +85,7 @@ One new goroutine: the metrics listener's `srv.ListenAndServe()`. Started only a
 
 - TLS on the metrics listener — loopback is the entire defence (see *Threat model*).
 - Authentication on `/metrics` — same rationale.
-- Graceful shutdown of either listener — the public listener has none either; SIGTERM-driven shutdown is open ticket #31, which will retrofit both listeners together. Structuring `metricsSrv` as a top-level local in `main` keeps that retrofit a localised edit.
+- Per-listener teardown logic baked into this file — graceful shutdown (#31) lives in `internal/relay/shutdown.go`, takes `servers ...*http.Server`, and the metrics server joins that variadic alongside the public listener(s). The "top-level local in `main`" shape that this feature established was the seam that made #31 a localised edit.
 - A `--metrics-listen` unix-socket form — out of scope; would need its own threat-model review (file permissions, peer authentication).
 - A second `/metrics` collector beyond #61's `NewConnectionsMetrics` — siblings #57 / #58 append more `NewXxxMetrics(metricsReg, …)` calls at the wiring site this ticket establishes.
 
