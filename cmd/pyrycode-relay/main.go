@@ -54,7 +54,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", relay.NewHealthzHandler(reg, Version, startedAt))
 	mux.Handle("/v1/server", relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes))
-	mux.Handle("/v1/client", relay.ClientHandler(reg, logger, maxFrameBytes))
+	// maxPhones=16 caps phones per server-id; over-cap registrations are
+	// rejected with WS close 4429. Per #30 architect spec.
+	mux.Handle("/v1/client", relay.ClientHandler(reg, logger, maxFrameBytes, 16))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)

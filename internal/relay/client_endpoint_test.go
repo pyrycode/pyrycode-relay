@@ -22,7 +22,18 @@ func startClient(t *testing.T) (*Registry, string, func()) {
 	t.Helper()
 	reg := NewRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024))
+	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0))
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	return reg, wsURL, srv.Close
+}
+
+// startClientWithCap is like startClient but threads maxPhones through to
+// ClientHandler. Used by the 4429 cap-rejection integration test.
+func startClientWithCap(t *testing.T, maxPhones int) (*Registry, string, func()) {
+	t.Helper()
+	reg := NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, maxPhones))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	return reg, wsURL, srv.Close
 }
@@ -111,7 +122,7 @@ func TestClientEndpoint_HeaderGate_400(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024))
+			srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0))
 			defer srv.Close()
 
 			req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -288,5 +299,51 @@ func TestClientEndpoint_DeviceNameOptional_HandlerAccepts(t *testing.T) {
 	// Clean up.
 	_ = c1.Close(websocket.StatusNormalClosure, "")
 	_ = c2.Close(websocket.StatusNormalClosure, "")
+	waitForPhones(t, reg, "s1", 0, 2*time.Second)
+}
+
+func TestClientEndpoint_AtCap_4429(t *testing.T) {
+	const cap = 2
+	reg, wsURL, cleanup := startClientWithCap(t, cap)
+	defer cleanup()
+	seedBinary(t, reg, "s1")
+
+	inCap := make([]*websocket.Conn, 0, cap)
+	for i := 0; i < cap; i++ {
+		c, _, err := dialWithClient(t, wsURL, validClientHeaders("s1"))
+		if err != nil {
+			t.Fatalf("dial #%d: %v", i, err)
+		}
+		inCap = append(inCap, c)
+	}
+	waitForPhones(t, reg, "s1", cap, time.Second)
+
+	over, _, err := dialWithClient(t, wsURL, validClientHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial over-cap: %v", err)
+	}
+	defer over.Close(websocket.StatusNormalClosure, "")
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelRead()
+	_, _, readErr := over.Read(readCtx)
+	var ce websocket.CloseError
+	if !errors.As(readErr, &ce) {
+		t.Fatalf("over-cap Read err = %v (%T), want *websocket.CloseError", readErr, readErr)
+	}
+	if ce.Code != websocket.StatusCode(4429) {
+		t.Fatalf("over-cap close code = %d, want 4429", ce.Code)
+	}
+	if ce.Reason != "too many phones for server-id" {
+		t.Fatalf("over-cap close reason = %q, want %q", ce.Reason, "too many phones for server-id")
+	}
+
+	if got := reg.PhonesFor("s1"); len(got) != cap {
+		t.Errorf("PhonesFor after over-cap rejection: got len=%d, want %d", len(got), cap)
+	}
+
+	for _, c := range inCap {
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}
 	waitForPhones(t, reg, "s1", 0, 2*time.Second)
 }

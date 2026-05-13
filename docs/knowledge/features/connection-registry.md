@@ -28,6 +28,7 @@ func (r *Registry) ClaimServer(serverID string, conn Conn) error
 func (r *Registry) ReleaseServer(serverID string) (released bool)
 func (r *Registry) ScheduleReleaseServer(serverID string, d time.Duration)
 func (r *Registry) RegisterPhone(serverID string, conn Conn) error
+func (r *Registry) RegisterPhoneCapped(serverID string, conn Conn, max int) error
 func (r *Registry) UnregisterPhone(serverID string, connID string)
 func (r *Registry) BinaryFor(serverID string) (Conn, bool)
 func (r *Registry) PhonesFor(serverID string) []Conn
@@ -39,9 +40,12 @@ Sentinel errors (branch with `errors.Is`):
 | Error | Returned by | Maps to |
 |---|---|---|
 | `ErrServerIDConflict` | `ClaimServer` when slot already held | WS close `4409` |
-| `ErrNoServer` | `RegisterPhone` when no binary holds the slot | WS close `4404` |
+| `ErrNoServer` | `RegisterPhone` / `RegisterPhoneCapped` when no binary holds the slot | WS close `4404` |
+| `ErrPhonesAtCap` | `RegisterPhoneCapped` when `len(phones[serverID]) >= max` | WS close `4429` |
 
 The mapping to close codes is informational; the registry doesn't know about WebSockets — the upgrade handlers translate.
+
+`RegisterPhone(serverID, conn)` is equivalent to `RegisterPhoneCapped(serverID, conn, 0)` — the legacy no-cap entry point, retained for test fixtures and callers that explicitly do not want the cap-aware contract. Production traffic on `/v1/client` uses `RegisterPhoneCapped` with the wiring-site `maxPhones` value (16 today, see [`/v1/client`](client-endpoint.md)). `ErrNoServer` takes precedence over `ErrPhonesAtCap`; the cap check (`max > 0 && len(phones[serverID]) >= max`) and the slice append both run under the same write lock, so two concurrent callers at `max-1` cannot both succeed (race shape mirrors `ClaimServer`'s first-claim-wins).
 
 ## Grace-period reclaim (`ScheduleReleaseServer`, #20)
 
@@ -93,7 +97,7 @@ The duration `d` is fully trusted — degenerate values (`d <= 0` fires immediat
 
 - **Does not close `Conn` handles in the immediate-release path.** `ReleaseServer` and `UnregisterPhone` only remove map entries. Connection lifetime is owned by the WS upgrade handlers. The grace-period expiry handler is the one exception — it `Close()`s phones whose binary did not reclaim within the grace window. See [ADR-0006](../decisions/0006-grace-period-as-reclaim-path.md).
 - **Does not deduplicate phones by `ConnID`.** Caller invariant: each `Conn` is registered once.
-- **Does not bound the per-server-id phone slice.** Per-server caps belong to the WS upgrade layer (#5).
+- **Does not own the per-server-id phone cap value.** `RegisterPhoneCapped` enforces a cap supplied by the caller (#30); the value itself lives at the wiring site in `cmd/pyrycode-relay/main.go`. `RegisterPhone` (no cap) remains available for fixtures that opt out.
 - **Does not propagate binary loss to phones via `ReleaseServer`.** When `ReleaseServer` runs, the phones slice is left in place. The owner of phones must `UnregisterPhone` (and choose whether to close them) when their server's binary is gone. The deferred sibling `ScheduleReleaseServer` *does* close phones — but only if the timer expires without a reclaim. This split lets the disconnect path opt into the grace window while the synchronous path (e.g. cleanup after a failed claim) stays narrow.
 - **Does not validate `serverID` content.** Length, charset, prefix — owned by `x-pyrycode-server` header validation in #4. The registry treats any string as an opaque map key.
 
@@ -103,7 +107,7 @@ The registry has no networking and no direct exposure to adversarial input. Adve
 
 - **`serverID` of pathological size or content** is harmless to the registry (just a map key) but the WS upgrade layer must cap header lengths.
 - **`Conn.ConnID()` returning unstable values** would cause `UnregisterPhone` to remove the wrong phone (or none). Documented as a contract on the `Conn` interface; violation is a leak, not a cross-tenant data leak.
-- **Repeated `RegisterPhone` for the same server-id** is unbounded memory growth, gated only by the requirement that a binary holds the slot. Per-server connection caps are #5's job.
+- **Repeated `RegisterPhone` for the same server-id** is unbounded memory growth. The cap-aware `RegisterPhoneCapped` (#30) is the entry point production wiring uses; the no-cap `RegisterPhone` remains for test fixtures. Across-server-id total caps are not the registry's job (deferred to per-IP rate-limit #34 and any future global cap).
 - **Slow `ConnID` blocking the write lock** is the cost of the documented non-blocking contract; copying the slice and scanning outside the lock would create a TOCTOU window where a phone could be added between snapshot and removal.
 
 ## Testing
@@ -115,6 +119,7 @@ Functional cases (one subtest per AC bullet):
 - `ClaimServer` first-wins / second-conflicts; `BinaryFor` still resolves to the first conn.
 - `ReleaseServer` reclaim — release returns `true`, second release of an unheld id returns `false`, claim again with a different conn succeeds.
 - `RegisterPhone` requires a binary (`ErrNoServer` until `ClaimServer`).
+- `RegisterPhoneCapped` cap semantics (#30): exact-cap registrations succeed, the next returns `ErrPhonesAtCap` without mutating the slice (`TestRegisterPhoneCapped_BoundaryAndRejection`); slot frees after `UnregisterPhone` and the next registration succeeds again (`TestRegisterPhoneCapped_RecoveryAfterUnregister`); cap is per-server-id, not global (`TestRegisterPhoneCapped_PerServerIDIndependent`); `RegisterPhone` delegates to `RegisterPhoneCapped(_, _, 0)` and the no-cap contract is preserved (`TestRegisterPhone_NoCapAfterDelegation`). `TestRegistry_RaceFreedom` was extended to drive `RegisterPhoneCapped` under the race detector.
 - `UnregisterPhone` removes by `ConnID`, leaves siblings intact, no-op on unknown id.
 - `PhonesFor` snapshot isolation: mutating the returned slice doesn't affect the registry; later registrations don't appear in earlier snapshots.
 - `Counts` across the full lifecycle including the `ReleaseServer` orphan case (`(0, 1)` while phones survive a release).

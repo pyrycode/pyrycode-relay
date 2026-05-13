@@ -18,6 +18,12 @@ var (
 	// ErrNoServer is returned by RegisterPhone when no binary holds the
 	// requested serverID. Maps to WS close code 4404.
 	ErrNoServer = errors.New("relay: no binary for server-id")
+
+	// ErrPhonesAtCap is returned by RegisterPhoneCapped when
+	// len(phones[serverID]) already equals the max-phones policy value
+	// passed by the caller. The error is returned BEFORE the slice is
+	// mutated. Maps to WS close code 4429.
+	ErrPhonesAtCap = errors.New("relay: phones at cap for server-id")
 )
 
 // Conn is the registry's view of a WebSocket connection. Real implementations
@@ -187,11 +193,35 @@ func (r *Registry) handleGraceExpiry(serverID string, self *graceEntry) {
 // ErrNoServer if no binary currently holds serverID. The registry does not
 // deduplicate by ConnID — the caller is responsible for not registering the
 // same phone twice.
+//
+// Equivalent to RegisterPhoneCapped(serverID, conn, 0): no cap. The dedicated
+// no-cap entry point exists for test fixtures and callers that explicitly do
+// not want the cap-aware contract.
 func (r *Registry) RegisterPhone(serverID string, conn Conn) error {
+	return r.RegisterPhoneCapped(serverID, conn, 0)
+}
+
+// RegisterPhoneCapped appends conn to the phones slice for serverID,
+// returning ErrPhonesAtCap when len(phones[serverID]) already equals max.
+// The cap check and the slice append run under one write lock, so two
+// concurrent callers at max-1 cannot both succeed (race shape mirrors
+// ClaimServer's first-claim-wins).
+//
+// max <= 0 disables the cap and the method behaves as the legacy
+// RegisterPhone. ErrNoServer takes precedence over ErrPhonesAtCap when both
+// would apply — the no-server check runs first.
+//
+// The mapping ErrPhonesAtCap → WS close code 4429 is informational; the
+// registry does not interpret close codes. /v1/client emits 4429 in the
+// stillborn-WSConn window.
+func (r *Registry) RegisterPhoneCapped(serverID string, conn Conn, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.binaries[serverID]; !ok {
 		return ErrNoServer
+	}
+	if max > 0 && len(r.phones[serverID]) >= max {
+		return ErrPhonesAtCap
 	}
 	r.phones[serverID] = append(r.phones[serverID], conn)
 	return nil
