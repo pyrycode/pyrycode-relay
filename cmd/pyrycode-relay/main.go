@@ -100,6 +100,8 @@ func main() {
 
 	metricsReg := relay.NewMetricsRegistry()
 	relay.NewConnectionsMetrics(metricsReg, reg)
+	relay.NewForwardMetrics(metricsReg, reg)
+	relay.NewGraceMetrics(metricsReg, reg)
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", relay.NewMetricsHandler(metricsReg))

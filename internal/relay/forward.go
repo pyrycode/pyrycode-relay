@@ -70,6 +70,10 @@ func StartPhoneForwarder(
 				"err", err)
 			return err
 		}
+
+		if h := reg.onPhoneForwarded; h != nil {
+			h()
+		}
 	}
 }
 
@@ -153,6 +157,10 @@ func StartBinaryForwarder(
 				"conn_id", env.ConnID,
 				"err", err)
 			continue
+		}
+
+		if h := reg.onBinaryForwarded; h != nil {
+			h()
 		}
 	}
 }
