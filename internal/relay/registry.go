@@ -64,6 +64,24 @@ type Registry struct {
 	binaries map[string]Conn
 	phones   map[string][]Conn
 	timers   map[string]*graceEntry
+
+	// onPhoneForwarded is invoked by StartPhoneForwarder after each
+	// successful binary.Send. Nil = no-op. Set once at boot via
+	// SetForwarderHooks before either listener starts serving; concurrent
+	// mutation during serving is undefined. Called outside any registry
+	// lock; the hook body MUST NOT acquire r.mu (deadlock risk). The
+	// production hook body (metrics_forward.go) is a pure
+	// prometheus.CounterVec.WithLabelValues(...).Inc call — atomic per
+	// client_golang's contract, no relay-side lock involved.
+	onPhoneForwarded func()
+	// onBinaryForwarded mirrors onPhoneForwarded for StartBinaryForwarder's
+	// per-successful-phone.Send path. Same lifecycle and locking rules.
+	onBinaryForwarded func()
+	// onGraceExpiry is invoked by handleGraceExpiry after the
+	// pointer-identity guard's success branch and the phone-close fan-out.
+	// Stale fires do not reach this site. Set once at boot via
+	// SetGraceExpiryHook; same locking rules as the forwarder hooks.
+	onGraceExpiry func()
 }
 
 // graceEntry wraps a pending grace-period timer. Its pointer identity
@@ -82,6 +100,22 @@ func NewRegistry() *Registry {
 		phones:   make(map[string][]Conn),
 		timers:   make(map[string]*graceEntry),
 	}
+}
+
+// SetForwarderHooks installs the two per-frame increment hooks. Either (or
+// both) may be nil for no-op. Call once at boot before any forwarder
+// goroutine runs; concurrent calls during serving are undefined. Hook
+// bodies MUST NOT acquire r.mu — deadlock risk.
+func (r *Registry) SetForwarderHooks(phone, binary func()) {
+	r.onPhoneForwarded = phone
+	r.onBinaryForwarded = binary
+}
+
+// SetGraceExpiryHook installs the eviction-increment hook. May be nil for
+// no-op. Call once at boot before any ScheduleReleaseServer call; concurrent
+// calls during serving are undefined. The hook body MUST NOT acquire r.mu.
+func (r *Registry) SetGraceExpiryHook(grace func()) {
+	r.onGraceExpiry = grace
 }
 
 // ClaimServer registers conn as the binary for serverID. First-claim-wins:
@@ -186,6 +220,10 @@ func (r *Registry) handleGraceExpiry(serverID string, self *graceEntry) {
 
 	for _, p := range snapshot {
 		p.Close()
+	}
+
+	if h := r.onGraceExpiry; h != nil {
+		h()
 	}
 }
 
