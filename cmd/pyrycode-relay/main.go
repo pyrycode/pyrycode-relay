@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/pyrycode/pyrycode-relay/internal/relay"
@@ -66,6 +67,22 @@ func main() {
 			"err", err,
 			"env_var", "PYRYCODE_RELAY_PRODUCTION",
 			"fix", "remove --insecure-listen and set --domain, or unset PYRYCODE_RELAY_PRODUCTION")
+		os.Exit(2)
+	}
+
+	// CheckRunningAsRoot is the in-process backstop for the CI non-root-build
+	// contract: docker run --user 0 or a missing/overridden USER directive at
+	// deploy time escapes CI and would otherwise silently run the
+	// internet-facing process as root. Runs before CheckCapabilities because
+	// production-mode misconfiguration is a deploy-shape concern that should
+	// be reported before Linux-specific runtime concerns. See
+	// docs/specs/architecture/78-refuse-boot-as-root-in-production.md § Wiring.
+	if err := relay.CheckRunningAsRoot(syscall.Geteuid, os.Getenv); err != nil {
+		logger.Error("refusing to start: production-mode misconfiguration",
+			"err", err,
+			"env_var", "PYRYCODE_RELAY_PRODUCTION",
+			"effective_uid", syscall.Geteuid(),
+			"fix", "drop privileges before exec (e.g. Dockerfile USER directive or --user <non-zero>, kubernetes securityContext.runAsUser), or unset PYRYCODE_RELAY_PRODUCTION if the deploy is truly dev")
 		os.Exit(2)
 	}
 
