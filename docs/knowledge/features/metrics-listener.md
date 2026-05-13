@@ -28,7 +28,7 @@ func NewMetricsServer(addr string, h http.Handler) (*http.Server, error)
 - `NewMetricsServer` is the opt-out-aware constructor:
   - `addr == ""` → `(nil, nil)`. The caller checks `srv != nil` before launching the goroutine or adding the port to the listener allowlist.
   - `CheckLoopbackBind(addr)` fails → `(nil, err)`.
-  - otherwise → `*http.Server` with the public listener's timeout policy (`ReadHeaderTimeout: 10s`, `ReadTimeout: 60s`, `WriteTimeout: 60s`, `IdleTimeout: 120s`) — duplicated rather than shared so either listener can drift if a future ticket has reason; today they match because that is the safest default.
+  - otherwise → `*http.Server` with the public listener's timeout policy (`ReadHeaderTimeout: 5s`, `ReadTimeout: 60s`, `WriteTimeout: 60s`, `IdleTimeout: 120s`) — duplicated rather than shared so either listener can drift if a future ticket has reason; today they match because that is the safest default. (`ReadHeaderTimeout` was 10s at first wiring; #35 tightened all four wiring sites to 5s together to keep the invariant the function's comment encodes.)
 
 The handler argument is `http.Handler`, not `*http.ServeMux`: the caller chooses whether to wire a bare `NewMetricsHandler(reg)` or wrap it in a mux. `cmd/pyrycode-relay/main.go` wraps in a `ServeMux` so `/metrics` is distinguishable from a future sibling path on the same listener.
 
