@@ -50,6 +50,13 @@ func main() {
 		os.Exit(2)
 	}
 
+	if err := relay.CheckCapabilities(); err != nil {
+		logger.Error("refusing to start: unexpected Linux capabilities",
+			"err", err,
+			"fix", "drop extra capabilities (e.g. --cap-drop=ALL --cap-add=NET_BIND_SERVICE on docker, or securityContext.capabilities on kubernetes)")
+		os.Exit(2)
+	}
+
 	startedAt := time.Now()
 	reg := relay.NewRegistry()
 
