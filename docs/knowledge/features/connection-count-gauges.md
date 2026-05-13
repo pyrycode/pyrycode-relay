@@ -41,7 +41,7 @@ The constant-cardinality property also keeps the `/metrics` response size delta 
 
 ## Wiring
 
-The collector lives in the registry's state for the process lifetime once `NewConnectionsMetrics(mreg, registry)` is called at startup. The wiring call site is `cmd/pyrycode-relay/main.go` next to `relay.NewRegistry()` and `relay.NewMetricsRegistry()`, alongside the listener wiring tracked under #60. Until #60 merges, the collector is exercised only by `metrics_connections_test.go`.
+The collector lives in the registry's state for the process lifetime once `NewConnectionsMetrics(mreg, registry)` is called at startup. The wiring call site is `cmd/pyrycode-relay/main.go` next to `relay.NewRegistry()` and `relay.NewMetricsRegistry()`, alongside the [localhost-only `/metrics` listener](metrics-listener.md) wired in #60.
 
 ## Concurrency
 
