@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -39,6 +40,24 @@ func main() {
 
 	if *insecureListen == "" && *domain == "" {
 		logger.Error("either --domain (for autocert) or --insecure-listen (for behind-proxy mode) must be set")
+		os.Exit(2)
+	}
+
+	// Boot-time env-var validation runs BEFORE CheckInsecureListenInProduction
+	// so that a typo like PYRYCODE_RELAY_PRODUCTION=true cannot slip through
+	// IsProductionMode's silent-non-production fallback and reach the
+	// insecure-listen guard with an unvalidated value. See
+	// docs/specs/architecture/80-validate-env-vars-at-boot.md § Wiring order.
+	if err := relay.CheckEnvConfig(os.LookupEnv); err != nil {
+		var cfgErr *relay.ErrInvalidConfig
+		if errors.As(err, &cfgErr) {
+			logger.Error("refusing to start: invalid env-var config",
+				"err", err,
+				"env_var", cfgErr.Key,
+				"reason", cfgErr.Reason)
+		} else {
+			logger.Error("refusing to start: invalid env-var config", "err", err)
+		}
 		os.Exit(2)
 	}
 
