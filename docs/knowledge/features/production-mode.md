@@ -49,6 +49,8 @@ if err := relay.CheckInsecureListenInProduction(*insecureListen, os.Getenv); err
 
 Autocert (`--domain`) is not inspected — the contract is purely about plaintext-in-prod. Setting `--domain` with `PYRYCODE_RELAY_PRODUCTION=1` is the happy path.
 
+Since #80 the matrix's "not `"1"`" row only describes the *post-validation* state: a malformed `PYRYCODE_RELAY_PRODUCTION` value (`"true"`, `"yes"`, `" 1"`, `"PRODUCTION"`, etc.) is now caught by [`CheckEnvConfig`](env-config-validator.md) *before* `CheckInsecureListenInProduction` is consulted, so the relay refuses to boot at the env-validation stage rather than silently treating the typo as "not production". `IsProductionMode`'s strict-`"1"` contract is unchanged; the validator simply ensures no other value ever reaches it.
+
 ## Threat model alignment
 
 `pyrycode/pyrycode/docs/protocol-mobile.md` § Security model assumes TLS for all production traffic. This is the in-binary enforcement of that assumption *when production mode is explicitly tagged*. The complement — a CI / deploy-manifest check that prod manifests actually set `PYRYCODE_RELAY_PRODUCTION=1` — is out of scope and the responsibility of the deploy layer.
@@ -66,3 +68,4 @@ The check is fail-closed: if the env var is on AND plaintext is requested, the r
 - [`internal/relay/tls.go`](../../../internal/relay/tls.go) — `ErrCacheDirInsecure` is the canonical boot-time-refusal sentinel this one models.
 - [Single-instance constraint (v1)](../../architecture.md#single-instance-constraint-v1) — sibling env-var contract (`PYRYCODE_RELAY_SINGLE_INSTANCE`), shape precedent.
 - [Codebase ticket note #77](../codebase/77.md) — per-ticket implementation detail.
+- [Env-var config validator](env-config-validator.md) — #80; the boot-time validator that polices the malformed-value cases listed in the contract, running before `CheckInsecureListenInProduction` so a typo can never reach `IsProductionMode`.
