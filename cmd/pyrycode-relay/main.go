@@ -42,6 +42,14 @@ func main() {
 		os.Exit(2)
 	}
 
+	if err := relay.CheckInsecureListenInProduction(*insecureListen, os.Getenv); err != nil {
+		logger.Error("refusing to start: production-mode misconfiguration",
+			"err", err,
+			"env_var", "PYRYCODE_RELAY_PRODUCTION",
+			"fix", "remove --insecure-listen and set --domain, or unset PYRYCODE_RELAY_PRODUCTION")
+		os.Exit(2)
+	}
+
 	startedAt := time.Now()
 	reg := relay.NewRegistry()
 
