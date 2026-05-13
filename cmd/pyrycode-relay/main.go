@@ -92,6 +92,24 @@ func run(args []string, sigCtx context.Context) int {
 		return 2
 	}
 
+	// CheckSingleInstance is the deterministic backstop to the
+	// docs/architecture.md § Single-instance constraint prose half (#64).
+	// Refuses to start on multi-instance-capable platforms (today: Fly.io,
+	// signalled by FLY_APP_NAME) unless the operator asserts single-instance
+	// intent via PYRYCODE_RELAY_SINGLE_INSTANCE=1. Runs after CheckEnvConfig
+	// so a typo'd bypass fails with the structured config error rather than
+	// being silently treated as unset; runs before CheckInsecureListenInProduction
+	// because a deploy-shape misconfiguration is more fundamental than a
+	// production-mode flag misconfiguration. See
+	// docs/specs/architecture/65-startup-multi-instance-check.md § Wiring.
+	if err := relay.CheckSingleInstance(os.Getenv); err != nil {
+		logger.Error("refusing to start: multi-instance deploy detected",
+			"err", err,
+			"bypass_env_var", "PYRYCODE_RELAY_SINGLE_INSTANCE",
+			"fix", "set PYRYCODE_RELAY_SINGLE_INSTANCE=1 in the deploy manifest (e.g. fly.toml [env]) to assert single-instance intent; see docs/architecture.md § Single-instance constraint")
+		return 2
+	}
+
 	if err := relay.CheckInsecureListenInProduction(*insecureListen, os.Getenv); err != nil {
 		logger.Error("refusing to start: production-mode misconfiguration",
 			"err", err,

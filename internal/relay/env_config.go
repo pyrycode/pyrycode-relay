@@ -60,6 +60,16 @@ var envContracts = []envContract{
 			return fmt.Errorf("expected %q or unset, got %q", "1", v)
 		},
 	},
+	{
+		name:     envSingleInstanceBypass,
+		required: false,
+		validate: func(v string) error {
+			if v == "1" {
+				return nil
+			}
+			return fmt.Errorf("expected %q or unset, got %q", "1", v)
+		},
+	},
 }
 
 // CheckEnvConfig walks envContracts and returns *ErrInvalidConfig on the

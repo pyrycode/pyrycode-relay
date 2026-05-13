@@ -4,7 +4,7 @@ Structured, table-driven validation of every env var the relay reads at boot. In
 
 ## What it catches
 
-The contract table is the single source of truth for "what env vars the relay reads". Today it has one row (`PYRYCODE_RELAY_PRODUCTION`); future env-var reads register here. For each entry the validator distinguishes three states:
+The contract table is the single source of truth for "what env vars the relay reads". Today it has two rows (`PYRYCODE_RELAY_PRODUCTION` from #80; `PYRYCODE_RELAY_SINGLE_INSTANCE` from #65, same exact-`"1"`-or-unset shape); future env-var reads register here. For each entry the validator distinguishes three states:
 
 - **Unset.** If `required: true`, returns `*ErrInvalidConfig{Reason: "missing"}`. If `required: false`, skipped.
 - **Set-and-non-empty.** Runs the per-key `validate(value)`; on `error`, returns `*ErrInvalidConfig{Reason: "malformed-value: <err>"}`.
@@ -32,7 +32,7 @@ Mixing the two seam shapes is intentional; do not refactor `IsProductionMode` to
 
 ## Wiring (`cmd/pyrycode-relay/main.go`)
 
-After flag-parse, **before** `CheckInsecureListenInProduction` (#77) and `CheckCapabilities` (#79):
+After flag-parse, **before** `CheckSingleInstance` (#65), `CheckInsecureListenInProduction` (#77), `CheckRunningAsRoot` (#78) and `CheckCapabilities` (#79):
 
 ```go
 if err := relay.CheckEnvConfig(os.LookupEnv); err != nil {
@@ -49,7 +49,7 @@ if err := relay.CheckEnvConfig(os.LookupEnv); err != nil {
 }
 ```
 
-- **Ordering is load-bearing.** `CheckInsecureListenInProduction` consults `IsProductionMode`, which treats every non-`"1"` value as "not production". If the operator wrote `PYRYCODE_RELAY_PRODUCTION=true`, the insecure-listen guard returns nil and a plaintext production listener boots. Running `CheckEnvConfig` first catches the malformed value and the dangerous path is never reached. Code review enforces.
+- **Ordering is load-bearing.** Downstream `Check*` helpers (`CheckInsecureListenInProduction`, `CheckSingleInstance`) treat every non-`"1"` value as "not set" — silent fall-through, not refusal. If the operator wrote `PYRYCODE_RELAY_PRODUCTION=true`, the insecure-listen guard would return nil and a plaintext production listener would boot; similarly `PYRYCODE_RELAY_SINGLE_INSTANCE=true` would let a multi-instance deploy through. Running `CheckEnvConfig` first catches malformed values and the dangerous paths are never reached. Code review enforces.
 - **Exit code 2** matches the sibling boot-time refusals; exit 1 is reserved for runtime failures.
 - **`errors.As` extraction at the log site**, not in the validator. The structured fields are `err`, `env_var` (the key), and `reason` (the per-key prose). The fallback branch (no `errors.As` hit) is defensive against a future refactor that wraps the error in something opaque; under the current design it is unreachable.
 - **No `value` log field.** The reason string already echoes the malformed value (`got "true"`) where safe; the `env_var` field carries the name only. Future entries whose values could carry secrets must keep raw bytes out of the reason string — describe the shape violation in operator-facing terms instead (`"expected hex-encoded 32-byte value"`, not `got %q`).
@@ -67,7 +67,9 @@ Code review enforces "every env-var read in the binary is registered here" by re
 
 ## Behaviour matrix (today)
 
-| `PYRYCODE_RELAY_PRODUCTION` | `CheckEnvConfig` result |
+Both registered env vars share the same `exact "1" or unset` shape, so the matrix is identical for either key:
+
+| Value (applies to `PYRYCODE_RELAY_PRODUCTION` and `PYRYCODE_RELAY_SINGLE_INSTANCE`) | `CheckEnvConfig` result |
 |---|---|
 | unset | nil |
 | `"1"` | nil |
@@ -76,11 +78,12 @@ Code review enforces "every env-var read in the binary is registered here" by re
 
 ## Why not a `Config` struct (yet)
 
-A natural extension is a typed `relay.Config` populated from the env at boot, validated as a single step, and threaded through the binary. **Deferred.** The relay has one env var today; the ticket body promises "future env-var additions register here", which means the contract table is the registry, not a typed struct. When env-var count crosses ~3 *and* a downstream caller wants a typed snapshot, a follow-up ticket consolidates. Doing it now is premature.
+A natural extension is a typed `relay.Config` populated from the env at boot, validated as a single step, and threaded through the binary. **Deferred.** The relay has two env vars today; the ticket body promises "future env-var additions register here", which means the contract table is the registry, not a typed struct. When env-var count crosses ~3 *and* a downstream caller wants a typed snapshot, a follow-up ticket consolidates. Doing it now is premature.
 
 ## Cross-links
 
 - [Production-mode contract & `--insecure-listen` startup refusal](production-mode.md) — first env-var contract (#77); the malformed-value cases listed there are now caught by `CheckEnvConfig` before `IsProductionMode` is consulted.
+- [Single-instance startup self-check](single-instance-check.md) — second env-var contract (#65); same exact-`"1"`-or-unset shape, second consumer of the registry.
 - [Linux capability allowlist](capability-allowlist.md) — sibling boot-time refusal (#79); same wiring shape, runs after env-config validation.
 - [Codebase note #80](../codebase/80.md) — implementation summary and lessons.
 - [Codebase note #77](../codebase/77.md) — env-var contract precedent (`PYRYCODE_RELAY_PRODUCTION`).

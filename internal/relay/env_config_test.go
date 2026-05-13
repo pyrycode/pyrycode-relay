@@ -81,6 +81,33 @@ func TestCheckEnvConfig_MalformedValueReturnsStructuredError(t *testing.T) {
 	}
 }
 
+func TestCheckEnvConfig_SingleInstanceBypassMalformedValue(t *testing.T) {
+	t.Parallel()
+
+	// Lock the envContracts row added for PYRYCODE_RELAY_SINGLE_INSTANCE so
+	// a typo'd bypass (e.g. =true) fails CheckEnvConfig with a structured
+	// per-key error before CheckSingleInstance reads the value. See
+	// docs/specs/architecture/65-startup-multi-instance-check.md.
+	env := map[string]string{envSingleInstanceBypass: "true"}
+	err := CheckEnvConfig(fakeLookup(env))
+	if err == nil {
+		t.Fatal("CheckEnvConfig with bypass=true returned nil, want error")
+	}
+	if !errors.Is(err, ErrInvalidConfigSentinel) {
+		t.Errorf("err %v should satisfy errors.Is(err, ErrInvalidConfigSentinel)", err)
+	}
+	var cfgErr *ErrInvalidConfig
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("err %v should satisfy errors.As(err, &*ErrInvalidConfig)", err)
+	}
+	if cfgErr.Key != envSingleInstanceBypass {
+		t.Errorf("got Key=%q, want %q", cfgErr.Key, envSingleInstanceBypass)
+	}
+	if !strings.HasPrefix(cfgErr.Reason, "malformed-value: ") {
+		t.Errorf("got Reason=%q, want prefix %q", cfgErr.Reason, "malformed-value: ")
+	}
+}
+
 func TestCheckEnvConfig_MissingRequiredKey(t *testing.T) {
 	t.Parallel()
 
