@@ -6,7 +6,7 @@ import "errors"
 // intent to run a single instance on a multi-instance-capable platform.
 // Contract is "1" means assert; anything else is treated as unset. Pinned
 // by docs/architecture.md § Single-instance constraint.
-const envSingleInstanceBypass = "PYRYCODE_RELAY_SINGLE_INSTANCE"
+const envSingleInstanceBypass = "PYRYCODE_RELAY_SINGLE_INSTANCE" // #nosec G101 -- env var name, not a credential
 
 // envFlyAppName is the Fly.io platform-set signal: non-empty on every
 // machine in a Fly app, which is also the substrate where
