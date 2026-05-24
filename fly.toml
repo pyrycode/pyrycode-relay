@@ -14,7 +14,7 @@
 #     the in-binary self-check (#65) is the load-bearing control.
 
 app = "pyrycode-relay"
-primary_region = "__REGION__"   # operator fills at bootstrap; see docs/deploy.md.
+primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 
 [build]
   dockerfile = "Dockerfile"
@@ -24,7 +24,7 @@ primary_region = "__REGION__"   # operator fills at bootstrap; see docs/deploy.m
 # is a one-line edit to this file — config, not code — and rides the
 # next deploy.
 [processes]
-  app = "--domain __DOMAIN__ --cert-cache /var/lib/relay/autocert"
+  app = "--domain pyrycode-relay.ilmoniemi.fi --cert-cache /var/lib/relay/autocert"
 
 [[mounts]]
   source = "relay_autocert"
