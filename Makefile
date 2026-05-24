@@ -5,11 +5,17 @@ PKG         := ./cmd/pyrycode-relay
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.Version=$(VERSION)
 
-.PHONY: build test vet lint run clean
+.PHONY: build check test vet lint run clean
 
 build:
 	@mkdir -p bin
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
+
+# `check` is the QA agent's mechanical gate (vet + race tests). Mirrors
+# pyrycode/pyrycode's `check` target so the agents repo's qa/CLAUDE.md
+# can stay convergent across forks. Heavier static-analysis (gosec,
+# govulncheck) lives in `lint` and is run by humans, not the dispatcher.
+check: vet test
 
 test:
 	go test -race ./...
