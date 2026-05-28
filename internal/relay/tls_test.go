@@ -69,9 +69,61 @@ func TestNewAutocertManager_ExistingSecureDirIsNoOp(t *testing.T) {
 	}
 }
 
-func TestNewAutocertManager_ExistingInsecureDirRejected(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("permission bits don't apply on Windows")
+func TestNewAutocertManager_OwnedInsecureDirIsTightened(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ownership-gated tightening per ADR-0009 only enabled on linux")
+	}
+	t.Parallel()
+
+	cache := filepath.Join(t.TempDir(), "certs")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	if _, err := NewAutocertManager("relay.example.com", cache); err != nil {
+		t.Fatalf("NewAutocertManager: unexpected error: %v", err)
+	}
+
+	info, err := os.Stat(cache)
+	if err != nil {
+		t.Fatalf("stat cache dir: %v", err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o700); got != want {
+		t.Errorf("cache dir mode after tightening: got %o, want %o", got, want)
+	}
+}
+
+func TestNewAutocertManager_ForeignOwnedInsecureDirRejected(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("requires root to chown to a foreign uid")
+	}
+	t.Parallel()
+
+	cache := filepath.Join(t.TempDir(), "certs")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+	if err := os.Chown(cache, 65534, 65534); err != nil {
+		t.Fatalf("setup chown: %v", err)
+	}
+
+	_, err := NewAutocertManager("relay.example.com", cache)
+	if !errors.Is(err, ErrCacheDirInsecure) {
+		t.Fatalf("expected ErrCacheDirInsecure, got %v", err)
+	}
+
+	info, statErr := os.Stat(cache)
+	if statErr != nil {
+		t.Fatalf("stat cache dir: %v", statErr)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o755); got != want {
+		t.Errorf("cache dir mode after rejection: got %o, want %o (chmod must not have run)", got, want)
+	}
+}
+
+func TestNewAutocertManager_InsecureDirRejectedOnNonLinux(t *testing.T) {
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		t.Skip("non-linux ownership-unknown path; perm bits don't apply on windows")
 	}
 	t.Parallel()
 

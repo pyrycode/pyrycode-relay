@@ -14,4 +14,7 @@ var allowedLogKeys = map[string]struct{}{
 	"remote":         {},
 	"binary_version": {},
 	"err":            {},
+	"path":           {},
+	"from":           {},
+	"to":             {},
 }
