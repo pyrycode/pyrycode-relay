@@ -52,8 +52,17 @@ func run(args []string, sigCtx context.Context) int {
 		domain         = fs.String("domain", "", "Public domain for Let's Encrypt cert issuance (required unless --insecure-listen is set).")
 		certCache      = fs.String("cert-cache", defaultCertCache(), "Directory for autocert's TLS certificate cache.")
 		insecureListen = fs.String("insecure-listen", "", "Listen address for plain HTTP (e.g. :8080). Disables autocert; use only when fronted by a reverse proxy.")
-		metricsListen  = fs.String("metrics-listen", "127.0.0.1:9090", "Listen address for the /metrics endpoint. Must be a loopback IP literal (e.g. 127.0.0.1:9090, [::1]:9090). Empty disables.")
-		trustXFF       = fs.Bool("trust-x-forwarded-for", false,
+		httpsListen    = fs.String("https-listen", ":443",
+			"Listen address for the autocert TLS terminator (host:port). "+
+				"Used only when --domain is set. Pass a high port like :8443 "+
+				"when a substrate forwards external 443 to a high internal port "+
+				"(e.g. distroless/nonroot containers without CAP_NET_BIND_SERVICE).")
+		httpListen = fs.String("http-listen", ":80",
+			"Listen address for the ACME HTTP-01 challenge listener (host:port). "+
+				"Used only when --domain is set. Pass :8080 when a substrate "+
+				"forwards external 80 to a high internal port.")
+		metricsListen = fs.String("metrics-listen", "127.0.0.1:9090", "Listen address for the /metrics endpoint. Must be a loopback IP literal (e.g. 127.0.0.1:9090, [::1]:9090). Empty disables.")
+		trustXFF      = fs.Bool("trust-x-forwarded-for", false,
 			"Trust the X-Forwarded-For header as the source IP for per-IP rate limiting. "+
 				"WARNING: enabling this without a trusted reverse proxy in front of the relay "+
 				"allows clients to spoof their source IP and bypass per-IP rate limits.")
@@ -71,6 +80,23 @@ func run(args []string, sigCtx context.Context) int {
 
 	if *insecureListen == "" && *domain == "" {
 		logger.Error("either --domain (for autocert) or --insecure-listen (for behind-proxy mode) must be set")
+		return 2
+	}
+
+	// --insecure-listen short-circuits the autocert branch entirely, so
+	// --http-listen / --https-listen would silently no-op alongside it.
+	// fs.Visit walks only flags set explicitly on argv: an operator who
+	// passes --http-listen=:80 (the default) alongside --insecure-listen
+	// is still confused and deserves the fast-fail. See
+	// docs/specs/architecture/96-autocert-configurable-listener-addrs.md
+	// § Mutual-exclusion guard.
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	if *insecureListen != "" && (setFlags["http-listen"] || setFlags["https-listen"]) {
+		logger.Error("refusing to start: --insecure-listen is mutually exclusive with --http-listen / --https-listen",
+			"fix", "use --insecure-listen alone (proxy-fronted plaintext mode), "+
+				"OR use --domain with optional --http-listen / --https-listen (autocert mode); "+
+				"the new flags configure the autocert listeners and have no effect in insecure mode")
 		return 2
 	}
 
@@ -261,7 +287,7 @@ func run(args []string, sigCtx context.Context) int {
 	}
 
 	httpsSrv := &http.Server{
-		Addr:              ":443",
+		Addr:              *httpsListen,
 		Handler:           relay.EnforceHost(*domain, mux),
 		TLSConfig:         relay.TLSConfig(mgr),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -271,7 +297,7 @@ func run(args []string, sigCtx context.Context) int {
 	}
 
 	httpSrv := &http.Server{
-		Addr: ":80",
+		Addr: *httpListen,
 		// NotFoundHandler — NOT nil. autocert.Manager.HTTPHandler(nil)
 		// would 302 GET/HEAD to HTTPS; the AC requires explicit 404 for
 		// non-challenge traffic.
@@ -294,7 +320,7 @@ func run(args []string, sigCtx context.Context) int {
 			"err", err, "addr", httpSrv.Addr)
 		return 2
 	}
-	expected := map[uint16]struct{}{443: {}, 80: {}}
+	expected := map[uint16]struct{}{httpsPort: {}, httpPort: {}}
 	actual := map[uint16]struct{}{httpsPort: {}, httpPort: {}}
 	if metricsSrv != nil {
 		mp, err := relay.ListenerPort(metricsSrv.Addr)
