@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // pollUntil polls fn every 5ms until it returns true or deadline passes.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // heartbeatInterval and heartbeatTimeout implement the per-connection

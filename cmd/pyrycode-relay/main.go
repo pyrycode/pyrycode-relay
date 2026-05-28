@@ -23,7 +23,7 @@ import (
 )
 
 // drainDeadline bounds how long Shutdown will wait for in-flight WS
-// close handshakes before force-closing. nhooyr.io/websocket.Conn.Close
+// close handshakes before force-closing. github.com/coder/websocket Conn.Close
 // waits up to 5s per conn for the peer's reciprocal close (lessons.md);
 // 10s leaves ~5s of headroom while keeping a stuck drain from delaying
 // a fly machine update indefinitely. Lives at the wiring site per the
@@ -191,7 +191,7 @@ func run(args []string, sigCtx context.Context) int {
 	// maxFrameBytes: 256 KiB per-frame read cap. Derivation:
 	// docs/specs/architecture/29-wsconn-read-limit.md (≤50-message
 	// message_chunk envelope + routing wrapper, headroom for outliers,
-	// four orders of magnitude below nhooyr's 32 MiB default).
+	// four orders of magnitude below the library's 32 MiB default).
 	const maxFrameBytes int64 = 256 * 1024
 
 	// Per-IP rate-limit policy: ~10 attempts/IP/minute steady-state, burst
@@ -229,7 +229,7 @@ func run(args []string, sigCtx context.Context) int {
 		// ReadHeaderTimeout (5s) bounds the pre-upgrade WebSocket
 		// handshake window — the gap between TCP accept and full HTTP
 		// request-header receipt. After header parse,
-		// nhooyr.io/websocket.Accept hijacks the connection and
+		// github.com/coder/websocket Accept hijacks the connection and
 		// ReadTimeout/WriteTimeout no longer apply; post-upgrade slow
 		// peers are covered by per-frame deadlines (#15) and heartbeat
 		// ping/pong (#7). Caps slow-loris exposure on the internet-

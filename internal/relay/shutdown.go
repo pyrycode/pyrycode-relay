@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"sync"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // gracefulCloser is the narrow contract that lets Shutdown emit a

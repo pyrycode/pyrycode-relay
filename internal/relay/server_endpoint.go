@@ -19,7 +19,7 @@ import (
 	"net/http"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // ServerHandler returns the http.Handler for /v1/server: the binary-side
@@ -58,7 +58,7 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxF
 			OriginPatterns: []string{"*"},
 		})
 		if err != nil {
-			// nhooyr.io/websocket has already written a 4xx response.
+			// github.com/coder/websocket has already written a 4xx response.
 			return
 		}
 

@@ -18,7 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // ClientHandler returns the http.Handler for /v1/client: the phone-side

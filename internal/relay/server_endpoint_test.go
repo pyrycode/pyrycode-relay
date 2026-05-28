@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // startServer spins up an httptest.NewServer running ServerHandler against a
