@@ -117,6 +117,96 @@ func TestRun_SigtermWithNoConns(t *testing.T) {
 	}
 }
 
+// TestRun_InsecureMutexWithAutocertListenFlags asserts the AC3 mutex:
+// --insecure-listen alongside either --http-listen or --https-listen is a
+// boot-time refusal (exit 2), because the new flags configure the autocert
+// listeners and silently no-op in insecure mode. The mutex check fires
+// before any listener is constructed, so the failure rows need no freePort
+// dance. The control row exists to lock in that the mutex does NOT fire
+// when --insecure-listen runs alone.
+func TestRun_InsecureMutexWithAutocertListenFlags(t *testing.T) {
+	controlAddr, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		args     []string
+		wantCode int
+		// run with a cancellable context only when we expect a clean signal-
+		// triggered exit; the mutex-refusal rows return before any listener
+		// is bound and need no cancel.
+		controlListener bool
+	}{
+		{
+			name: "insecure+http-listen",
+			args: []string{
+				"--insecure-listen", ":8080",
+				"--http-listen", ":80",
+				"--metrics-listen", "",
+			},
+			wantCode: 2,
+		},
+		{
+			name: "insecure+https-listen",
+			args: []string{
+				"--insecure-listen", ":8080",
+				"--https-listen", ":443",
+				"--metrics-listen", "",
+			},
+			wantCode: 2,
+		},
+		{
+			name: "insecure+both",
+			args: []string{
+				"--insecure-listen", ":8080",
+				"--http-listen", ":80",
+				"--https-listen", ":443",
+				"--metrics-listen", "",
+			},
+			wantCode: 2,
+		},
+		{
+			name: "insecure-alone-control",
+			args: []string{
+				"--insecure-listen", controlAddr,
+				"--metrics-listen", "",
+			},
+			wantCode:        0,
+			controlListener: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.controlListener {
+				sigCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				exit := make(chan int, 1)
+				go func() { exit <- run(tc.args, sigCtx) }()
+				if err := waitForDial(controlAddr, 3*time.Second); err != nil {
+					t.Fatalf("relay did not accept connections: %v", err)
+				}
+				cancel()
+				select {
+				case got := <-exit:
+					if got != tc.wantCode {
+						t.Errorf("run exit code: got %d, want %d", got, tc.wantCode)
+					}
+				case <-time.After(drainDeadline + 2*time.Second):
+					t.Fatal("run did not return after shutdown")
+				}
+				return
+			}
+			got := run(tc.args, context.Background())
+			if got != tc.wantCode {
+				t.Errorf("run exit code: got %d, want %d", got, tc.wantCode)
+			}
+		})
+	}
+}
+
 // freePort opens a loopback listener on port 0, captures the assigned
 // port, closes the listener, and returns the addr string. There is an
 // inherent race between close and the test re-binding it, but the

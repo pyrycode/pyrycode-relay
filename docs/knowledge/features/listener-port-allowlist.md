@@ -6,7 +6,7 @@ The relay refuses to start when the set of TCP ports the process is *about to bi
 
 - **Asymmetric.** Surplus listeners (`actual ⊋ expected`) are the threat shape and trigger refusal. Missing listeners (`actual ⊊ expected`) are *not* an error here — a failure to bind an expected port surfaces as a runtime listener error from `http.Server.ListenAndServe` (exit 1), which has its own clearer signal. Empty-on-both is permitted.
 - **Port-only.** Interface binding (`127.0.0.1` vs `0.0.0.0` vs `::`) is intentionally not part of the contract. The threat model the check encodes is "a listener exists on this port and is reachable"; on a single-instance internet-exposed deploy, every listener is reachable. A future ticket adding management-only loopback listeners would extend the set type without breaking the port-set shape.
-- **Expected set is flag-derived.** Autocert mode (`--domain` set): `{443, 80}`. Insecure mode (`--insecure-listen :<port>`): `{port}`. The expected set is built from the parsed flag values in `main`, not from a static literal — `--insecure-listen :8080` yields `{8080}`, not `{443}`.
+- **Expected set is flag-derived.** Autocert mode (`--domain` set): `{ListenerPort(*httpsListen), ListenerPort(*httpListen)}`, defaulting to `{443, 80}` when the new #96 flags are absent. Insecure mode (`--insecure-listen :<port>`): `{port}`. The expected set is built from the parsed flag values in `main`, not from a static literal — `--insecure-listen :8080` yields `{8080}`, not `{443}`; `--http-listen :8080 --https-listen :8443` yields `{8080, 8443}` (#96). Both branches drive `actual` and `expected` from the same `ListenerPort` parse.
 - **Actual set is `http.Server.Addr`-derived.** The check runs after the `http.Server` literals are constructed but *before* either `ListenAndServe` call. The relay's only network ingress today is `http.Server`-mediated; a future non-HTTP listener (gRPC, raw TCP) would need a deliberate spec update to extend the actual-set source.
 - **Port 0 is rejected.** `:0` means "pick an ephemeral port" in `net.Listen` semantics — accepting it would smuggle an unknown bound port past the actual-set construction and defeat the check. `ListenerPort` returns a wrapped error.
 
@@ -24,7 +24,7 @@ The check is inserted into each listener branch separately — the two branches 
 
 **Insecure-mode branch.** Builds `expected = {port}` and `actual = {port}` from the parsed flag, runs the check, exits 2 on surplus.
 
-**Autocert-mode branch.** Builds `expected = {443, 80}` and `actual = {ListenerPort(httpsSrv.Addr), ListenerPort(httpSrv.Addr)}`, runs the check, exits 2 on surplus.
+**Autocert-mode branch.** Builds `expected = actual = {ListenerPort(httpsSrv.Addr), ListenerPort(httpSrv.Addr)}` from the parsed `--https-listen` / `--http-listen` flags (defaulting to `:443` / `:80`; #96), runs the check, exits 2 on surplus.
 
 Three details:
 

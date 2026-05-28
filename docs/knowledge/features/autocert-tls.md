@@ -14,10 +14,10 @@ Authoritative wire spec: [`pyrycode/pyrycode/docs/protocol-mobile.md` § TLS](ht
 
 | Flag | When to use |
 |---|---|
-| `--domain <fqdn>` | Production. Relay holds the cert. Requires `:80` and `:443` reachable from the public internet. |
+| `--domain <fqdn>` | Production. Relay holds the cert. Requires `:80` and `:443` reachable from the public internet (directly bound, or substrate-forwarded via `--http-listen` / `--https-listen` — see § Operational notes). |
 | `--insecure-listen :8080` | Behind a reverse proxy that terminates TLS upstream, or local dev. Disables autocert. |
 
-The two are mutually exclusive; one of them must be set or the binary refuses to start.
+The two modes are mutually exclusive; one of them must be set or the binary refuses to start. `--insecure-listen` is also mutually exclusive with `--http-listen` / `--https-listen` (the new autocert listener-address flags would silently no-op in insecure mode; the boot refuses with exit 2).
 
 ## API
 
@@ -39,9 +39,13 @@ var ErrCacheDirInsecure = errors.New("relay: cert cache dir has insecure permiss
 |---|---|---|
 | `--domain` | (required for autocert) | Single domain. Bound via `autocert.HostWhitelist(domain)`; ACME issuance for any other host is rejected. |
 | `--cert-cache` | `~/.pyrycode-relay/certs` | Created with `0700` if missing. Refuses to start if an existing dir is world- or group-readable (`ErrCacheDirInsecure`). |
-| `--insecure-listen` | (unset) | Disables autocert. |
+| `--https-listen` | `:443` | Bind address for the autocert TLS terminator (host:port). Pass `:8443` etc. when a substrate forwards external 443 to a high internal port (#96). Validated via `relay.ListenerPort`. |
+| `--http-listen` | `:80` | Bind address for the ACME HTTP-01 challenge listener (host:port). Pass `:8080` etc. for the same high-port substrate-forward pattern (#96). Validated via `relay.ListenerPort`. |
+| `--insecure-listen` | (unset) | Disables autocert. Mutually exclusive with `--http-listen` / `--https-listen` (refused at boot with exit 2). |
 
 The cache dir is the only on-disk state the relay keeps. TLS private keys live there (autocert writes them with `0o600`).
+
+The two listener-address flags default to today's `:443` / `:80` so absence-of-flag preserves prior behaviour exactly — no existing deploy needs flag changes. The defaults are checked through the surplus-listener gate (#81) which is now parameterised on the configured ports rather than the literals.
 
 ## Two host gates
 
@@ -107,7 +111,9 @@ The `*autocert.Manager` is constructed once and used read-only; its internal loc
 
 ## Operational notes
 
-- `:80` and `:443` are privileged. Run with `sudo`, or grant `CAP_NET_BIND_SERVICE` via `setcap` / systemd `AmbientCapabilities`.
+- `:80` and `:443` are privileged. Options to bind them as the relay's process:
+  - Run with `sudo`, or grant `CAP_NET_BIND_SERVICE` via `setcap` / systemd `AmbientCapabilities`.
+  - **Substrate-portable alternative (#96)**: bind the relay to high internal ports via `--http-listen=:8080 --https-listen=:8443` and let the substrate forward external `:80`/`:443`. Works under any port-passthrough substrate that preserves the real TCP socket end-to-end (Fly TCP passthrough, K8s `Service` with `targetPort`, systemd `socket` forwarding). ACME HTTP-01 keeps working because Let's Encrypt opens TCP 80 on the public IP, the substrate forwards verbatim to the relay's internal port, and the autocert handler answers. Required for non-root deploys without `CAP_NET_BIND_SERVICE` (distroless/nonroot containers, K8s restricted SCC, unprivileged systemd).
 - First request to the domain after a fresh start may take ~10–20s while autocert issues and caches the cert. Subsequent restarts reuse the cache.
 - Cert renewal is silent — autocert handles it. No metrics in v1.
 
