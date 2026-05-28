@@ -1,6 +1,6 @@
 # WSConn — WebSocket adapter for the registry
 
-`WSConn` is the single adapter that wraps `nhooyr.io/websocket.Conn` so it satisfies the registry's `Conn` interface ([connection-registry.md](connection-registry.md)). The relay's WS upgrade handlers (`/v1/server` in #4/#16, `/v1/client` in #5) hand the registry a `*WSConn` rather than each inventing its own wrapper. Frame forwarding, broadcasts, and the future heartbeat ticket all reach the wire through this type.
+`WSConn` is the single adapter that wraps `github.com/coder/websocket.Conn` so it satisfies the registry's `Conn` interface ([connection-registry.md](connection-registry.md)). The relay's WS upgrade handlers (`/v1/server` in #4/#16, `/v1/client` in #5) hand the registry a `*WSConn` rather than each inventing its own wrapper. Frame forwarding, broadcasts, and the future heartbeat ticket all reach the wire through this type.
 
 The adapter is small on purpose: one file, one mutex, one one-shot guard, no goroutines, no queues. Everything else (handshake, header validation, close-code semantics, ping/pong, read-side frame loop) lives in adjacent tickets.
 
@@ -29,7 +29,7 @@ const writeTimeout = 10 * time.Second
 
 `writeTimeout` bounds a single `Send`. A slow peer cannot stall a caller past this deadline.
 
-`CloseWithCode` and `Ping` were added in #7 (heartbeat). `Close()` now delegates to `CloseWithCode(StatusNormalClosure, "")` — both share the `closeOnce` funnel, so whichever close-family call fires first wins. `Ping` is a pure forwarder over `*websocket.Conn.Ping`; it does not take `writeMu` because `nhooyr.io/websocket` serialises control frames against data writes internally. See [ADR-0007](../decisions/0007-wsconn-closewithcode-for-active-conn.md) for why active-conn application close codes go on `WSConn` while stillborn-WSConn close codes (`4409`/`4404`/`4401`, [ADR-0005](../decisions/0005-application-close-codes-via-underlying-conn.md)) keep the underlying-`*websocket.Conn` pattern.
+`CloseWithCode` and `Ping` were added in #7 (heartbeat). `Close()` now delegates to `CloseWithCode(StatusNormalClosure, "")` — both share the `closeOnce` funnel, so whichever close-family call fires first wins. `Ping` is a pure forwarder over `*websocket.Conn.Ping`; it does not take `writeMu` because `github.com/coder/websocket` serialises control frames against data writes internally. See [ADR-0007](../decisions/0007-wsconn-closewithcode-for-active-conn.md) for why active-conn application close codes go on `WSConn` while stillborn-WSConn close codes (`4409`/`4404`/`4401`, [ADR-0005](../decisions/0005-application-close-codes-via-underlying-conn.md)) keep the underlying-`*websocket.Conn` pattern.
 
 ## Concurrency model
 
@@ -42,7 +42,7 @@ const writeTimeout = 10 * time.Second
 
 One mutex, one one-shot. The lock graph is a single node. There are no callbacks, no channels, no goroutines spawned by the adapter.
 
-`Close` deliberately does **not** take `writeMu`. Acquiring it would deadlock against a slow peer holding the mutex inside `Send`: the whole point of cancelling `closeCtx` is to abort the in-flight `Write` so it releases the mutex on its own. `nhooyr.io/websocket.Conn.Close` is documented to be safe with an in-flight `Write` — that property is why this library was chosen.
+`Close` deliberately does **not** take `writeMu`. Acquiring it would deadlock against a slow peer holding the mutex inside `Send`: the whole point of cancelling `closeCtx` is to abort the in-flight `Write` so it releases the mutex on its own. `github.com/coder/websocket.Conn.Close` is documented to be safe with an in-flight `Write` — that property is why this library was chosen.
 
 `Read` takes only the caller-supplied `ctx`; it does **not** join `closeCtx`. Rationale (added in #25): when `Close` cancels `closeCtx` *and* closes the underlying `*websocket.Conn`, the in-flight library `Read` returns immediately with the close error. Plumbing `closeCtx` through the read path would be redundant. The single-caller contract makes the lock-free shape safe — only the per-WSConn forwarder goroutine (`internal/relay/forward.go`) calls `Read`.
 
@@ -80,7 +80,7 @@ Documented on `NewWSConn`: after construction, callers must reach the connection
 The adapter is on the hot path: every routed frame passes through `WSConn.Send`. Threats considered:
 
 - **Slow-loris on the write side.** A peer that completes the handshake and stops reading would, with `context.Background()` writes, hang every `Send` forever. Mitigated by `writeTimeout = 10s` — the first code-level slow-loris defence in the relay. A flood of such peers consumes one goroutine each for at most 10 seconds; connection-count caps belong to the WS upgrade ticket.
-- **Concurrent `Send` corrupting frames.** `nhooyr.io/websocket.Conn.Write` is *not* safe to call from multiple goroutines at once — concurrent calls would interleave bytes mid-frame. `writeMu` serialises every `Send`. Race-detector test under `-race` is the verification, not a smoke test.
+- **Concurrent `Send` corrupting frames.** `github.com/coder/websocket.Conn.Write` is *not* safe to call from multiple goroutines at once — concurrent calls would interleave bytes mid-frame. `writeMu` serialises every `Send`. Race-detector test under `-race` is the verification, not a smoke test.
 - **`Close` while many goroutines are blocked on `writeMu`.** `Close` cancels `closeCtx` without taking `writeMu`. The currently-writing goroutine's `ctx` is cancelled and `Write` returns. Each next-in-line goroutine acquires the mutex, derives a `WithTimeout(closeCtx, …)` from an already-cancelled parent, and `Write` short-circuits with the cancellation error. No goroutine is stuck.
 - **`Close` racing with mid-`Write` `Send`.** Library is documented to handle this; relying on that property is explicit. If the property regresses in a future library version, the race test surfaces a `DATA RACE`.
 - **Same `*websocket.Conn` wrapped by two `WSConn` constructors.** Each gets its own `writeMu`; serial-write guarantee is broken; the wire interleaves. Caller-invariant; not enforced.
@@ -106,11 +106,12 @@ What we deliberately do not test: the library's behaviour itself (we trust `Writ
 
 ## Dependency
 
-`nhooyr.io/websocket` (v1.8.x line). First WS library in the project; second non-stdlib direct dep (after `golang.org/x/crypto` for autocert). The vanity import path remains `nhooyr.io/websocket` even though the upstream module home moved to `github.com/coder/websocket`. `make lint` (`govulncheck`) covers known CVEs; the residual supply-chain risk (a malicious release tagged by an authentic maintainer would see every routed frame in cleartext) is named in `docs/threat-model.md` § "Supply chain — Go dependencies."
+`github.com/coder/websocket`. First WS library in the project; second non-stdlib direct dep (after `golang.org/x/crypto` for autocert). Migrated from the deprecated `nhooyr.io/websocket` vanity path in #98 ([ADR-0010](../decisions/0010-coder-websocket-migration.md)) — same upstream, same public API, maintained under the non-vanity path. `make lint` (`govulncheck`) covers known CVEs; the residual supply-chain risk (a malicious release tagged by an authentic maintainer would see every routed frame in cleartext) is named in `docs/threat-model.md` § "Supply chain — Go dependencies."
 
 ## Related
 
-- [ADR-0004: WS library choice and adapter context strategy](../decisions/0004-ws-library-and-adapter-context-strategy.md)
+- [ADR-0010: Migrate to `github.com/coder/websocket`](../decisions/0010-coder-websocket-migration.md) — supersedes ADR-0004; the library identity in use today.
+- [ADR-0004: WS library choice and adapter context strategy](../decisions/0004-ws-library-and-adapter-context-strategy.md) — superseded; retained as historical context for the original choice and the adapter context-strategy rationale (still in force).
 - [Connection registry](connection-registry.md) — the `Conn` interface this implements.
 - [Phone-side frame forwarder](phone-forwarder.md) — sole caller of `Read`; satisfies the local `phoneSource` interface.
 - [Threat model](../../threat-model.md) — slow-loris and supply-chain framings.

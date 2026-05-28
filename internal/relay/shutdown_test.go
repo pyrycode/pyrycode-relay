@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // shutdownFakeConn extends the registry-test fakeConn pattern with a

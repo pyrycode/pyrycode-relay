@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // startEcho stands up an httptest server whose handler upgrades to a

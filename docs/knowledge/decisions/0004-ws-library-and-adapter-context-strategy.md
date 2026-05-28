@@ -1,6 +1,6 @@
 # ADR-0004: WS library choice and adapter context strategy
 
-**Status:** Accepted (#15)
+**Status:** Superseded by [ADR-0010](0010-coder-websocket-migration.md) (#98)
 **Date:** 2026-05-08
 
 ## Context

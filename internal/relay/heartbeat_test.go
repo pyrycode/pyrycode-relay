@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // startHeartbeatPair stands up an httptest server whose handler upgrades
@@ -118,7 +118,7 @@ func TestHeartbeat_HealthyPeer_KeepsConnOpen(t *testing.T) {
 // conn with code 1011 and reason "heartbeat timeout" within one
 // timeout window.
 //
-// nhooyr's Conn.Close performs a close handshake with a 5s grace
+// coder/websocket's Conn.Close performs a close handshake with a 5s grace
 // waiting for the peer's reciprocal close frame. The close frame
 // itself reaches the wire immediately; runHeartbeat's exit (and so
 // `done`) is gated on the handshake's grace expiring (the unresponsive

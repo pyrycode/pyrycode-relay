@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // TestRun_SigtermClosesWSConnsWithGoingAway boots the relay via run()

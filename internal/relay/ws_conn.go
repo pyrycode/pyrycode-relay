@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // writeTimeout bounds a single Send. A slow peer cannot stall a caller
@@ -13,7 +13,7 @@ import (
 // error and the caller decides whether to drop the connection.
 const writeTimeout = 10 * time.Second
 
-// WSConn adapts a *websocket.Conn from nhooyr.io/websocket to the
+// WSConn adapts a *websocket.Conn from github.com/coder/websocket to the
 // registry's Conn interface. It owns the per-connection write mutex
 // (the underlying library forbids concurrent Write) and a per-connection
 // cancellation context that Close trips to abort in-flight writes.
@@ -121,7 +121,7 @@ func (w *WSConn) CloseWithCode(code websocket.StatusCode, reason string) {
 
 // Ping sends an RFC 6455 ping control frame and blocks until the
 // matching pong returns or ctx expires. Pure forwarder over the
-// library's Conn.Ping; does not take writeMu — nhooyr.io/websocket
+// library's Conn.Ping; does not take writeMu — github.com/coder/websocket
 // serialises control frames against data writes internally.
 //
 // Used by runHeartbeat. A non-nil return is the caller's signal that
