@@ -62,7 +62,9 @@ func TestIPRateLimiter_RefillAfterAdvance(t *testing.T) {
 	l, clk := newTestLimiter(t, time.Second, 2)
 
 	// Exhaust the burst at t=0.
-	if !l.Allow("a") || !l.Allow("a") {
+	burst1 := l.Allow("a")
+	burst2 := l.Allow("a")
+	if !burst1 || !burst2 {
 		t.Fatal("burst Allows: got false, want true")
 	}
 	if l.Allow("a") {
@@ -80,7 +82,9 @@ func TestIPRateLimiter_RefillAfterAdvance(t *testing.T) {
 
 	// Advance by 2s (cap clamps at burst=2) — two tokens, third denies.
 	clk.Advance(2 * time.Second)
-	if !l.Allow("a") || !l.Allow("a") {
+	refill1 := l.Allow("a")
+	refill2 := l.Allow("a")
+	if !refill1 || !refill2 {
 		t.Fatal("two Allows after 2s advance: expected both true (burst cap)")
 	}
 	if l.Allow("a") {
@@ -95,7 +99,9 @@ func TestIPRateLimiter_FractionalRefillPreserved(t *testing.T) {
 	t.Parallel()
 	l, clk := newTestLimiter(t, time.Second, 2)
 
-	if !l.Allow("a") || !l.Allow("a") {
+	burst1 := l.Allow("a")
+	burst2 := l.Allow("a")
+	if !burst1 || !burst2 {
 		t.Fatal("burst Allows: got false, want true")
 	}
 	if l.Allow("a") {
@@ -164,7 +170,9 @@ func TestIPRateLimiter_EvictionPreservesActiveBucket(t *testing.T) {
 	l, clk := newTestLimiter(t, 10*time.Millisecond, 2)
 
 	// Exhaust the burst (so tokens=0, subsequent Allows deny).
-	if !l.Allow("a") || !l.Allow("a") {
+	burst1 := l.Allow("a")
+	burst2 := l.Allow("a")
+	if !burst1 || !burst2 {
 		t.Fatal("burst Allows: got false, want true")
 	}
 
