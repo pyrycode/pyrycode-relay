@@ -50,6 +50,17 @@ The distroless runtime image has no shell, so `[processes] app = "..."` is treat
 
 `primary_region = "__REGION__"` and `--domain __DOMAIN__` ship as placeholders. The first deploy fails loudly if the operator forgets to fill them — preferable to a plausible-but-wrong real value escaping review (cf. the silently-misconfigured-cert-dir failure mode the autocert work guarded against).
 
+### Manifest gotchas surfaced by first-deploy bootstrap (#97)
+
+Two non-obvious `fly.toml` requirements were captured after the 2026-05-24 first-deploy bootstrap. Both are now encoded in the checked-in manifest; the operator-facing notes live in [`docs/deploy.md` § *fly.toml gotchas*](../../deploy.md#flytoml-gotchas).
+
+- **`[env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` is required on Fly.** Fly's substrate exposes `FLY_APP_NAME`, which the #65 self-check reads as a multi-instance-capable platform. Without this env var asserted in the manifest, the relay refuses to boot. The `[env]` block sits immediately under the manifest's single-machine-cap header comment with an inline rationale that names the self-check by issue number, so a future reader doesn't mistake the assertion for dead config. This is the deploy-time half of the [Single-instance startup self-check](single-instance-check.md) belt-and-suspenders pair — the binary-side gate plus the manifest-side assertion together close the "operator deployed to Fly and never read `architecture.md`" failure mode.
+- **`processes = ["app"]` on each `[[services]]` block.** Fly's schema requires every service to name its process whenever `[processes]` is defined, and `[processes]` is always defined here (argv lives in `[processes]` because distroless has no shell to expand env vars into argv — see *Argv, not shell* above). Adding a third `[[services]]` block in a future ticket means adding `processes = ["app"]` as the first line; `flyctl config validate` is the structural backstop but PR-time correctness is cheaper than a failed CI deploy.
+
+### Listen-port pinning is provisional
+
+The current manifest pins `internal_port = 80` / `internal_port = 443`, matching autocert's hardcoded defaults from the pre-#96 era. [Ticket #96](https://github.com/pyrycode/pyrycode-relay/issues/96) — [Autocert TLS (configurable HTTP-01 and TLS listener addresses)](autocert-tls.md) — has now shipped the binary-side capability for high-port substrates (`--http-listen` / `--https-listen` flags, defaults preserve the low-port binding exactly). Landing the canonical high-port Fly recipe (`internal_port = 8080` / `internal_port = 8443` + `--http-listen=:8080 --https-listen=:8443` in `[processes]`, with external `port = 80` / `port = 443` untouched on the `[[services.ports]]` blocks) is a deferred doc-only follow-up that owns the operator-side verification dance against a real Fly deploy. The #97 forward pointer in [`docs/deploy.md` § *fly.toml gotchas*](../../deploy.md#flytoml-gotchas) is the institutional-memory seam that keeps the follow-up findable.
+
 ## CI deploy job — privilege model
 
 `deploy` runs in `.github/workflows/ci.yml` after `image-scan`. Three structural defences keep `FLY_API_TOKEN` away from untrusted code:
@@ -88,7 +99,8 @@ A rollback does **not** revert the `main` commit. To prevent CI's next deploy fr
 
 ## Cross-links
 
-- [Ticket #38 codebase notes](../codebase/38.md) — what landed in this ticket.
+- [Ticket #38 codebase notes](../codebase/38.md) — what landed for the initial Fly wiring.
+- [Ticket #97 codebase notes](../codebase/97.md) — fly.toml gotchas captured after the 2026-05-24 first-deploy bootstrap (the `[env]` block and per-`[[services]]` `processes = ["app"]` mapping).
 - [Architect spec](../../specs/architecture/38-fly-deploy-manifest.md) — full design rationale + security review.
 - [`docs/deploy.md`](../../deploy.md) — operator-facing bootstrap / steady-state / rollback.
 - [`docs/architecture.md` § Hosting](../../architecture.md#hosting) — the decision record.
