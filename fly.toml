@@ -16,6 +16,11 @@
 app = "pyrycode-relay"
 primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 
+[env]
+  # Asserts single-instance intent to the #65 self-check, which would
+  # otherwise refuse to boot on Fly's multi-instance-capable substrate.
+  PYRYCODE_RELAY_SINGLE_INSTANCE = "1"
+
 [build]
   dockerfile = "Dockerfile"
 
@@ -35,6 +40,7 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 # Raw TCP services. NO `handlers = ["http"]` / `handlers = ["tls"]` —
 # either would terminate at Fly's edge and break autocert.
 [[services]]
+  processes = ["app"]
   protocol = "tcp"
   internal_port = 80
   auto_stop_machines = "off"
@@ -48,6 +54,7 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
     # autocert HTTP-01 listener and ADR-0002's 404 fallback.
 
 [[services]]
+  processes = ["app"]
   protocol = "tcp"
   internal_port = 443
   auto_stop_machines = "off"

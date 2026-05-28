@@ -40,6 +40,32 @@ Done once per Fly app — typically only the production app.
    `pyrycode-relay`-only deploy token if Fly's tokens UI offers that at
    bootstrap time.
 
+## fly.toml gotchas
+
+Non-obvious requirements that surface as `flyctl deploy` failures or
+boot-time errors. Both are encoded in the checked-in `fly.toml`; the
+notes here exist so an operator editing the manifest (first bootstrap,
+re-cutover, porting to a new app) doesn't trip them again.
+
+1. **`[env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` is required.** Fly's
+   substrate exposes `FLY_APP_NAME`, which the #65 self-check reads as
+   a multi-instance-capable platform; without this assertion the binary
+   refuses to boot. See
+   [`docs/architecture.md` § *The `PYRYCODE_RELAY_SINGLE_INSTANCE` bypass*](architecture.md#the-pyrycode_relay_single_instance-bypass)
+   for the rationale.
+2. **`processes = ["app"]` on each `[[services]]` block.** Fly's schema
+   requires every service to name its process whenever `[processes]` is
+   defined, and `[processes]` is always defined here because the
+   distroless image has no shell to expand env vars into argv — the
+   relay receives `--domain` / `--cert-cache` via the `[processes]`
+   argv string.
+3. **Listen ports are pinned to 80 / 443 today.** `internal_port = 80`
+   and `internal_port = 443` work only because autocert hardcodes those
+   ports. Once [#96](https://github.com/pyrycode/pyrycode-relay/issues/96)
+   ships, revisit this section to document the high-port pattern
+   (internal `8080`/`8443` mapped to external `80`/`443`) as the
+   canonical Fly recipe.
+
 ## Steady-state flow
 
 1. Open a PR. CI runs `test`, `security`, and `image-scan` on the PR HEAD.
