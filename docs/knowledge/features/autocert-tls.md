@@ -62,12 +62,15 @@ Single-domain enforcement happens in two places, because the TLS handshake's SNI
 
 - Missing → `os.MkdirAll(dir, 0o700)`.
 - Exists, is dir, mode `& 0o077 == 0` → no-op (secure).
-- Exists, is dir, mode `& 0o077 != 0` → `ErrCacheDirInsecure` (refuses to start).
+- Exists, is dir, mode `& 0o077 != 0`, **owned by relay's runtime euid** (Linux only) → `os.Chmod(dir, 0o700)` + INFO log (`"tightened cert cache dir perms"` with `path` / `from` / `to`), continue startup.
+- Exists, is dir, mode `& 0o077 != 0`, owned by foreign uid (or ownership not discoverable, e.g. non-Linux) → `ErrCacheDirInsecure` (refuses to start).
 - Exists, not a dir → error.
 
-Reasoning: TLS private keys live there. Silently accepting an attacker-readable cache fits neither the relay's "internet-exposed; adversarial input is the default" stance nor the `--insecure-listen` precedent of loud failure.
+Reasoning: TLS private keys live there. Silently accepting an attacker-staged cache fits neither the relay's "internet-exposed; adversarial input is the default" stance nor the `--insecure-listen` precedent of loud failure.
 
-Per-file mode (`0o600`) is autocert's contract, not enforced here.
+The same-uid tightening is the only departure from the "loud failure over silent correction" project rule for this sentinel. It exists because Fly.io's `[[mounts]]` block has no `mode` field and the volume is remounted at 0755 on every machine boot — without the narrowing, every restart after a volume detach/reattach would trip `ErrCacheDirInsecure`. Foreign-uid 0755 still means "someone else staged a directory the relay is about to write TLS keys into" and continues to fail closed (#95). Ownership probe is Linux-only via `syscall.Stat_t.Uid` (`internal/relay/owner_linux.go`); on darwin / other GOOS the `owner_other.go` stub returns "ownership unknown" so the unchanged rejection path runs (strict superset of pre-#95 behaviour, no regression).
+
+Per-file mode (`0o600`) is autocert's contract, not enforced here. The directory-perm tightening above relies on that contract — if autocert's `DirCache` ever changed file perms, a 0755 dir handed over with stale files would need a separate walk-and-re-tighten. Today it does not.
 
 ## Server timeouts
 
