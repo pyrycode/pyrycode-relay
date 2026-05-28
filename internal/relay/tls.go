@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -13,15 +14,27 @@ import (
 )
 
 // ErrCacheDirInsecure is returned by NewAutocertManager when CacheDir
-// already exists with permissions broader than 0700. TLS private keys
-// live there; the relay refuses to start with a world- or group-readable
-// cache rather than silently weakening the deployment.
+// already exists with permissions broader than 0700 and the directory is
+// owned by a uid other than the relay's runtime euid (or ownership is not
+// discoverable on this platform). TLS private keys live there; a foreign
+// owner staging the cache path is a structurally suspicious state that
+// must fail loud.
+//
+// Narrow exception: when the dir is owned by the relay's own euid (the
+// substrate, e.g. a Fly volume mount, just handed our process a fresh dir
+// at 0755), NewAutocertManager tightens the mode to 0700 in place and
+// continues startup. This is the only departure from the "loud failure
+// over silent correction" project rule for this sentinel.
 var ErrCacheDirInsecure = errors.New("relay: cert cache dir has insecure permissions (must be 0700)")
 
 // NewAutocertManager returns an autocert.Manager bound to the single
 // domain via HostWhitelist. The cache dir is created with mode 0700 if
-// missing. If it already exists with permissions broader than 0700, the
-// function returns ErrCacheDirInsecure (wrapped with the dir path).
+// missing. If it already exists with permissions broader than 0700 and
+// is owned by the relay's runtime euid, the directory is tightened to
+// 0700 in place (one INFO log line) and startup continues. If it exists
+// with permissions broader than 0700 and is owned by any other uid (or
+// ownership cannot be discovered), the function returns
+// ErrCacheDirInsecure (wrapped with the dir path).
 //
 // The returned manager terminates ACME http-01 challenges via its
 // HTTPHandler (mount on :80) and serves certificates via TLSConfig
@@ -44,7 +57,17 @@ func NewAutocertManager(domain, cacheDir string) (*autocert.Manager, error) {
 			return nil, fmt.Errorf("relay: cert cache path is not a directory: %s", cacheDir)
 		}
 		if mode := info.Mode().Perm(); mode&0o077 != 0 {
-			return nil, fmt.Errorf("%w: %s (mode %o)", ErrCacheDirInsecure, cacheDir, mode)
+			ownerUID, ok := fileOwnerUID(info)
+			if !ok || ownerUID != uint32(os.Geteuid()) {
+				return nil, fmt.Errorf("%w: %s (mode %o)", ErrCacheDirInsecure, cacheDir, mode)
+			}
+			if err := os.Chmod(cacheDir, 0o700); err != nil {
+				return nil, fmt.Errorf("relay: tightening cert cache dir %s: %w", cacheDir, err)
+			}
+			slog.Default().Info("tightened cert cache dir perms",
+				"path", cacheDir,
+				"from", fmt.Sprintf("%#o", mode),
+				"to", "0700")
 		}
 	}
 
