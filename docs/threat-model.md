@@ -7,7 +7,7 @@ Each threat below records four fields:
 - **Severity** — `low` / `medium` / `high`.
 - **v1 mitigation** — what is already in place, with a `file:line` anchor when grounded in code.
 - **Residual risk** — what the v1 mitigation does not cover.
-- **Future hardening** — what we would add if the residual risk became material; "deferred" status is first-class, not a gap.
+- **Future hardening** — what we would add if the residual risk became material; "deferred" status is first-class, not a gap. The "Future hardening" lines below are also collected, with triggers and rough scope, in [`security-followups.md`](security-followups.md) — that file is the menu when "what about hardening X?" comes up; this file is the threat narrative.
 
 ## Deploy security — VPS compromise
 
