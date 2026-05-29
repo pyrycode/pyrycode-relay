@@ -59,12 +59,31 @@ re-cutover, porting to a new app) doesn't trip them again.
    distroless image has no shell to expand env vars into argv — the
    relay receives `--domain` / `--cert-cache` via the `[processes]`
    argv string.
-3. **Listen ports are pinned to 80 / 443 today.** `internal_port = 80`
-   and `internal_port = 443` work only because autocert hardcodes those
-   ports. Once [#96](https://github.com/pyrycode/pyrycode-relay/issues/96)
-   ships, revisit this section to document the high-port pattern
-   (internal `8080`/`8443` mapped to external `80`/`443`) as the
-   canonical Fly recipe.
+3. **High-port pattern: bind `:8080`/`:8443` internally; Fly forwards
+   external `:80`/`:443`.** The distroless `:nonroot` Dockerfile runs the
+   binary as uid `65532`, which can't bind privileged ports (`<1024`) on
+   Linux without `CAP_NET_BIND_SERVICE`. The relay's `--http-listen` and
+   `--https-listen` flags (added in
+   [#96](https://github.com/pyrycode/pyrycode-relay/issues/96)) take
+   operator-supplied addresses; the checked-in `fly.toml` passes
+   `--http-listen=:8080 --https-listen=:8443` in the `[processes]` argv,
+   and the matching `[[services]].internal_port` values let Fly's TCP
+   passthrough forward:
+   - `[[services]] internal_port = 8080` ← external `port = 80`
+     (ACME HTTP-01 challenge listener + ADR-0002 `404` fallback for
+     non-challenge requests).
+   - `[[services]] internal_port = 8443` ← external `port = 443`
+     (autocert TLS terminator; cert lives in the binary, not at Fly's
+     edge).
+
+   The external ports must stay at `80` / `443` so Let's Encrypt's HTTP-01
+   reaches autocert on the standard challenge port of the public IP, and
+   clients reach TLS on the standard HTTPS port. The flags default to
+   `:80` / `:443` for substrates that grant the bind capability (root,
+   K8s with `NET_BIND_SERVICE`, systemd `AmbientCapabilities`); pass the
+   override on any nonroot substrate. The full rationale, mutex with
+   `--insecure-listen`, and listener-allowlist interaction live in
+   [`docs/specs/architecture/96-autocert-configurable-listener-addrs.md`](specs/architecture/96-autocert-configurable-listener-addrs.md).
 
 ## Steady-state flow
 
