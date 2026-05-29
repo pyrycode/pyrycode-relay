@@ -29,7 +29,13 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 # is a one-line edit to this file — config, not code — and rides the
 # next deploy.
 [processes]
-  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert"
+  # `--http-listen=:8080` + `--https-listen=:8443` match the high-port
+  # pattern documented as the canonical Fly recipe in docs/deploy.md:
+  # the binary runs as nonroot (distroless `:nonroot` Dockerfile, uid
+  # 65532) and can't bind privileged ports < 1024. Fly's TCP passthrough
+  # then forwards external 80/443 → internal 8080/8443 (see the matching
+  # `internal_port` settings in the [[services]] blocks below).
+  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443"
 
 [[mounts]]
   source = "relay_autocert"
@@ -42,7 +48,7 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 [[services]]
   processes = ["app"]
   protocol = "tcp"
-  internal_port = 80
+  internal_port = 8080   # relay binds :8080 internally (nonroot can't bind :80); Fly forwards external :80 → internal :8080.
   auto_stop_machines = "off"
   auto_start_machines = false
   min_machines_running = 1
@@ -56,7 +62,7 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 [[services]]
   processes = ["app"]
   protocol = "tcp"
-  internal_port = 443
+  internal_port = 8443   # relay binds :8443 internally (nonroot can't bind :443); Fly forwards external :443 → internal :8443.
   auto_stop_machines = "off"
   auto_start_machines = false
   min_machines_running = 1
