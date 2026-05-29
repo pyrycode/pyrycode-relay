@@ -87,34 +87,53 @@ re-cutover, porting to a new app) doesn't trip them again.
 
 ## Steady-state flow
 
-1. Open a PR. CI runs `test`, `security`, and `image-scan` on the PR HEAD.
-2. Merge to `main`. CI re-runs the three jobs against `main`, then runs
-   `deploy` (gated on all three passing).
-3. `deploy` invokes `flyctl deploy --remote-only`. Fly's remote builder
-   rebuilds the image from `Dockerfile` and replaces the single machine
-   in place via the `immediate` deploy strategy.
+Deploys are **operator-direct from a clean `main`** since 2026-05-24,
+when the convenience CI workflow (`.github/workflows/ci.yml`) was
+removed across the org (commit
+[`0b987e2`](https://github.com/pyrycode/pyrycode-relay/commit/0b987e2)).
+Pre-merge correctness is handled by the dispatcher pipeline (PO →
+architect → developer → code-review → docs stages, each running
+`make check` = `go vet + go test -race`); the daily
+[`security-scan.yml`](../.github/workflows/security-scan.yml) workflow
+keeps the `govulncheck` + image-scan guards firing against `main`. No
+GHA workflow auto-deploys on push.
+
+1. Land changes on `main` (dispatcher pipeline for tickets;
+   operator-direct PR for runner/release-adjacent or other
+   pipeline-incompatible work).
+2. From a clean local checkout of `main`, run `make check` for the
+   final pre-deploy gate, then `flyctl deploy --remote-only -a
+   pyrycode-relay`. Fly's remote builder rebuilds the image from
+   `Dockerfile` and replaces the single machine in place via the
+   `immediate` deploy strategy.
+3. Verify post-deploy: `flyctl status -a pyrycode-relay` (machine
+   `started`), `curl -sS https://pyrycode-relay.pyryco.de/healthz`
+   (`200`), and a tail of `flyctl logs -a pyrycode-relay` for any
+   startup-time errors.
 
 Observability:
 
-- `flyctl status` — machine health.
-- `flyctl logs --app pyrycode-relay` — relay stderr in real time.
-- The deploy job's GitHub Actions log records the build + roll output.
+- `flyctl status -a pyrycode-relay` — machine health.
+- `flyctl logs -a pyrycode-relay` — relay stderr in real time.
+- Local deploy output records the build + roll progress (the GHA
+  Actions log no longer exists for deploys).
 
 ## Rollback
 
 Two paths, in increasing order of disruption.
 
-1. **By image digest (preferred).** `flyctl releases list` shows recent
-   release digests. `flyctl deploy --image <prior-digest> --remote-only`
-   pins to the prior image without rebuilding. The autocert cache
-   persists across rollbacks (it's on the volume), so no Let's Encrypt
-   re-issuance is triggered.
-2. **By release number.** `flyctl releases rollback` rolls back the
-   *most recent* release. Use when the prior release's digest isn't to
-   hand and a rollback is needed immediately.
+1. **By image digest (preferred).** `flyctl releases list -a
+   pyrycode-relay` shows recent release digests. `flyctl deploy --image
+   <prior-digest> --remote-only -a pyrycode-relay` pins to the prior
+   image without rebuilding. The autocert cache persists across
+   rollbacks (it's on the volume), so no Let's Encrypt re-issuance is
+   triggered.
+2. **By release number.** `flyctl releases rollback -a pyrycode-relay`
+   rolls back the *most recent* release. Use when the prior release's
+   digest isn't to hand and a rollback is needed immediately.
 
-A rollback does **not** revert the `main` commit. To prevent CI's next
-deploy from immediately re-rolling the broken release forward, either
-revert the offending PR before the next merge to `main`, or disable the
-`deploy` job temporarily by editing `.github/workflows/ci.yml` on a
-revert PR.
+A rollback does **not** revert the `main` commit. Because deploys are
+operator-direct, there is no auto-deploy that would re-roll a broken
+release forward — but the next manual `flyctl deploy --remote-only`
+WILL rebuild from `main`'s current HEAD. Revert the offending PR on
+`main` before the next deploy, or you'll re-ship the bad change.
