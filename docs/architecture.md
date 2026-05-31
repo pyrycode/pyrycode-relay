@@ -68,7 +68,7 @@ Production deploys to a single **Fly.io** machine in one region. TLS terminates 
 
 The single-machine cap is platform-enforced via `min_machines_running = 1`, `auto_start_machines = false`, and `auto_stop_machines = "off"` in `fly.toml`, and binary-enforced via the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65). Multi-instance scaling is out of scope for v1 — see § *Single-instance constraint* above.
 
-Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). CI deploy job: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). Deploys are operator-direct from clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](deploy.md).
 
 ## Threat model
 
