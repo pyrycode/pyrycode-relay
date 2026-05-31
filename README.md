@@ -17,7 +17,7 @@ Implements the [`v1` mobile protocol](https://github.com/pyrycode/pyrycode/blob/
 
 ## Status
 
-**Pre-alpha.** Scaffold only; no routing logic yet. See open issues for current work.
+**Production — LIVE.** Deployed to [Fly.io](https://fly.io) at `pyrycode-relay.pyryco.de`, live since 2026-05-29 (DENIC delegation landed, real Let's Encrypt cert, `/healthz` returns `200`). Full routing shipped — phone ↔ binary frame forwarding, per-IP rate limiting, graceful shutdown, metrics, and autocert TLS termination. Deploys are operator-direct from a clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](docs/deploy.md).
 
 ## Build
 
@@ -35,7 +35,7 @@ docker build -t pyrycode-relay:dev .
 docker run --rm pyrycode-relay:dev --version
 ```
 
-The image is host-agnostic: it exposes `:80` and `:443` for autocert, and declares a volume mount point at `/var/lib/relay/autocert` for the cert cache. Host-specific deploy wiring (TLS termination policy, port publishing, volume backing, single-instance enforcement) lives in #38.
+The image is host-agnostic: it exposes `:80` and `:443` for autocert, and declares a volume mount point at `/var/lib/relay/autocert` for the cert cache. Host-specific deploy wiring (TLS termination policy, port publishing, volume backing, single-instance enforcement) lives in [`fly.toml`](./fly.toml) and is documented in [`docs/deploy.md`](docs/deploy.md).
 
 ## Run
 
@@ -59,8 +59,12 @@ Flags:
 |---|---|---|
 | `--domain` | (required for autocert) | Public domain for Let's Encrypt cert issuance. Required when `--insecure-listen` is unset. |
 | `--cert-cache` | `~/.pyrycode-relay/certs` | Directory for autocert's TLS certificate cache. Created with `0700` if missing; refuses to start if an existing dir is world- or group-readable. |
-| `--insecure-listen` | (unset) | Listen address for plain HTTP (e.g. `:8080`). Disables autocert. Use only when fronted by a reverse proxy. |
+| `--https-listen` | `:443` | Bind address for the autocert TLS terminator (host:port). Pass `:8443` etc. when a substrate forwards external 443 to a high internal port. |
+| `--http-listen` | `:80` | Bind address for the ACME HTTP-01 challenge listener (host:port). Pass `:8080` etc. for the same high-port substrate-forward pattern. |
+| `--insecure-listen` | (unset) | Listen address for plain HTTP (e.g. `:8080`). Disables autocert. Use only when fronted by a reverse proxy. Mutually exclusive with `--http-listen` / `--https-listen`. |
 | `--version` | | Print version and exit. |
+
+`:80` and `:443` are privileged. On a nonroot substrate that can't bind them (distroless/`:nonroot` containers running uid 65532, K8s restricted SCC, unprivileged systemd without `CAP_NET_BIND_SERVICE`), bind high internal ports via `--http-listen=:8080 --https-listen=:8443` and let the substrate forward external `:80`/`:443`. The production Fly deploy uses `--http-listen=:8080 --https-listen=:8443`. ACME HTTP-01 keeps working under any TCP-passthrough substrate. See [`docs/knowledge/features/autocert-tls.md`](docs/knowledge/features/autocert-tls.md) § Operational notes.
 
 ## License
 

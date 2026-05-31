@@ -1,12 +1,12 @@
 # Fly.io deploy — production host wiring
 
-The relay's production host is a single [Fly.io](https://fly.io) machine in one region. `fly.toml` at the repo root tells Fly how to run the portable image from #32; `.github/workflows/ci.yml`'s `deploy` job re-applies the manifest on every push to `main`. Operator-facing procedures live in [`docs/deploy.md`](../../deploy.md); the decision record lives in [`docs/architecture.md` § Hosting](../../architecture.md#hosting).
+The relay's production host is a single [Fly.io](https://fly.io) machine in one region. `fly.toml` at the repo root tells Fly how to run the portable image from #32. Deploys are **operator-direct from a clean `main`** (`flyctl deploy --remote-only`) since 2026-05-24, when the convenience CI deploy workflow (`.github/workflows/ci.yml`) was removed across the org — no GHA workflow auto-deploys on push. Operator-facing procedures live in [`docs/deploy.md`](../../deploy.md); the decision record lives in [`docs/architecture.md` § Hosting](../../architecture.md#hosting).
 
 ## What it does
 
 - **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and a single-machine hard cap.
-- **CI `deploy` job** runs `flyctl deploy --remote-only` on push to `main`, gated on `test` + `security` + `image-scan` passing. Fly's remote builder rebuilds the image from `Dockerfile` against the merged commit and rolls the single machine in place.
-- **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → set the `FLY_API_TOKEN` GitHub repo secret → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`.
+- **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `immediate` strategy. No GHA workflow auto-deploys.
+- **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment); no GitHub repo secret is involved anymore.
 
 ## Why this shape
 
@@ -55,30 +55,29 @@ The distroless runtime image has no shell, so `[processes] app = "..."` is treat
 Two non-obvious `fly.toml` requirements were captured after the 2026-05-24 first-deploy bootstrap. Both are now encoded in the checked-in manifest; the operator-facing notes live in [`docs/deploy.md` § *fly.toml gotchas*](../../deploy.md#flytoml-gotchas).
 
 - **`[env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` is required on Fly.** Fly's substrate exposes `FLY_APP_NAME`, which the #65 self-check reads as a multi-instance-capable platform. Without this env var asserted in the manifest, the relay refuses to boot. The `[env]` block sits immediately under the manifest's single-machine-cap header comment with an inline rationale that names the self-check by issue number, so a future reader doesn't mistake the assertion for dead config. This is the deploy-time half of the [Single-instance startup self-check](single-instance-check.md) belt-and-suspenders pair — the binary-side gate plus the manifest-side assertion together close the "operator deployed to Fly and never read `architecture.md`" failure mode.
-- **`processes = ["app"]` on each `[[services]]` block.** Fly's schema requires every service to name its process whenever `[processes]` is defined, and `[processes]` is always defined here (argv lives in `[processes]` because distroless has no shell to expand env vars into argv — see *Argv, not shell* above). Adding a third `[[services]]` block in a future ticket means adding `processes = ["app"]` as the first line; `flyctl config validate` is the structural backstop but PR-time correctness is cheaper than a failed CI deploy.
+- **`processes = ["app"]` on each `[[services]]` block.** Fly's schema requires every service to name its process whenever `[processes]` is defined, and `[processes]` is always defined here (argv lives in `[processes]` because distroless has no shell to expand env vars into argv — see *Argv, not shell* above). Adding a third `[[services]]` block in a future ticket means adding `processes = ["app"]` as the first line; `flyctl config validate` is the structural backstop but PR-time correctness is cheaper than a failed `flyctl deploy`.
 
 ### Listen-port pinning is provisional
 
 The current manifest pins `internal_port = 80` / `internal_port = 443`, matching autocert's hardcoded defaults from the pre-#96 era. [Ticket #96](https://github.com/pyrycode/pyrycode-relay/issues/96) — [Autocert TLS (configurable HTTP-01 and TLS listener addresses)](autocert-tls.md) — has now shipped the binary-side capability for high-port substrates (`--http-listen` / `--https-listen` flags, defaults preserve the low-port binding exactly). Landing the canonical high-port Fly recipe (`internal_port = 8080` / `internal_port = 8443` + `--http-listen=:8080 --https-listen=:8443` in `[processes]`, with external `port = 80` / `port = 443` untouched on the `[[services.ports]]` blocks) is a deferred doc-only follow-up that owns the operator-side verification dance against a real Fly deploy. The #97 forward pointer in [`docs/deploy.md` § *fly.toml gotchas*](../../deploy.md#flytoml-gotchas) is the institutional-memory seam that keeps the follow-up findable.
 
-## CI deploy job — privilege model
+## Deploy privilege model — operator-direct
 
-`deploy` runs in `.github/workflows/ci.yml` after `image-scan`. Three structural defences keep `FLY_API_TOKEN` away from untrusted code:
+Deploys run from an operator's local checkout of clean `main`, not from CI. The deploy credential (`FLY_API_TOKEN`, or a `flyctl auth login` session) lives only in the operator's local environment — it never touches GitHub Actions. PR code, including code from forks, has no path to a deploy credential because no workflow holds one.
 
-1. **Branch gate.** `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`. PRs (including from forks) never satisfy this condition.
-2. **`needs:` chain.** `test` + `security` + `image-scan` must pass. A bad PR that slips through review still has to pass the existing gates.
-3. **Job-level `permissions: contents: read`.** Belt-and-suspenders on the workflow-level header. `FLY_API_TOKEN` flows only as `env:` on the deploy step.
+The pre-merge correctness gates that the old CI `deploy` job depended on still run, just decoupled from the deploy step:
 
-`superfly/flyctl-actions/setup-flyctl` is pinned by commit SHA with a `# Tracks: superfly/flyctl-actions/setup-flyctl@<tag>` comment alongside — same convention as the Trivy pin (#68) and govulncheck pin (#41). A tag-swap upstream cannot change what code holds the token between Renovate bumps.
+1. **Dispatcher pipeline.** Tickets land via the PO → architect → developer → code-review → docs stages, each running `make check` (`go vet` + `go test -race`). Runner/release-adjacent work lands via operator-direct PR.
+2. **Final pre-deploy gate.** The operator runs `make check` from the clean checkout before `flyctl deploy --remote-only` — the local equivalent of the old `needs: [test, security, image-scan]` chain.
+3. **Daily security scan.** [`security-scan.yml`](../../../.github/workflows/security-scan.yml) keeps `govulncheck` + image-scan firing against `main` on a cron, so disclosed CVEs against unchanged deps still surface within ≤24h.
 
-### Why `--remote-only`, not scan-image reuse
+### Historical note — the removed CI `deploy` job
 
-The `image-scan` job (#68) builds the image locally as part of its scan. Reusing it at deploy time would require either:
+Before 2026-05-24 this wiring lived in `.github/workflows/ci.yml`'s `deploy` job, which ran `flyctl deploy --remote-only` on push to `main`. Its privilege model kept `FLY_API_TOKEN` away from untrusted code via a branch gate (`github.ref == 'refs/heads/main'`), a `needs: [test, security, image-scan]` chain, and job-level `permissions: contents: read` with the token flowing only as `env:` on the deploy step; `superfly/flyctl-actions/setup-flyctl` was SHA-pinned with a `# Tracks:` comment. That entire workflow was removed across the org (commit [`0b987e2`](https://github.com/pyrycode/pyrycode-relay/commit/0b987e2)); the GHA-token privilege model is moot now that the token never enters CI. Only [`security-scan.yml`](../../../.github/workflows/security-scan.yml) remains in `.github/workflows/`.
 
-- Pushing to GHCR — regresses `image-scan`'s `contents: read` posture to `contents: read, packages: write`.
-- An `actions/upload-artifact` tarball handoff + `docker load` in `deploy` — adds a new artifact channel and CI complexity.
+### Why `--remote-only`
 
-Both are deferred. Fly's remote builder rebuilds from `Dockerfile` on every deploy; layer-cache dedup makes the rebuild cost small in steady state. The privilege-minimisation win is permanent.
+Fly's remote builder rebuilds the image from `Dockerfile` on every deploy rather than reusing a locally-built or scan-built image. Reusing the `image-scan` artifact (#68) would have required either pushing to GHCR (regressing that job's `contents: read` posture) or an artifact tarball handoff — both deferred. Layer-cache dedup makes the rebuild cost small in steady state.
 
 ## Rollback
 
@@ -87,13 +86,13 @@ Two paths in `docs/deploy.md`, both operator-driven:
 1. **By image digest (preferred).** `flyctl releases list` → `flyctl deploy --image <prior-digest> --remote-only`. Autocert cache persists across rollbacks (it's on the volume) — no Let's Encrypt re-issuance triggered.
 2. **By release number.** `flyctl releases rollback` rolls back the most recent release. Use when the prior digest isn't to hand.
 
-A rollback does **not** revert the `main` commit. To prevent CI's next deploy from immediately re-rolling the broken release forward, revert the offending PR before the next merge — or temporarily disable the `deploy` job via a revert PR.
+A rollback does **not** revert the `main` commit. Because deploys are operator-direct, no auto-deploy re-rolls a broken release forward — but the next manual `flyctl deploy --remote-only` rebuilds from `main`'s current HEAD. Revert the offending PR on `main` before the next deploy, or it ships again.
 
 ## What this feature deliberately does NOT do
 
 - **No Fly-managed TLS, no Fly HTTP proxy.** Both would break autocert and silently change the rate-limiter's view of the peer IP.
 - **No platform-level enforcement of single-machine cap.** Fly has no ceiling knob; operator discipline + the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing combination.
-- **No deploy-approval gate.** `environment: production` with required reviewers is a one-line addition for later; not wired in v1.
+- **No deploy-approval gate.** Deploys are operator-direct; the gate is operator discipline (clean `main` + `make check` before `flyctl deploy`), not a CI approval step.
 - **No multi-region / multi-instance scaling.** Blocked on the in-process-registry constraint; separate prerequisite ticket.
 - **No image-reuse from the scan job.** Always `--remote-only` rebuild; privilege-minimisation over rebuild-time.
 
