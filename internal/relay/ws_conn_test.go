@@ -62,6 +62,58 @@ func startEcho(t *testing.T, maxFrameBytes int64) (*WSConn, <-chan []byte, func(
 	return wc, received, cleanup
 }
 
+// TestWSConn_Send_UsesTextOpcode pins the outbound WebSocket frame opcode
+// to text. The wire spec (pyrycode/pyrycode/docs/protocol-mobile.md §
+// Encoding) requires line-delimited JSON over WS text frames; the mobile
+// client closes the connection on any binary frame. The relay-side fakes
+// all use text, so they cannot catch a regression in the relay's own
+// outbound opcode — this test stands up its own peer that captures the
+// observed message type, since startEcho deliberately discards it.
+func TestWSConn_Send_UsesTextOpcode(t *testing.T) {
+	gotType := make(chan websocket.MessageType, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer c.Close(websocket.StatusInternalError, "test ended")
+		typ, _, err := c.Read(r.Context())
+		if err != nil {
+			t.Errorf("read: %v", err)
+			return
+		}
+		gotType <- typ
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, _, err := websocket.Dial(dialCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	wc := NewWSConn(client, "test-conn-id", 256*1024)
+	defer wc.Close()
+
+	if err := wc.Send([]byte("envelope")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case typ := <-gotType:
+		if typ != websocket.MessageText {
+			t.Errorf("peer observed message type %v, want %v", typ, websocket.MessageText)
+		}
+		if typ == websocket.MessageBinary {
+			t.Errorf("Send wrote a binary frame; the mobile client rejects binary (regression of #108)")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for peer to observe the sent frame")
+	}
+}
+
 func TestWSConn_ConnID_ReturnsConstructorValue(t *testing.T) {
 	wc, _, cleanup := startEcho(t, 256*1024)
 	defer cleanup()
