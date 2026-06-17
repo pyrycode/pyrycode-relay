@@ -68,8 +68,11 @@ func (w *WSConn) ConnID() string {
 	return w.connID
 }
 
-// Send writes msg as a single binary WebSocket frame. Concurrent Send
-// callers are serialised on a per-WSConn mutex; the wire receives whole,
+// Send writes msg as a single text WebSocket frame. The wire is always
+// text: pyrycode/pyrycode/docs/protocol-mobile.md § Encoding mandates
+// line-delimited JSON over WS text frames (UTF-8), and the mobile client
+// closes the connection on any binary frame. Concurrent Send callers are
+// serialised on a per-WSConn mutex; the wire receives whole,
 // non-interleaved frames in some order. Each call has a fixed write
 // deadline (writeTimeout); Send after Close returns a non-nil error.
 // Callers treat any non-nil return as "drop the connection."
@@ -78,7 +81,7 @@ func (w *WSConn) Send(msg []byte) error {
 	defer w.writeMu.Unlock()
 	ctx, cancel := context.WithTimeout(w.closeCtx, writeTimeout)
 	defer cancel()
-	return w.conn.Write(ctx, websocket.MessageBinary, msg)
+	return w.conn.Write(ctx, websocket.MessageText, msg)
 }
 
 // Read returns the next inbound message as opaque bytes. ctx bounds the
