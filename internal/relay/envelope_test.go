@@ -97,3 +97,54 @@ func TestUnmarshal_Rejections(t *testing.T) {
 		})
 	}
 }
+
+// TestUnmarshal_CloseDirective covers the disconnect half of the routing
+// contract: a non-zero close_code makes a frameless envelope valid (the
+// daemon closes a phone with no final frame), while a frame-carrying close
+// directive keeps its frame. conn_id is still mandatory.
+func TestUnmarshal_CloseDirective(t *testing.T) {
+	t.Parallel()
+
+	t.Run("close code, null frame is valid", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"conn_id":"c-1","frame":null,"close_code":4401}`))
+		if err != nil {
+			t.Fatalf("Unmarshal: unexpected err %v", err)
+		}
+		if env.ConnID != "c-1" || env.CloseCode != 4401 {
+			t.Fatalf("Unmarshal: got %+v", env)
+		}
+		if hasFrame(env.Frame) {
+			t.Errorf("hasFrame = true, want false for null frame")
+		}
+	})
+
+	t.Run("close code, absent frame is valid", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"conn_id":"c-1","close_code":4403}`))
+		if err != nil {
+			t.Fatalf("Unmarshal: unexpected err %v", err)
+		}
+		if env.CloseCode != 4403 || hasFrame(env.Frame) {
+			t.Fatalf("Unmarshal: got %+v", env)
+		}
+	})
+
+	t.Run("close code with frame keeps the frame", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"conn_id":"c-1","frame":{"type":"error"},"close_code":4401}`))
+		if err != nil {
+			t.Fatalf("Unmarshal: unexpected err %v", err)
+		}
+		if env.CloseCode != 4401 || !hasFrame(env.Frame) {
+			t.Fatalf("Unmarshal: got %+v", env)
+		}
+	})
+
+	t.Run("close code without conn_id still rejected", func(t *testing.T) {
+		t.Parallel()
+		if _, err := Unmarshal([]byte(`{"frame":null,"close_code":4401}`)); !errors.Is(err, ErrMissingConnID) {
+			t.Fatalf("Unmarshal: got err=%v, want ErrMissingConnID", err)
+		}
+	})
+}

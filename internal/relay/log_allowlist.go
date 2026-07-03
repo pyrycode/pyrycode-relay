@@ -17,4 +17,7 @@ var allowedLogKeys = map[string]struct{}{
 	"path":           {},
 	"from":           {},
 	"to":             {},
+	// WS close code (uint16) from a daemon close directive. Non-sensitive:
+	// a protocol status number, never user or key material.
+	"close_code": {},
 }
