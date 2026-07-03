@@ -24,9 +24,27 @@ var (
 //
 // The relay treats Frame as opaque bytes and MUST NOT deserialise them.
 // See pyrycode/pyrycode/docs/protocol-mobile.md § Routing envelope.
+//
+// CloseCode is the one relay-interpreted control field. On a binary→relay
+// envelope a non-zero CloseCode asks the relay to deliver Frame (if present)
+// to the addressed phone and then close that phone's WebSocket with this
+// close code. It is the disconnect half of the routing contract: without it
+// the daemon cannot tell the relay to drop a phone (auth reject, protocol
+// mismatch, handshake failure), so the phone hangs on a dead session. The
+// field mirrors the daemon's protocol.RoutingEnvelope.CloseCode; omitempty
+// keeps every non-close envelope byte-identical to the pre-close-code shape.
 type Envelope struct {
-	ConnID string          `json:"conn_id"`
-	Frame  json.RawMessage `json:"frame"`
+	ConnID    string          `json:"conn_id"`
+	Frame     json.RawMessage `json:"frame"`
+	CloseCode uint16          `json:"close_code,omitempty"`
+}
+
+// hasFrame reports whether f carries a real inner frame. An absent field
+// (nil/empty) and the JSON literal null both count as "no frame" — the
+// daemon emits "frame":null on a close directive that carries no final
+// application frame (protocol.RoutingEnvelope.Frame has no omitempty).
+func hasFrame(f json.RawMessage) bool {
+	return len(f) > 0 && !bytes.Equal(f, []byte("null"))
 }
 
 // Marshal builds the JSON-encoded routing envelope for an inner frame
@@ -59,7 +77,12 @@ func Marshal(connID string, frame []byte) ([]byte, error) {
 // It returns ErrMalformedEnvelope (wrapping the underlying decoder error)
 // for syntactically invalid JSON or a non-object payload, ErrMissingConnID
 // when conn_id is absent, empty, or null, and ErrMissingFrame when frame
-// is absent or null.
+// is absent or null AND no close code is set.
+//
+// A close directive (CloseCode != 0) may legitimately carry no frame: the
+// daemon closes a phone without a final application frame, e.g. an auth
+// reject with no error body. Such an envelope is valid and ErrMissingFrame
+// is not returned.
 //
 // The Frame field of the returned Envelope is the verbatim bytes of the
 // inner frame (modulo insignificant whitespace normalised by the JSON
@@ -72,7 +95,7 @@ func Unmarshal(data []byte) (Envelope, error) {
 	if env.ConnID == "" {
 		return Envelope{}, ErrMissingConnID
 	}
-	if len(env.Frame) == 0 || bytes.Equal(env.Frame, []byte("null")) {
+	if env.CloseCode == 0 && !hasFrame(env.Frame) {
 		return Envelope{}, ErrMissingFrame
 	}
 	return env, nil

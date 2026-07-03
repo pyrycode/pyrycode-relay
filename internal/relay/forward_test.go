@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // fakePhone implements phoneSource and Conn. Tests push frames onto frames;
@@ -26,6 +28,12 @@ type fakePhone struct {
 	mu      sync.Mutex
 	sent    [][]byte
 	sendErr error
+
+	// closeCode records the WS close code passed to CloseWithCode (0 = never
+	// closed with a code). closeCalls counts every Close-family call so a
+	// test can assert idempotent, single-shot close behavior.
+	closeCode  uint16
+	closeCalls int
 }
 
 func newFakePhone(id string) *fakePhone {
@@ -58,7 +66,43 @@ func (p *fakePhone) Send(msg []byte) error {
 	return nil
 }
 
-func (p *fakePhone) Close() {}
+func (p *fakePhone) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closeCalls++
+}
+
+// CloseWithCode makes *fakePhone satisfy the forwarder's phoneCloser
+// capability so the close-directive path exercises coded close rather than
+// the plain-Close fallback.
+func (p *fakePhone) CloseWithCode(code websocket.StatusCode, _ string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closeCode = uint16(code)
+	p.closeCalls++
+}
+
+func (p *fakePhone) snapshotClose() (code uint16, calls int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closeCode, p.closeCalls
+}
+
+// waitForPhoneClose polls until CloseWithCode recorded a non-zero code or the
+// deadline elapses, then returns the recorded code (0 if never closed coded).
+func waitForPhoneClose(t *testing.T, p *fakePhone, timeout time.Duration) uint16 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if code, _ := p.snapshotClose(); code != 0 {
+			return code
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	code, _ := p.snapshotClose()
+	t.Fatalf("waitForPhoneClose: code still %d after %v", code, timeout)
+	return 0
+}
 
 func (p *fakePhone) snapshotSent() [][]byte {
 	p.mu.Lock()
@@ -381,6 +425,30 @@ func mustMarshal(t *testing.T, connID string, frame []byte) []byte {
 	return out
 }
 
+// closeEnvelopeJSON builds the exact binary→relay wire bytes the daemon's
+// V2SessionManager.closeWith emits: a routing envelope carrying a close code
+// and — per the daemon's protocol.RoutingEnvelope, whose Frame field has no
+// omitempty — an explicit "frame":null when there is no final frame. This is
+// the relay-side conformance fixture for the close-code contract the daemon
+// owns; the field names and shape mirror protocol.RoutingEnvelope so the two
+// repos are checked against one wire format.
+func closeEnvelopeJSON(t *testing.T, connID string, frame json.RawMessage, code uint16) []byte {
+	t.Helper()
+	f := json.RawMessage("null")
+	if len(frame) > 0 {
+		f = frame
+	}
+	out, err := json.Marshal(struct {
+		ConnID    string          `json:"conn_id"`
+		Frame     json.RawMessage `json:"frame"`
+		CloseCode uint16          `json:"close_code"`
+	}{ConnID: connID, Frame: f, CloseCode: code})
+	if err != nil {
+		t.Fatalf("closeEnvelopeJSON(%s): %v", connID, err)
+	}
+	return out
+}
+
 func TestStartBinaryForwarder_RoutesToAddressedPhone(t *testing.T) {
 	t.Parallel()
 
@@ -510,6 +578,92 @@ func TestStartBinaryForwarder_MalformedEnvelope_DropsAndContinues(t *testing.T) 
 	if !bytes.Equal(compactJSON(t, got[0]), compactJSON(t, inner)) {
 		t.Errorf("p1 inner bytes diverged\nwant: %s\n got: %s",
 			compactJSON(t, inner), compactJSON(t, got[0]))
+	}
+
+	close(src.frames)
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("forwarder return = %v, want io.EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not return after frames chan closed")
+	}
+}
+
+// TestStartBinaryForwarder_CloseDirectiveNoFrame_ClosesPhone is the seam
+// conformance test for the disconnect half of the routing contract: a daemon
+// close directive with no final frame must close the addressed phone with the
+// given WS code and must NOT tear down the binary forwarder.
+func TestStartBinaryForwarder_CloseDirectiveNoFrame_ClosesPhone(t *testing.T) {
+	t.Parallel()
+
+	reg := NewRegistry()
+	p1 := newFakePhone("client-s1-aaaa1111")
+	p2 := newFakePhone("client-s1-bbbb2222")
+	claimAndRegister(t, reg, "s1", p1, p2)
+
+	src := newFakeBinarySource("bin-s1")
+	done, cancel := runBinaryForwarder(reg, "s1", src)
+	defer cancel()
+
+	// Daemon closes p1 with 4401 (unauthorized) and no final frame.
+	src.frames <- closeEnvelopeJSON(t, p1.ConnID(), nil, 4401)
+	// A following normal frame to p2 proves the forwarder continued past the
+	// close directive rather than returning.
+	inner := []byte(`{"type":"after-close"}`)
+	src.frames <- mustMarshal(t, p2.ConnID(), inner)
+
+	if code := waitForPhoneClose(t, p1, 2*time.Second); code != 4401 {
+		t.Fatalf("p1 close code = %d, want 4401", code)
+	}
+	if sent := p1.snapshotSent(); len(sent) != 0 {
+		t.Errorf("p1 sent = %d frames, want 0 (close carried no frame)", len(sent))
+	}
+	got := waitForPhoneSent(t, p2, 1, 2*time.Second)
+	if !bytes.Equal(compactJSON(t, got[0]), compactJSON(t, inner)) {
+		t.Errorf("p2 inner diverged\nwant: %s\n got: %s",
+			compactJSON(t, inner), compactJSON(t, got[0]))
+	}
+	if _, calls := p1.snapshotClose(); calls != 1 {
+		t.Errorf("p1 close calls = %d, want exactly 1", calls)
+	}
+
+	close(src.frames)
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("forwarder return = %v, want io.EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not return after frames chan closed")
+	}
+}
+
+// TestStartBinaryForwarder_CloseDirectiveWithFrame_ForwardsThenCloses proves a
+// close directive that also carries a final frame delivers the frame to the
+// phone before closing it with the WS code (the spec's frame-before-close MUST).
+func TestStartBinaryForwarder_CloseDirectiveWithFrame_ForwardsThenCloses(t *testing.T) {
+	t.Parallel()
+
+	reg := NewRegistry()
+	p1 := newFakePhone("client-s1-aaaa1111")
+	claimAndRegister(t, reg, "s1", p1)
+
+	src := newFakeBinarySource("bin-s1")
+	done, cancel := runBinaryForwarder(reg, "s1", src)
+	defer cancel()
+
+	errFrame := json.RawMessage(`{"type":"error","payload":{"code":"unauthorized"}}`)
+	src.frames <- closeEnvelopeJSON(t, p1.ConnID(), errFrame, 4401)
+
+	got := waitForPhoneSent(t, p1, 1, 2*time.Second)
+	if !bytes.Equal(compactJSON(t, got[0]), compactJSON(t, errFrame)) {
+		t.Errorf("p1 final frame diverged\nwant: %s\n got: %s",
+			compactJSON(t, errFrame), compactJSON(t, got[0]))
+	}
+	if code := waitForPhoneClose(t, p1, 2*time.Second); code != 4401 {
+		t.Fatalf("p1 close code = %d, want 4401", code)
 	}
 
 	close(src.frames)
