@@ -23,11 +23,11 @@ Each threat below records four fields:
 
 **Severity:** `medium`.
 
-**v1 mitigation:** A minimal dependency surface — stdlib plus `golang.org/x/crypto v0.50.0` for `acme/autocert`, with `golang.org/x/net` and `golang.org/x/text` as transitive dependencies (`go.mod`). `go.sum` provides per-module checksum verification on every build. `govulncheck` runs in `make lint` and in `ci.yml`'s `security` job and gates merge (#41 pins it to a semver tag). The runtime image is additionally scanned by Trivy in `ci.yml`'s `image-scan` job (#68), covering OS-package + Go-binary content. Both scanners are also re-run daily against `main` via `.github/workflows/security-scan.yml` (#72), so CVEs disclosed against deps that have not changed since the last PR surface as a red Actions run within ≤24h rather than staying invisible until the next dep bump. A regression now also opens a `security-sensitive`-labelled GitHub issue via the same workflow's `file-issue` job (#73), lifting the red Actions row to a tracked work-item in the triage queue rather than leaving it as a passive signal. New dependencies require a justification (`docs/PROJECT-MEMORY.md`).
+**v1 mitigation:** A small, justified dependency surface (`go.mod`): `github.com/coder/websocket v1.8.14` (the WebSocket implementation, chosen 2026-05-28 in [ADR-0010](knowledge/decisions/0010-coder-websocket-migration.md)), `github.com/prometheus/client_golang v1.23.2` with its `client_model v0.6.2` and `common v0.66.1` companions (metrics, [ADR-0008](knowledge/decisions/0008-prometheus-client-adoption.md)), and `golang.org/x/crypto v0.51.0` for `acme/autocert`. `go.sum` provides per-module checksum verification on every build. `govulncheck` runs in `make lint` (#41 pins it to a semver tag) and daily against `main` in the `govulncheck` job of `.github/workflows/security-scan.yml` (#72) — the repo's only workflow since the convenience `ci.yml` was removed 2026-05-24. The runtime image is additionally scanned by Trivy in the same workflow's `image-scan` job (#68/#72), covering OS-package + Go-binary content, so CVEs disclosed against deps that have not changed since the last PR surface as a red Actions run within ≤24h rather than staying invisible until the next dep bump. A regression also opens a `security-sensitive`-labelled GitHub issue via the workflow's `file-issue` job (#73), lifting the red Actions row to a tracked work-item in the triage queue rather than leaving it as a passive signal. New dependencies require a justification (`docs/PROJECT-MEMORY.md`).
 
-**Residual risk:** A compromised release of `golang.org/x/crypto` would expose TLS private-key handling. A compromised future WebSocket library would see every routed frame in cleartext, since the relay is the TLS terminus. `go.sum` defends against tampered downloads, not against a malicious release tagged by an authentic maintainer.
+**Residual risk:** A compromised release of `golang.org/x/crypto` would expose TLS private-key handling. A compromised release of `github.com/coder/websocket` would see every routed frame in cleartext, since the relay is the TLS terminus. `go.sum` defends against tampered downloads, not against a malicious release tagged by an authentic maintainer.
 
-**Future hardening:** SBOM generation in CI; pinned-version review on every `go.mod` change; consider Go module proxy mirroring once any user data flows through the relay. The WebSocket library, when chosen, joins this list.
+**Future hardening:** SBOM generation in CI; pinned-version review on every `go.mod` change; consider Go module proxy mirroring once any user data flows through the relay.
 
 ## DoS resistance — connection floods, slow-loris, fork-bomb retry
 
@@ -94,7 +94,6 @@ This document must be revisited when any of the following occurs:
 - The deploy target changes (new VPS provider, container platform, managed Kubernetes).
 - A new public endpoint is exposed (any new path under `/v1/*` or otherwise).
 - A security incident occurs — any unexpected behaviour with security implications, even if no compromise is confirmed.
-- The WebSocket library is chosen — re-evaluate the Supply chain and DoS resistance entries together.
 
 ## Out of scope
 

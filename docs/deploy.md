@@ -23,12 +23,12 @@ for the operational threat surface the substrate sits on.
 
 Done once per Fly app — typically only the production app.
 
-1. Edit `fly.toml`: replace `__REGION__` with a Fly region code (e.g.
-   `ams`, `arn`, `fra` — see `flyctl platform regions`) and `__DOMAIN__`
-   with the public domain (e.g. `relay.pyrycode.dev`). These are
-   placeholders by design — the first deploy fails loudly if either is
-   left unset, which is preferable to a silently-misconfigured production
-   relay.
+1. `fly.toml` is checked in with the production values — `primary_region
+   = "arn"` and the public domain (`pyrycode-relay.pyryco.de`) in the
+   `[processes]` argv — so the production app needs no edit. When porting
+   to a new app or environment, treat both as placeholders: replace the
+   region with your own code (see `flyctl platform regions`) and the
+   domain with the new app's public domain before the first deploy.
 2. `flyctl apps create pyrycode-relay` (must match `app =` in `fly.toml`).
 3. `flyctl ips allocate-v4 --app pyrycode-relay` — a dedicated IPv4 is
    **required**, not optional, for autocert's HTTP-01 challenge to
@@ -44,11 +44,10 @@ Done once per Fly app — typically only the production app.
    Let's Encrypt resolves the domain via HTTP-01 on first deploy;
    without DNS in place, the first WSS request hangs ~minutes while
    autocert retries.
-6. GitHub repo secret: `FLY_API_TOKEN` = output of `flyctl auth token`.
-   Settings → Secrets and variables → Actions → New repository secret.
-   The token grants deploy access to the entire Fly org — scope it to a
-   `pyrycode-relay`-only deploy token if Fly's tokens UI offers that at
-   bootstrap time.
+
+The operator authenticates `flyctl` locally (`flyctl auth login`); the
+deploy token lives only in the operator's local environment. No GitHub
+repo secret is involved — PR code has no path to a deploy credential.
 
 ## fly.toml gotchas
 
@@ -120,6 +119,11 @@ GHA workflow auto-deploys on push.
    `started`), `curl -sS https://pyrycode-relay.pyryco.de/healthz`
    (`200`), and a tail of `flyctl logs -a pyrycode-relay` for any
    startup-time errors.
+
+Deploy history: the live instance was redeployed 2026-07-03 from commit
+[`67ffa46`](https://github.com/pyrycode/pyrycode-relay/commit/67ffa46),
+picking up the #108 text-frames fix; before that it ran the initial
+2026-05-29 deploy.
 
 Observability:
 

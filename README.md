@@ -1,10 +1,10 @@
 # pyrycode-relay
 
-Stateless WebSocket relay that routes traffic between mobile clients and a [`pyrycode`](https://github.com/pyrycode/pyrycode) binary running on a user's machine. Companion service to the pyry binary.
+Stateless WebSocket relay that routes traffic between mobile and desktop clients and a [`pyrycode`](https://github.com/pyrycode/pyrycode) binary running on a user's machine. Companion service to the pyry binary.
 
 ```
 ┌────────┐     WSS     ┌──────────┐     WSS     ┌────────────────┐
-│ phone  │ ──────────> │  relay   │ <────────── │ pyrycode binary│
+│ client │ ──────────> │  relay   │ <────────── │ pyrycode binary│
 │ (N)    │             │(stateless)│             │ (1 per server) │
 └────────┘             └──────────┘             └────────────────┘
 ```
@@ -13,11 +13,11 @@ The relay routes by an `x-pyrycode-server` header and never reads message payloa
 
 ## Wire protocol
 
-Implements the [`v1` mobile protocol](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md) defined in the pyrycode CLI repo. That document is the single source of truth — this binary is one of two server-side implementations (the pyry binary is the other).
+Implements the [`v2` mobile protocol](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md) defined in the pyrycode CLI repo — the daemon's only wire since mid-2026. The `/v1/server` and `/v1/client` endpoint names are route paths, not protocol versions: the relay is content-blind, and the protocol version lives in each frame's `v` field. That document is the single source of truth — this binary is one of two server-side implementations (the pyry binary is the other).
 
 ## Status
 
-**Production — LIVE.** Deployed to [Fly.io](https://fly.io) at `pyrycode-relay.pyryco.de`, live since 2026-05-29 (DENIC delegation landed, real Let's Encrypt cert, `/healthz` returns `200`). Full routing shipped — phone ↔ binary frame forwarding, per-IP rate limiting, graceful shutdown, metrics, and autocert TLS termination. Deploys are operator-direct from a clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](docs/deploy.md).
+**Production — LIVE.** Deployed to [Fly.io](https://fly.io) at `pyrycode-relay.pyryco.de`, live since 2026-05-29 (DENIC delegation landed, real Let's Encrypt cert, `/healthz` returns `200`). Full routing shipped — client ↔ binary frame forwarding, per-IP rate limiting, graceful shutdown, metrics, and autocert TLS termination. Deploys are operator-direct from a clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](docs/deploy.md).
 
 ## Build
 
@@ -62,6 +62,8 @@ Flags:
 | `--https-listen` | `:443` | Bind address for the autocert TLS terminator (host:port). Pass `:8443` etc. when a substrate forwards external 443 to a high internal port. |
 | `--http-listen` | `:80` | Bind address for the ACME HTTP-01 challenge listener (host:port). Pass `:8080` etc. for the same high-port substrate-forward pattern. |
 | `--insecure-listen` | (unset) | Listen address for plain HTTP (e.g. `:8080`). Disables autocert. Use only when fronted by a reverse proxy. Mutually exclusive with `--http-listen` / `--https-listen`. |
+| `--metrics-listen` | `127.0.0.1:9090` | Listen address for the `/metrics` endpoint. Must be a loopback IP literal (e.g. `127.0.0.1:9090`, `[::1]:9090`). Empty disables. |
+| `--trust-x-forwarded-for` | `false` | Trust the `X-Forwarded-For` header as the source IP for per-IP rate limiting. Enable only behind a trusted reverse proxy — otherwise clients can spoof their source IP and bypass the rate limits. |
 | `--version` | | Print version and exit. |
 
 `:80` and `:443` are privileged. On a nonroot substrate that can't bind them (distroless/`:nonroot` containers running uid 65532, K8s restricted SCC, unprivileged systemd without `CAP_NET_BIND_SERVICE`), bind high internal ports via `--http-listen=:8080 --https-listen=:8443` and let the substrate forward external `:80`/`:443`. The production Fly deploy uses `--http-listen=:8080 --https-listen=:8443`. ACME HTTP-01 keeps working under any TCP-passthrough substrate. See [`docs/knowledge/features/autocert-tls.md`](docs/knowledge/features/autocert-tls.md) § Operational notes.
