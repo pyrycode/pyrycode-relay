@@ -4,7 +4,7 @@
 # Pinned by digest so a tag-only swap upstream can't shift what we build
 # against. Renovate keeps the digest fresh; refresh in lockstep with the
 # tag comment so a future reviewer can sanity-check what the digest tracks.
-FROM golang:1.26-bookworm@sha256:252599aeb51ad60b83e4d8821802068127c528c707cb7dd7afd93be057c6011c AS build
+FROM golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS build
 
 ARG VERSION=dev
 
