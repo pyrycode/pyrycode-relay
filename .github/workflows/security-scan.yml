@@ -88,10 +88,10 @@ jobs:
           ' trivy.json)
           # If trivy.json has no parseable vulnerabilities (e.g. the
           # action failed before producing output, or produced an
-          # empty results array), there is nothing to file — skip
-          # rendering and leave the red workflow row as the sole
-          # signal. The upload step's hashFiles() guard ensures no
-          # artifact is uploaded in this case.
+          # empty results array), there is nothing to render here.
+          # `file-issue` still files a generic scanner-failure issue
+          # when a scanner job failed and no artifact was produced,
+          # so this branch is no longer a silent red row.
           if [ -z "$primary_cve" ]; then
             echo "no parseable CVEs in trivy.json — skipping issue render"
             exit 0
@@ -228,9 +228,17 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          for dir in artifacts/regression-*; do
-            title=$(cat "$dir/issue-title.txt")
+          # Locate rendered issues by their title file rather than by
+          # globbing `artifacts/regression-*` directories. The glob
+          # form silently matched nothing on the 2026-08-03 run
+          # 30799090194 even though the artifact downloaded — the
+          # extraction layout of download-artifact is not a contract —
+          # so every red run since 2026-06-06 filed nothing. `find`
+          # keyed on the file we wrote ourselves is layout-proof.
+          filed_or_suppressed=0
+          while IFS= read -r title_file; do
+            dir=$(dirname "$title_file")
+            title=$(cat "$title_file")
             body_file="$dir/issue-body.md"
             # Dedup: search open security-sensitive issues for one
             # whose title matches the full deterministic string we
@@ -247,6 +255,7 @@ jobs:
               --jq 'length')
             if [ "$existing" -gt 0 ]; then
               echo "duplicate suppressed for: $title"
+              filed_or_suppressed=1
               continue
             fi
             # `--body-file` (not `--body "<...>"`) so scanner-derived
@@ -259,4 +268,40 @@ jobs:
               --title "$title" \
               --body-file "$body_file" \
               --label security-sensitive
-          done
+            filed_or_suppressed=1
+          done < <(find artifacts -name issue-title.txt 2>/dev/null | sort)
+          # Fallback: this job only runs when a scanner failed. If no
+          # rendered issue reached us (scanner died before producing
+          # output, or rendering itself broke), file a generic
+          # infrastructure issue instead of leaving the red Actions
+          # row as the sole signal — an unwatched red row is how the
+          # 2026-06-06..2026-08-03 window went unnoticed. Same
+          # open-state title dedup as above, so this files once per
+          # incident, not once per day.
+          if [ "$filed_or_suppressed" -eq 0 ]; then
+            title="security-scan: scanner failed with no parseable findings"
+            existing=$(gh issue list \
+              --repo "$REPO" \
+              --state open \
+              --label security-sensitive \
+              --search "in:title \"$title\"" \
+              --json number \
+              --jq 'length')
+            if [ "$existing" -gt 0 ]; then
+              echo "duplicate suppressed for: $title"
+            else
+              {
+                printf '## Periodic security-scan infrastructure failure\n\n'
+                printf 'A scanner job failed but produced no parseable findings artifact,\n'
+                printf 'so there is no CVE to name. Read the run log to see which job died\n'
+                printf 'and why (scanner crash, DB download failure, or a rendering bug).\n\n'
+                printf '**Workflow run:** %s/%s/actions/runs/%s\n' \
+                  "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+              } > infra-issue-body.md
+              gh issue create \
+                --repo "$REPO" \
+                --title "$title" \
+                --body-file infra-issue-body.md \
+                --label security-sensitive
+            fi
+          fi
