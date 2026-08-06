@@ -1,8 +1,18 @@
 # Deploy
 
-The relay deploys to a single [Fly.io](https://fly.io) machine. CI deploys on every merge to
-`main`; manual deploys are needed only for the one-time bootstrap and for
-rollbacks.
+The relay deploys to a single [Fly.io](https://fly.io) machine. **Every deploy is
+operator-run. Nothing deploys on merge.** The repo has no deploy workflow at all —
+only `security-scan.yml` and the dependency graph — so a merged fix stays out of
+production until somebody runs `flyctl deploy` by hand. See
+[*Steady-state flow*](#steady-state-flow) below for the procedure.
+
+> **This has bitten us.** The 2026-08-03 CVE patch (#122) merged and then sat
+> undeployed while the live machine kept serving a 2026-07-03 build, because the
+> daily security scan went green and read as "handled". That scan builds a fresh
+> image from `main` and inspects **that**, so it reports what *would* ship and
+> never what is serving. A green scan is not evidence that production is patched.
+> After any merge you care about, verify the **running** artifact per
+> [*Verify a deploy*](#verify-a-deploy).
 
 See [`docs/architecture.md` § *Hosting*](architecture.md#hosting) for the
 hosting + TLS-termination decision record, and
@@ -117,6 +127,38 @@ Observability:
 - `flyctl logs -a pyrycode-relay` — relay stderr in real time.
 - Local deploy output records the build + roll progress (the GHA
   Actions log no longer exists for deploys).
+
+## Verify a deploy
+
+Answering "is the fix actually live?" means asking the **running** machine, not
+the repo and not CI. Two independent readings, and they should agree:
+
+1. `flyctl status -a pyrycode-relay` — the `LAST UPDATED` column is when the
+   running machine was last replaced. If it predates your merge, the fix is not
+   live no matter how green everything else looks.
+2. `curl -sS https://pyrycode-relay.pyryco.de/healthz` — the `uptime_seconds`
+   field independently dates the running process. Convert it and check it lands
+   on the same moment as the machine's `LAST UPDATED`.
+
+On 2026-08-05 those two agreed to the minute on a build 33 days old, which is
+what established that the CVE patch had never shipped. Note `version` in the
+health payload is the build-stamp string and reads `dev` on every deploy, so it
+distinguishes nothing — do not use it as a version check.
+
+Two flyctl gotchas on the operator MacBook, both of which look like something
+worse than they are:
+
+- `flyctl` is installed at `~/.fly/bin/flyctl` and is **not on `PATH`**, so
+  `which flyctl` comes back empty and reads as "not installed". Call it by full
+  path.
+- In a non-interactive shell it does not pick up the stored login and fails with
+  `no access token available`, which reads as an expired session. The credential
+  is fine, in `~/.fly/config.yml`; pass it through for the one command:
+  `FLY_ACCESS_TOKEN="$(sed -n 's/^access_token: *//p' ~/.fly/config.yml | tr -d '"')"`.
+
+Restarting the relay drops every connected binary. They reconnect on their own
+through the daemon's backoff ladder — measured at 13 s for two binaries on
+2026-08-05 — so a deploy is disruptive but self-healing.
 
 ## Rollback
 
