@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -204,6 +205,199 @@ func TestRun_InsecureMutexWithAutocertListenFlags(t *testing.T) {
 				t.Errorf("run exit code: got %d, want %d", got, tc.wantCode)
 			}
 		})
+	}
+}
+
+// TestRun_ReclaimDuringGraceClosesPhoneWith4404 is the end-to-end
+// regression for #127: a binary conn, a phone registered against it, a
+// binary close, and a second binary claim within the 30s grace window
+// that main.go wires. The phone must observe close status 4404 (the code
+// every client already retries), then re-dial and register against the
+// new binary conn, proven by a frame the new binary reads.
+func TestRun_ReclaimDuringGraceClosesPhoneWith4404(t *testing.T) {
+	addr, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+
+	sigCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exit := make(chan int, 1)
+	go func() {
+		exit <- run([]string{
+			"--insecure-listen", addr,
+			"--metrics-listen", "",
+		}, sigCtx)
+	}()
+	if err := waitForDial(addr, 3*time.Second); err != nil {
+		t.Fatalf("relay did not accept connections: %v", err)
+	}
+
+	const serverID = "s-e2e-127"
+
+	b1 := dialServer(t, addr, serverID)
+	defer b1.Close(websocket.StatusInternalError, "")
+	b1Reads := readPump(b1)
+
+	phone := dialPhone(t, addr, serverID)
+	defer phone.Close(websocket.StatusInternalError, "")
+	// A frame round-tripped through b1 proves the phone is registered
+	// (the handler registers before it starts the forwarder).
+	sendAndExpectAtBinary(t, phone, b1Reads, `{"v":2,"t":"probe-1"}`)
+
+	// Binary "restarts": close b1, then reclaim the slot inside grace.
+	if err := b1.Close(websocket.StatusNormalClosure, "restart"); err != nil {
+		t.Fatalf("b1.Close: %v", err)
+	}
+	b2, b2Reads := dialServerUntilClaimed(t, addr, serverID)
+	defer b2.Close(websocket.StatusInternalError, "")
+
+	// The inherited phone must be evicted with 4404.
+	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer readCancel()
+	if _, _, err := phone.Read(readCtx); err == nil {
+		t.Fatal("phone Read: got nil error after reclaim, want close error")
+	} else if code := websocket.CloseStatus(err); code != websocket.StatusCode(4404) {
+		t.Fatalf("phone close status: got %d, want 4404; err=%v", code, err)
+	}
+
+	// The phone re-dials and lands on the new binary.
+	phone2 := dialPhone(t, addr, serverID)
+	defer phone2.Close(websocket.StatusNormalClosure, "")
+	// A reader on phone2 lets it answer the drain's close handshake
+	// promptly instead of making Shutdown wait out the 5s handshake
+	// timeout.
+	_ = readPump(phone2)
+	sendAndExpectAtBinary(t, phone2, b2Reads, `{"v":2,"t":"probe-2"}`)
+
+	cancel()
+	select {
+	case <-exit:
+	case <-time.After(drainDeadline + 2*time.Second):
+		t.Fatal("run did not return after shutdown")
+	}
+}
+
+// dialServer opens a /v1/server WebSocket for serverID.
+func dialServer(t *testing.T, addr, serverID string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws://"+addr+"/v1/server", &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"X-Pyrycode-Server":  []string{serverID},
+			"X-Pyrycode-Version": []string{"0.0.0"},
+			"User-Agent":         []string{"pyrycode-relay-e2e/1.0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("websocket.Dial /v1/server: %v", err)
+	}
+	return c
+}
+
+// wsRead is one result from readPump.
+type wsRead struct {
+	data []byte
+	err  error
+}
+
+// readPump reads c on a dedicated goroutine and delivers every result on
+// the returned channel, ending with the first error. A single long-lived
+// reader is the only way to wait "is this conn still open?" without a
+// Read deadline, because coder/websocket closes the conn when a Read's
+// context expires. The goroutine exits once the conn is closed by the
+// test's defers or the relay's drain.
+func readPump(c *websocket.Conn) <-chan wsRead {
+	ch := make(chan wsRead, 8)
+	go func() {
+		for {
+			_, data, err := c.Read(context.Background())
+			ch <- wsRead{data: data, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// dialServerUntilClaimed dials /v1/server until the claim sticks. After
+// the prior binary's close handshake completes there is a short window
+// before its handler defer runs ScheduleReleaseServer, during which a
+// claim is refused with 4409. A conn whose pump has delivered nothing
+// after a short wait is the one the registry accepted; it is returned
+// together with its pump so the caller can keep reading it.
+func dialServerUntilClaimed(t *testing.T, addr, serverID string) (*websocket.Conn, <-chan wsRead) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c := dialServer(t, addr, serverID)
+		reads := readPump(c)
+		select {
+		case r := <-reads:
+			if r.err == nil {
+				t.Fatalf("unexpected frame on a fresh /v1/server conn: %q", r.data)
+			}
+			if websocket.CloseStatus(r.err) != websocket.StatusCode(4409) {
+				t.Fatalf("fresh /v1/server conn closed: %v", r.err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		case <-time.After(150 * time.Millisecond):
+			return c, reads
+		}
+	}
+	t.Fatal("binary could not reclaim its slot within 3s")
+	return nil, nil
+}
+
+// dialPhone opens a /v1/client WebSocket for serverID.
+func dialPhone(t *testing.T, addr, serverID string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws://"+addr+"/v1/client", &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"X-Pyrycode-Server": []string{serverID},
+			"X-Pyrycode-Token":  []string{"phone-token-opaque"},
+			"User-Agent":        []string{"pyrycode-relay-e2e/1.0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("websocket.Dial /v1/client: %v", err)
+	}
+	return c
+}
+
+// sendAndExpectAtBinary writes frame on phone and asserts the binary's
+// pump delivers a routing envelope carrying it.
+func sendAndExpectAtBinary(t *testing.T, phone *websocket.Conn, binaryReads <-chan wsRead, frame string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := phone.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+		t.Fatalf("phone.Write: %v", err)
+	}
+	var data []byte
+	select {
+	case r := <-binaryReads:
+		if r.err != nil {
+			t.Fatalf("binary read: %v", r.err)
+		}
+		data = r.data
+	case <-time.After(3 * time.Second):
+		t.Fatal("binary did not receive the phone's frame within 3s")
+	}
+	var env struct {
+		ConnID string          `json:"conn_id"`
+		Frame  json.RawMessage `json:"frame"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		t.Fatalf("envelope unmarshal: %v (raw %q)", err, data)
+	}
+	if env.ConnID == "" || string(env.Frame) != frame {
+		t.Fatalf("envelope: got conn_id=%q frame=%s, want non-empty conn_id and frame %s", env.ConnID, env.Frame, frame)
 	}
 }
 
