@@ -57,7 +57,7 @@ While the timer is pending:
 |---|---|
 | `BinaryFor(serverID)` | Returns the (now-closed) binary `Conn`. `Send` through it errors per the underlying impl's contract; the registry adds no new error semantics. |
 | `RegisterPhone(serverID, conn)` | Succeeds — the binary entry is still present, only the timer is pending. |
-| `ClaimServer(serverID, conn)` | Returns `nil`, **not** `ErrServerIDConflict`. The pending timer is `Stop()`'d, the binary `Conn` is replaced atomically, and any phones registered during the window are inherited by the new binary. |
+| `ClaimServer(serverID, conn)` | Returns `nil`, **not** `ErrServerIDConflict`. The pending timer is `Stop()`'d, the binary `Conn` is replaced atomically, and every phone registered for `serverID` (before or during the window) is removed under the lock and closed with `4404` outside it, one goroutine per phone (#127, ADR-0006 amendment). The phones re-dial and re-handshake against the new binary. |
 | `ScheduleReleaseServer(serverID, d')` | Replaces the pending timer (last call wins). Old timer is `Stop()`'d. |
 | `ReleaseServer(serverID)` | Unchanged — still removes the binary entry immediately. Does not interact with the timer. |
 

@@ -1,6 +1,6 @@
 # ADR-0006: Binary disconnect grace window IS the reclaim path
 
-**Status:** Accepted (#20)
+**Status:** Accepted (#20), amended 2026-09-15 (#127): phones are no longer inherited across a reclaim, see the amendment section at the end.
 **Date:** 2026-05-08
 
 ## Context
@@ -71,3 +71,26 @@ The protocol spec says 30 seconds; the handler in #21 passes `30*time.Second`. T
 - [ADR-0003: Connection registry as a passive store](0003-connection-registry-passive-store.md) — the orphan-phones invariant that makes option 3 work.
 - [ADR-0005: Application WS close codes](0005-application-close-codes-via-underlying-conn.md) — why `Close()` on grace expiry emits `1000` rather than the protocol's `1011`.
 - [Connection registry feature](../features/connection-registry.md) — current API surface including `ScheduleReleaseServer`.
+
+## Amendment 2026-09-15 (#127): phones are closed at reclaim, not inherited
+
+**What changed.** When `ClaimServer` succeeds during a pending grace window it now removes every phone registered for that server-id under the lock and closes each one with WebSocket close code `4404` outside the lock, one goroutine per phone, through the same `CloseWithCode` type-assertion seam that `Shutdown` uses. The slot reclaim itself is unchanged: any claim during the window still wins, the timer is still cancelled, `RegisterPhone` still succeeds during the window, and expiry still evicts everything. The no-grace `ClaimServer` path and `handleGraceExpiry` are untouched.
+
+**Why the "phones still attached" rationale no longer holds.** Option 3 was chosen so a quick binary reconnect would keep its phones without a re-handshake. Under Mobile Protocol v2 every phone conn carries a Noise session that lives in the daemon process. The relay is content-blind and cannot tell a same-process reconnect from a restarted daemon, but only the same-process case keeps those sessions alive. A restarted daemon has no session for an inherited conn id, so the phone's next `noise_msg` is answered with a fatal `4421` and the client stops re-dialling. Observed twice against production on 2026-09-15, daemon restarts at 18:19 and 20:53 Helsinki time: the desktop client's relay socket survived the restart, sent `noise_msg` on the inherited conn, got `4421` three times in a row, and showed "Pairing error - Re-pair" until a human restarted it. A re-handshake costs one round trip plus microseconds of crypto and the daemon replays missed events from `hello.last_event_id`. A stranded client is dead until restarted. The trade is no longer close.
+
+A phone that registers during the grace window is in the same position: its `noise_init` went to the closed prior binary conn and it is waiting for a `noise_resp` that never arrives. Evicting it at reclaim is what gets it a live handshake.
+
+**Why close at reclaim rather than at release.** Closing at release would leave the window open for a phone to re-dial, register against the closed conn, send `noise_init` into it, and hit its own 10-second `noise_resp` timeout, which is a fatal `4421` on the client side as well. Reclaim is the first moment a live binary exists for the phones to land on.
+
+**Why `4404`.** It is the code `/v1/client` already emits when no binary holds the slot, and every client already classifies it as "relay reachable, daemon absent" and retries with its normal backoff. IANA `1012` Service Restart would have been semantically closer but no client classifies it, so it would have been a new fatal-by-default path. The reason string is `binary reclaimed server-id` so relay logs and client debug output can tell the two `4404` sources apart.
+
+**Consequences.**
+
+- The "phones survive a reclaim with no separate dance" and "asymmetric outcomes for phones registered during grace" points above are historical. Both outcomes now converge on eviction; only the close code differs (`4404` at reclaim, `1000` at expiry).
+- `Counts` drops the evicted phones synchronously with the reclaim, so the connection-count gauge stays honest.
+- The daemon keeps stale `V2Session` entries for the evicted conn ids until its idle sweep, which sends a `4408` for a conn the relay no longer has. The wire spec documents that as a harmless no-op.
+- Two backstops are deliberately out of scope and may get their own tickets: the daemon answering a `noise_msg` on an unknown conn with a retryable close instead of `4421`, and the desktop client bounding `4421` on an already-authenticated session the way the daemon bounds `4409`.
+- The wire spec's close-code table in the pyrycode repo should gain a sentence on its `4404` row saying the relay also sends it to phones evicted by a binary reclaim.
+
+Implementation notes: [codebase/127.md](../codebase/127.md).
+

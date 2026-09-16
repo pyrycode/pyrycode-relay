@@ -80,10 +80,17 @@ func TestConnectionsMetrics_GraceStaleFireDoesNotMoveGauge(t *testing.T) {
 		t.Fatalf("RegisterPhone p-1: %v", err)
 	}
 
-	// Arm grace; immediately cancel-and-replace via reclaim.
+	// Arm grace; immediately cancel-and-replace via reclaim. The reclaim
+	// evicts p-1 under the lock (#127), so the phones gauge drops to 0
+	// synchronously; a phone registered against the new binary brings it
+	// back to 1 and is the one a stale fire would wrongly remove.
 	r.ScheduleReleaseServer("s1", 5*time.Millisecond)
 	if err := r.ClaimServer("s1", &fakeConn{id: "b-2"}); err != nil {
 		t.Fatalf("ClaimServer b-2 (reclaim): %v", err)
+	}
+	assertGauge(t, h, "pyrycode_relay_connected_phones", 0)
+	if err := r.RegisterPhone("s1", &fakeConn{id: "p-2"}); err != nil {
+		t.Fatalf("RegisterPhone p-2: %v", err)
 	}
 
 	// Wait past the original grace window. If the stale fire were to

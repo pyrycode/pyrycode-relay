@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // Sentinel errors returned by Registry methods. Callers branch on these with
@@ -118,33 +120,75 @@ func (r *Registry) SetGraceExpiryHook(grace func()) {
 	r.onGraceExpiry = grace
 }
 
+// reclaimCloseCode is the WebSocket close code sent to every phone that
+// was registered for a server-id when a binary reclaims that slot during
+// its grace window (#127). It is the same 4404 that /v1/client emits when
+// no binary holds the slot, and every client already treats it as
+// "relay reachable, daemon absent: retry". IANA 1012 Service Restart was
+// rejected because no client classifies it.
+const reclaimCloseCode = websocket.StatusCode(4404)
+
+// reclaimCloseReason accompanies reclaimCloseCode on the wire.
+const reclaimCloseReason = "binary reclaimed server-id"
+
 // ClaimServer registers conn as the binary for serverID. First-claim-wins:
 // a second concurrent caller for the same serverID receives
 // ErrServerIDConflict and the conflicting caller's conn is left untouched
 // (the registry does not Close it).
 //
-// Use ReleaseServer to free the slot. ClaimServer does NOT inspect or modify
-// the phones slice for serverID; phones registered before a release remain
-// in the map until they are explicitly UnregisterPhone'd by their owner, or
-// removed by a higher-layer cleanup (#8 grace period).
+// Use ReleaseServer to free the slot. Outside a grace window ClaimServer
+// does NOT inspect or modify the phones slice for serverID; phones
+// registered before a plain release remain in the map until they are
+// explicitly UnregisterPhone'd by their owner.
+//
+// During a pending grace window (ScheduleReleaseServer) ClaimServer
+// succeeds, replaces the binary Conn, cancels the timer, and evicts every
+// phone registered for serverID: the phones are removed from the map under
+// the lock, so Counts and PhonesFor never report them after this call
+// returns, and each one is closed with reclaimCloseCode outside the lock
+// (one goroutine per phone, as Shutdown does, because a close can block on
+// the peer's close handshake). Under Mobile Protocol v2 a restarted daemon
+// has no cipher state for inherited conns, so handing phones across would
+// strand them on a fatal 4421; a 4404 makes them re-dial and re-handshake
+// against the live binary. See ADR-0006 (amended for #127).
 func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if entry, gracing := r.timers[serverID]; gracing {
-		// Grace window in flight: cancel the pending release and atomically
-		// replace the binary Conn. Phones registered during the grace window
-		// stay; the new binary inherits them. The expiry handler defends
-		// against a concurrent stale fire via pointer-identity on r.timers.
-		entry.timer.Stop()
-		delete(r.timers, serverID)
+	entry, gracing := r.timers[serverID]
+	if !gracing {
+		defer r.mu.Unlock()
+		if _, ok := r.binaries[serverID]; ok {
+			return ErrServerIDConflict
+		}
 		r.binaries[serverID] = conn
 		return nil
 	}
-	if _, ok := r.binaries[serverID]; ok {
-		return ErrServerIDConflict
-	}
+	// Grace window in flight: cancel the pending release, atomically
+	// replace the binary Conn, and snapshot-and-delete the phones. The
+	// expiry handler defends against a concurrent stale fire via
+	// pointer-identity on r.timers.
+	entry.timer.Stop()
+	delete(r.timers, serverID)
 	r.binaries[serverID] = conn
+	evicted := r.phones[serverID]
+	delete(r.phones, serverID)
+	r.mu.Unlock()
+
+	for _, p := range evicted {
+		go closeWithCode(p, reclaimCloseCode, reclaimCloseReason)
+	}
 	return nil
+}
+
+// closeWithCode closes c with the given application close code when the
+// Conn supports it, and falls back to plain Close otherwise. Mirrors the
+// gracefulCloser type-assertion seam in shutdown.go: *WSConn takes the
+// code-aware path, narrow test fakes take Close.
+func closeWithCode(c Conn, code websocket.StatusCode, reason string) {
+	if gc, ok := c.(gracefulCloser); ok {
+		gc.CloseWithCode(code, reason)
+		return
+	}
+	c.Close()
 }
 
 // ReleaseServer removes the binary entry for serverID. Returns true if a
@@ -169,8 +213,9 @@ func (r *Registry) ReleaseServer(serverID string) (released bool) {
 //     callers that Send through it observe whatever error the underlying
 //     impl returns.
 //   - RegisterPhone(serverID, conn) continues to succeed.
-//   - ClaimServer(serverID, conn) replaces the binary atomically and
-//     cancels the pending timer (returns nil, NOT ErrServerIDConflict).
+//   - ClaimServer(serverID, conn) replaces the binary atomically, cancels
+//     the pending timer (returns nil, NOT ErrServerIDConflict), and evicts
+//     every phone registered for serverID with close code 4404 (#127).
 //
 // If a timer is already pending for serverID, it is stopped and replaced
 // (last call wins). Calling ScheduleReleaseServer for a serverID with no
