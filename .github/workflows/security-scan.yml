@@ -46,7 +46,7 @@ jobs:
       # Explicit `ref: main` so a future change to the default-branch
       # name or a manual `workflow_dispatch` invocation from a feature
       # branch still scans `main` (the ticket's AC #2 names `main`).
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
       - name: build image
@@ -116,7 +116,7 @@ jobs:
           } > issue-body.md
       - name: upload issue artifact
         if: failure() && hashFiles('issue-title.txt') != ''
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: regression-image-scan
           path: |
@@ -130,10 +130,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: '1.26.x'
       # Tracks: golang.org/x/vuln/cmd/govulncheck@v1.1.4
@@ -190,7 +190,7 @@ jobs:
           } > issue-body.md
       - name: upload issue artifact
         if: failure() && hashFiles('issue-title.txt') != ''
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: regression-govulncheck
           path: |
@@ -213,7 +213,7 @@ jobs:
       issues: write
     steps:
       - name: download regression artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           # Matches both `regression-image-scan` and
           # `regression-govulncheck`. Missing artifacts (e.g. one
