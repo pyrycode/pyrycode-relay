@@ -889,3 +889,151 @@ func TestRegistry_RaceFreedom(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestTakeoverServer_IdleIncumbent_ReplacesAndEvicts pins the probe-driven
+// takeover (#112): it has the grace-reclaim semantics of #127 (binary
+// swapped, phones gone before return and closed with 4404), and it leaves
+// closing the displaced incumbent to the caller.
+func TestTakeoverServer_IdleIncumbent_ReplacesAndEvicts(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	incumbent := &fakeConn{id: "b-1"}
+	if err := r.ClaimServer("s1", incumbent); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+	phone := &codedFakeConn{fakeConn: fakeConn{id: "p-1", closeCh: make(chan struct{})}}
+	if err := r.RegisterPhone("s1", phone); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	if err := r.TakeoverServer("s1", incumbent, &fakeConn{id: "b-2"}); err != nil {
+		t.Fatalf("TakeoverServer: got %v, want nil", err)
+	}
+	if got, ok := r.BinaryFor("s1"); !ok || got.ConnID() != "b-2" {
+		t.Errorf("BinaryFor after takeover: got (%v, %v), want (b-2, true)", got, ok)
+	}
+	if phones := r.PhonesFor("s1"); phones != nil {
+		t.Errorf("PhonesFor after takeover: got %v, want nil", phones)
+	}
+	select {
+	case <-phone.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for phone eviction on takeover")
+	}
+	if got := phone.closeCode(); got != reclaimCloseCode {
+		t.Errorf("phone close code: got %d, want %d", got, reclaimCloseCode)
+	}
+	if incumbent.isClosed() {
+		t.Error("registry closed the displaced incumbent; the caller owns that")
+	}
+}
+
+// TestTakeoverServer_IncumbentReplaced_Conflicts pins identity scoping: a
+// takeover against an incumbent that no longer holds the slot must not
+// overwrite whoever does.
+func TestTakeoverServer_IncumbentReplaced_Conflicts(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	stale := &fakeConn{id: "b-1"}
+	if err := r.ClaimServer("s1", stale); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+	if err := r.TakeoverServer("s1", stale, &fakeConn{id: "b-2"}); err != nil {
+		t.Fatalf("first TakeoverServer: %v", err)
+	}
+	phone := &fakeConn{id: "p-1"}
+	if err := r.RegisterPhone("s1", phone); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	err := r.TakeoverServer("s1", stale, &fakeConn{id: "b-3"})
+	if !errors.Is(err, ErrServerIDConflict) {
+		t.Fatalf("TakeoverServer with stale incumbent: got %v, want ErrServerIDConflict", err)
+	}
+	if got, ok := r.BinaryFor("s1"); !ok || got.ConnID() != "b-2" {
+		t.Errorf("BinaryFor: got (%v, %v), want (b-2, true)", got, ok)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if phone.isClosed() {
+		t.Error("losing takeover closed a phone of the current holder")
+	}
+	if phones := r.PhonesFor("s1"); len(phones) != 1 {
+		t.Errorf("PhonesFor: got %v, want [p-1]", phones)
+	}
+
+	// A nil incumbent means "the slot was empty when I looked": refused
+	// once someone holds it, granted when it is still empty.
+	if err := r.TakeoverServer("s1", nil, &fakeConn{id: "b-4"}); !errors.Is(err, ErrServerIDConflict) {
+		t.Errorf("TakeoverServer(nil) on held slot: got %v, want ErrServerIDConflict", err)
+	}
+	if err := r.TakeoverServer("s2", nil, &fakeConn{id: "b-5"}); err != nil {
+		t.Errorf("TakeoverServer(nil) on empty slot: got %v, want nil", err)
+	}
+}
+
+// TestTakeoverServer_DuringGrace_CancelsTimer covers a takeover racing the
+// incumbent's own disconnect defer: the grace timer that defer armed must
+// not later delete the new binary.
+func TestTakeoverServer_DuringGrace_CancelsTimer(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	grace := 30 * time.Millisecond
+
+	incumbent := &fakeConn{id: "b-1"}
+	if err := r.ClaimServer("s1", incumbent); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+	if !r.ScheduleReleaseServerIfHeld("s1", incumbent, grace) {
+		t.Fatal("ScheduleReleaseServerIfHeld for the holder: got false, want true")
+	}
+	if err := r.TakeoverServer("s1", incumbent, &fakeConn{id: "b-2"}); err != nil {
+		t.Fatalf("TakeoverServer: %v", err)
+	}
+
+	time.Sleep(3 * grace)
+	if got, ok := r.BinaryFor("s1"); !ok || got.ConnID() != "b-2" {
+		t.Errorf("BinaryFor past grace: got (%v, %v), want (b-2, true)", got, ok)
+	}
+}
+
+// TestScheduleReleaseServerIfHeld_DisplacedConn_NoOp is the hazard #112
+// names: the displaced incumbent's handler runs its release defer after
+// the new binary holds the slot, and that must not arm a timer whose
+// expiry deletes the new binary.
+func TestScheduleReleaseServerIfHeld_DisplacedConn_NoOp(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	grace := 30 * time.Millisecond
+
+	incumbent := &fakeConn{id: "b-1"}
+	if err := r.ClaimServer("s1", incumbent); err != nil {
+		t.Fatalf("ClaimServer b1: %v", err)
+	}
+	fresh := &fakeConn{id: "b-2"}
+	if err := r.TakeoverServer("s1", incumbent, fresh); err != nil {
+		t.Fatalf("TakeoverServer: %v", err)
+	}
+
+	if r.ScheduleReleaseServerIfHeld("s1", incumbent, grace) {
+		t.Error("ScheduleReleaseServerIfHeld for a displaced conn: got true, want false")
+	}
+	time.Sleep(3 * grace)
+	if got, ok := r.BinaryFor("s1"); !ok || got != Conn(fresh) {
+		t.Fatalf("BinaryFor past grace: got (%v, %v), want (b-2, true)", got, ok)
+	}
+
+	// The holder's own release still fires.
+	if !r.ScheduleReleaseServerIfHeld("s1", fresh, grace) {
+		t.Fatal("ScheduleReleaseServerIfHeld for the holder: got false, want true")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := r.BinaryFor("s1"); !ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("holder's scheduled release never fired")
+}
