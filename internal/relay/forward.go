@@ -196,14 +196,8 @@ func StartBinaryForwarder(
 			continue
 		}
 
-		var phone Conn
-		for _, p := range reg.PhonesFor(serverID) {
-			if p.ConnID() == env.ConnID {
-				phone = p
-				break
-			}
-		}
-		if phone == nil {
+		phone, ok := reg.PhoneFor(serverID, env.ConnID)
+		if !ok {
 			logger.Warn("binary_forwarder_unknown_conn_id",
 				"server_id", serverID,
 				"conn_id", env.ConnID)

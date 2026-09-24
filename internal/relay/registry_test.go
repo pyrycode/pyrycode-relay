@@ -276,6 +276,61 @@ func TestPhonesFor_SnapshotIsolation(t *testing.T) {
 	}
 }
 
+func TestPhoneFor_FindsRegisteredPhone(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	p1 := &fakeConn{id: "p-1"}
+	p2 := &fakeConn{id: "p-2"}
+	if err := r.RegisterPhone("s1", p1); err != nil {
+		t.Fatalf("RegisterPhone p1: %v", err)
+	}
+	if err := r.RegisterPhone("s1", p2); err != nil {
+		t.Fatalf("RegisterPhone p2: %v", err)
+	}
+
+	for _, want := range []*fakeConn{p1, p2} {
+		got, ok := r.PhoneFor("s1", want.id)
+		if !ok || got != want {
+			t.Errorf("PhoneFor(s1, %s) = (%v, %v), want (%v, true)", want.id, got, ok, want)
+		}
+	}
+	if got, ok := r.PhoneFor("s1", "p-unknown"); ok || got != nil {
+		t.Errorf("PhoneFor unknown conn_id = (%v, %v), want (nil, false)", got, ok)
+	}
+	if got, ok := r.PhoneFor("s-unknown", "p-1"); ok || got != nil {
+		t.Errorf("PhoneFor unknown server-id = (%v, %v), want (nil, false)", got, ok)
+	}
+}
+
+// Not parallel: AllocsPerRun counts process-wide mallocs.
+func TestPhoneFor_ZeroAllocs(t *testing.T) {
+	r := NewRegistry()
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-1"}); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	for _, id := range []string{"p-1", "p-2", "p-3"} {
+		if err := r.RegisterPhone("s1", &fakeConn{id: id}); err != nil {
+			t.Fatalf("RegisterPhone %s: %v", id, err)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, ok := r.PhoneFor("s1", "p-3"); !ok {
+			t.Fatal("PhoneFor hit missed")
+		}
+		if _, ok := r.PhoneFor("s1", "p-unknown"); ok {
+			t.Fatal("PhoneFor miss hit")
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("PhoneFor allocs per run: got %v, want 0", allocs)
+	}
+}
+
 func TestCounts_AcrossLifecycle(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
