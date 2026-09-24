@@ -84,6 +84,9 @@ type Registry struct {
 	// Stale fires do not reach this site. Set once at boot via
 	// SetGraceExpiryHook; same locking rules as the forwarder hooks.
 	onGraceExpiry func()
+	// pushWaker sends the FCM wakes binaries ask for. Nil = push off. Set
+	// once at boot via SetPushWaker; same lifecycle rules as the hooks.
+	pushWaker *PushWaker
 }
 
 // graceEntry wraps a pending grace-period timer. Its pointer identity
@@ -111,6 +114,13 @@ func NewRegistry() *Registry {
 func (r *Registry) SetForwarderHooks(phone, binary func()) {
 	r.onPhoneForwarded = phone
 	r.onBinaryForwarded = binary
+}
+
+// SetPushWaker installs the waker StartBinaryForwarder hands push_wake
+// envelopes to. Nil means push is off. Call once at boot before any
+// forwarder goroutine runs; concurrent calls during serving are undefined.
+func (r *Registry) SetPushWaker(w *PushWaker) {
+	r.pushWaker = w
 }
 
 // SetGraceExpiryHook installs the eviction-increment hook. May be nil for

@@ -122,6 +122,10 @@ type binarySource interface {
 // socket with that WS close code, honoring the daemon's disconnect requests.
 // A missing addressed phone (already gone) is a normal race, logged + skipped.
 //
+// A push_wake envelope (no conn_id) goes to the registry's PushWaker, which
+// sends asynchronously; with no waker set, push is off and the wake is
+// logged and dropped.
+//
 // Returns when binary.Read errors or ctx is cancelled. Does NOT return on
 // per-frame errors: a malformed envelope, an unknown conn_id, or a phone
 // Send failure all log + drop + continue. A single bad frame from the
@@ -160,6 +164,19 @@ func StartBinaryForwarder(
 				"server_id", serverID,
 				"binary_conn_id", binary.ConnID(),
 				"err", err)
+			continue
+		}
+
+		// Wake request: Unmarshal returns an empty ConnID only for a
+		// push_wake envelope, which addresses the relay, not a phone. The
+		// waker sends off this loop; a refused wake is logged and dropped.
+		if env.ConnID == "" {
+			if err := reg.pushWaker.Request(serverID, env.PushWake); err != nil {
+				logger.Warn("binary_forwarder_push_wake_dropped",
+					"server_id", serverID,
+					"binary_conn_id", binary.ConnID(),
+					"err", err)
+			}
 			continue
 		}
 

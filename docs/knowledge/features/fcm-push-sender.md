@@ -2,9 +2,11 @@
 
 `internal/relay/push.go` gives the relay an `FCMSender` that wakes a
 backgrounded Android app by sending it a data-only FCM message. Introduced by
-#132. Nothing calls `Send` yet — the daemon's `push_wake` routing envelope
-(`protocol-mobile.md` § `push_wake`) is wired to this sender by #133, which
-also constructs it from `main`.
+#132. #133 wires the daemon's `push_wake` routing envelope
+(`protocol-mobile.md` § `push_wake`) to `Send` and constructs the sender
+from `main` — see [Push wake dispatch](push-wake-dispatch.md) for the
+dispatch path (structural validation, per-server-id rate limit, relay-wide
+in-flight cap, async send off the binary read loop).
 
 ## Why
 
@@ -98,21 +100,23 @@ subpackage rather than `oauth2/google` — see
 [`docs/threat-model.md` § Supply chain](../../threat-model.md) for the
 residual-risk accounting.
 
-## Out of scope (this ticket)
+## Out of scope
 
-- Wiring the `push_wake` envelope to `Send` and constructing the sender in
-  `main` — #133.
 - APNs (iOS push).
 - Telling the daemon that a device token is dead (no retry, no dead-token
   callback).
-- Rate-limiting wakes per server-id — belongs to whichever ticket connects
-  inbound frames to `Send` (#133).
+- A global wakes-per-second ceiling beyond the per-server-id rate and
+  relay-wide in-flight cap — see
+  [`docs/threat-model.md` § Outbound network calls](../../threat-model.md#outbound-network-calls--fcm-push-wake).
 
 ## Cross-links
 
 - [ADR-0011: `oauth2/jwt` not `oauth2/google`](../decisions/0011-oauth2-jwt-not-google-for-fcm.md)
+- [Push wake dispatch](push-wake-dispatch.md) — the caller: validates the
+  wake, rate-limits and caps it, calls `Send` off the binary read loop.
 - [Env-var config validator](env-config-validator.md) — the registry
   `PYRYCODE_RELAY_FCM_CREDENTIALS` joins.
 - [Codebase note #132](../codebase/132.md) — implementation summary and
-  lessons.
+  lessons for the sender itself; [#133](../codebase/133.md) for the
+  dispatch wiring.
 - [`internal/relay/push.go`](../../../internal/relay/push.go) — implementation.

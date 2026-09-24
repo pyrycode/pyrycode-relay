@@ -16,6 +16,12 @@ var (
 	ErrMalformedEnvelope = errors.New("relay: malformed routing envelope")
 	ErrMissingConnID     = errors.New("relay: routing envelope missing conn_id")
 	ErrMissingFrame      = errors.New("relay: routing envelope missing frame")
+
+	// Wake-request rejections. None of them carries any part of the
+	// push_wake object: the token is never logged or put in error text.
+	ErrMalformedPushWake       = errors.New("relay: malformed push_wake")
+	ErrUnsupportedPushPlatform = errors.New("relay: push_wake platform not supported")
+	ErrEmptyPushToken          = errors.New("relay: push_wake token is empty")
 )
 
 // Envelope is the routing wrapper exchanged between the relay and a pyrycode
@@ -33,10 +39,41 @@ var (
 // mismatch, handshake failure), so the phone hangs on a dead session. The
 // field mirrors the daemon's protocol.RoutingEnvelope.CloseCode; omitempty
 // keeps every non-close envelope byte-identical to the pre-close-code shape.
+//
+// PushWake is the second relay-interpreted field: an envelope with no
+// conn_id and a push_wake object asks the relay to wake a phone
+// (docs/protocol-mobile.md § push_wake). It stays raw here so a conn_id
+// envelope decodes exactly as before whatever push_wake it carries;
+// parsePushWake validates it only on the wake path.
 type Envelope struct {
 	ConnID    string          `json:"conn_id"`
 	Frame     json.RawMessage `json:"frame"`
 	CloseCode uint16          `json:"close_code,omitempty"`
+	PushWake  json.RawMessage `json:"push_wake,omitempty"`
+}
+
+// pushWake is the relay-addressed wake request carried in Envelope.PushWake.
+type pushWake struct {
+	Platform string `json:"platform"`
+	Token    string `json:"token"`
+}
+
+// parsePushWake validates a push_wake object at the envelope boundary. fcm
+// is the only platform the relay sends to; apns and anything else are
+// rejected. The decoder error is not wrapped so no fragment of the input
+// reaches error text.
+func parsePushWake(raw json.RawMessage) (pushWake, error) {
+	var w pushWake
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return pushWake{}, ErrMalformedPushWake
+	}
+	if w.Platform != "fcm" {
+		return pushWake{}, ErrUnsupportedPushPlatform
+	}
+	if w.Token == "" {
+		return pushWake{}, ErrEmptyPushToken
+	}
+	return w, nil
 }
 
 // hasFrame reports whether f carries a real inner frame. An absent field
@@ -79,6 +116,10 @@ func Marshal(connID string, frame []byte) ([]byte, error) {
 // when conn_id is absent, empty, or null, and ErrMissingFrame when frame
 // is absent or null AND no close code is set.
 //
+// A wake request (conn_id absent, empty or null, and push_wake present and
+// not null) is valid: it is returned with an empty ConnID and the raw
+// PushWake, whatever frame it carries. Callers branch on ConnID == "".
+//
 // A close directive (CloseCode != 0) may legitimately carry no frame: the
 // daemon closes a phone without a final application frame, e.g. an auth
 // reject with no error body. Such an envelope is valid and ErrMissingFrame
@@ -93,6 +134,10 @@ func Unmarshal(data []byte) (Envelope, error) {
 		return Envelope{}, fmt.Errorf("%w: %v", ErrMalformedEnvelope, err)
 	}
 	if env.ConnID == "" {
+		// Same presence rule as a frame: absent and null mean "none".
+		if hasFrame(env.PushWake) {
+			return env, nil
+		}
 		return Envelope{}, ErrMissingConnID
 	}
 	if env.CloseCode == 0 && !hasFrame(env.Frame) {

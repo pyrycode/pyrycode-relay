@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -773,5 +774,128 @@ func TestStartBinaryForwarder_ContextCancellation_Returns(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("forwarder did not return promptly on ctx cancel")
+	}
+}
+
+// runBinaryForwarderLogged is runBinaryForwarder with a caller-supplied
+// logger, for tests that assert on log output.
+func runBinaryForwarderLogged(reg *Registry, serverID string, bin binarySource, logger *slog.Logger) (done chan error, cancel context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done = make(chan error, 1)
+	go func() {
+		done <- StartBinaryForwarder(ctx, reg, serverID, bin, logger)
+	}()
+	return done, cancel
+}
+
+func pushWakeEnvelope(platform, token string) []byte {
+	out, _ := json.Marshal(map[string]json.RawMessage{"push_wake": wakeJSON(platform, token)})
+	return out
+}
+
+// TestStartBinaryForwarder_PushWake_DispatchedOffReadLoop proves a wake is
+// sent once to its token without blocking the binary read loop: with the
+// sender stuck, the next frame still reaches its phone.
+func TestStartBinaryForwarder_PushWake_DispatchedOffReadLoop(t *testing.T) {
+	t.Parallel()
+
+	reg := NewRegistry()
+	p1 := newFakePhone("client-s1-aaaa1111")
+	claimAndRegister(t, reg, "s1", p1)
+
+	sender := newFakePushSender()
+	sender.block = make(chan struct{})
+	w := NewPushWaker(sender, discardLogger())
+	defer w.Close()
+	reg.SetPushWaker(w)
+
+	logger, logs := captureLogger()
+	src := newFakeBinarySource("bin-s1")
+	_, cancel := runBinaryForwarderLogged(reg, "s1", src, logger)
+	defer cancel()
+
+	inner := []byte(`{"type":"after-wake"}`)
+	src.frames <- pushWakeEnvelope("fcm", testWakeToken)
+	src.frames <- mustMarshal(t, p1.ConnID(), inner)
+
+	waitForPhoneSent(t, p1, 1, 2*time.Second)
+	sender.waitStarted(t, 1)
+	if got := sender.sentTokens(); len(got) != 1 || got[0] != testWakeToken {
+		t.Fatalf("sent tokens = %q, want exactly [%q]", got, testWakeToken)
+	}
+	out := logs.String()
+	if strings.Contains(out, "binary_forwarder_unmarshal_err") {
+		t.Errorf("wake logged as an unmarshal error: %q", out)
+	}
+	if strings.Contains(out, testWakeToken) {
+		t.Errorf("log contains the token: %q", out)
+	}
+}
+
+// TestStartBinaryForwarder_PushWake_DropsAndContinues covers every dropped
+// wake and the conn_id+push_wake envelope: none reach the sender, the loop
+// keeps forwarding, and no log line carries the token.
+func TestStartBinaryForwarder_PushWake_DropsAndContinues(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		envelope []byte
+		pushOn   bool
+		dropped  bool
+	}{
+		{"apns", pushWakeEnvelope("apns", testWakeToken), true, true},
+		{"other platform", pushWakeEnvelope("webpush", testWakeToken), true, true},
+		{"empty token", pushWakeEnvelope("fcm", ""), true, true},
+		{"malformed", []byte(`{"push_wake":["` + testWakeToken + `"]}`), true, true},
+		{"push off", pushWakeEnvelope("fcm", testWakeToken), false, true},
+		{"conn_id with push_wake", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := NewRegistry()
+			p1 := newFakePhone("client-s1-aaaa1111")
+			claimAndRegister(t, reg, "s1", p1)
+
+			sender := newFakePushSender()
+			if tc.pushOn {
+				w := NewPushWaker(sender, discardLogger())
+				defer w.Close()
+				reg.SetPushWaker(w)
+			}
+
+			envelope := tc.envelope
+			if envelope == nil {
+				envelope = []byte(`{"conn_id":"` + p1.ConnID() + `","frame":{"type":"first"},"push_wake":{"platform":"fcm","token":"` + testWakeToken + `"}}`)
+			}
+
+			logger, logs := captureLogger()
+			src := newFakeBinarySource("bin-s1")
+			_, cancel := runBinaryForwarderLogged(reg, "s1", src, logger)
+			defer cancel()
+
+			src.frames <- envelope
+			src.frames <- mustMarshal(t, p1.ConnID(), []byte(`{"type":"later"}`))
+
+			want := 1
+			if !tc.dropped {
+				want = 2
+			}
+			got := waitForPhoneSent(t, p1, want, 2*time.Second)
+			if !bytes.Equal(compactJSON(t, got[want-1]), []byte(`{"type":"later"}`)) {
+				t.Errorf("last phone frame = %s, want the later frame", got[want-1])
+			}
+			if tokens := sender.sentTokens(); len(tokens) != 0 {
+				t.Errorf("sender called with %q, want no send", tokens)
+			}
+			out := logs.String()
+			if got := strings.Contains(out, "binary_forwarder_push_wake_dropped"); got != tc.dropped {
+				t.Errorf("dropped log present = %v, want %v: %q", got, tc.dropped, out)
+			}
+			if strings.Contains(out, testWakeToken) {
+				t.Errorf("log contains the token: %q", out)
+			}
+		})
 	}
 }

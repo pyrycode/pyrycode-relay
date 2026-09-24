@@ -27,8 +27,26 @@ The wire protocol lives in [`pyrycode/pyrycode/docs/protocol-mobile.md`](https:/
 - Read message payloads. Frames are opaque bytes.
 - Persist anything (modulo the on-disk autocert cert cache).
 - Validate device tokens. The binary does that.
-- Implement push notifications. The binary calls APNs/FCM directly.
+- Implement APNs push. Only FCM wakes are sent, and only when the binary
+  asks for one.
 - Operate on multiple users / tenants in v1. One operator, many users' server-ids.
+
+## Outbound calls to Google (FCM push wake)
+
+Unlike everything else in [*What this binary does*](#what-this-binary-does),
+this one path makes outbound calls instead of only routing inbound ones. When
+a binary sends a `push_wake` routing envelope (`{"push_wake":{"platform":"fcm","token":"…"}}`,
+no `conn_id`), the relay makes two outbound HTTPS calls to Google: an OAuth
+token request to `https://oauth2.googleapis.com/token` (cached across sends;
+see [FCM push sender](knowledge/features/fcm-push-sender.md)), and an FCM
+send to `https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send`.
+The wake carries no payload — no `notification`, no `data` field — so a
+successful send tells the phone only to reconnect, never what happened in
+the session. See [Push wake dispatch](knowledge/features/push-wake-dispatch.md)
+for the dispatch path (async off the binary read loop, per-server-id rate
+limit, relay-wide in-flight cap) and
+[`docs/threat-model.md` § Outbound network calls](threat-model.md#outbound-network-calls--fcm-push-wake)
+for the abuse accounting.
 
 ## Single-instance constraint (v1)
 

@@ -49,6 +49,26 @@ The operator authenticates `flyctl` locally (`flyctl auth login`); the
 deploy token lives only in the operator's local environment. No GitHub
 repo secret is involved — PR code has no path to a deploy credential.
 
+## Secrets
+
+- **`PYRYCODE_RELAY_FCM_CREDENTIALS`** — optional. Holds the *entire* Google
+  service-account JSON key the relay uses to send FCM push wakes (see
+  [Push wake dispatch](knowledge/features/push-wake-dispatch.md)). Unset
+  means push is off: the relay starts normally, sends nothing, and logs
+  once at startup (`push off: PYRYCODE_RELAY_FCM_CREDENTIALS unset`). Set
+  it with:
+
+  ```sh
+  fly secrets set PYRYCODE_RELAY_FCM_CREDENTIALS="$(cat key.json)" -a pyrycode-relay
+  ```
+
+  Setting a Fly secret triggers a machine restart, which drops every
+  connected binary the same way a deploy does (see
+  [*Steady-state flow*](#steady-state-flow) below); binaries reconnect on
+  their own. A malformed value fails `CheckEnvConfig` at boot with
+  value-withheld error text, so a bad key refuses to start rather than
+  running with push silently broken.
+
 ## fly.toml gotchas
 
 Non-obvious requirements that surface as `flyctl deploy` failures or
