@@ -1,6 +1,6 @@
 # ADR-0006: Binary disconnect grace window IS the reclaim path
 
-**Status:** Accepted (#20), amended 2026-09-15 (#127): phones are no longer inherited across a reclaim, see the amendment section at the end.
+**Status:** Accepted (#20), amended 2026-09-15 (#127): phones are no longer inherited across a reclaim; amended 2026-09-24 (#112): a caller can also trigger the reclaim path by liveness probe, without a grace window. See the amendment sections at the end.
 **Date:** 2026-05-08
 
 ## Context
@@ -93,4 +93,21 @@ A phone that registers during the grace window is in the same position: its `noi
 - The wire spec's close-code table in the pyrycode repo should gain a sentence on its `4404` row saying the relay also sends it to phones evicted by a binary reclaim.
 
 Implementation notes: [codebase/127.md](../codebase/127.md).
+
+## Amendment 2026-09-24 (#112): a second, probe-driven route into the same reclaim path
+
+**What changed.** Option 3's reclaim semantics — cancel any pending timer, swap the binary, evict phones with `4404` — are no longer reached only through `ClaimServer` during an active grace window. A new method, `Registry.TakeoverServer(serverID, incumbent, conn)`, reaches the identical behaviour (implemented as one shared `replaceBinaryLocked` helper, so there is exactly one reclaim implementation) from a different trigger: the `/v1/server` handler, on a conflicting claim, pings the incumbent for up to 10s before deciding it's unresponsive. If it doesn't answer, `TakeoverServer` hands the slot to the new claim — whether or not any grace timer happens to be pending — and the handler closes the displaced incumbent with `1011 "heartbeat timeout"`. See [`/v1/server`](../features/server-endpoint.md) and [Connection registry § Probe-driven takeover](../features/connection-registry.md).
+
+**Why this needed a new entry point rather than reusing `ClaimServer`.** `ClaimServer`'s grace branch trusts that a pending timer for `serverID` implies the incumbent is gone — the timer only exists because the disconnect path already ran. A probe-driven takeover has no such timer: the incumbent may still be fully registered, mid-heartbeat, with nothing yet having detected it as dead. `TakeoverServer` therefore takes the incumbent `Conn` explicitly and checks *that specific conn* still holds the slot, rather than inferring liveness from timer presence. This identity check is also what keeps a takeover safe against a race: if two claimants both probe the same dead incumbent, the first to reach `TakeoverServer` swaps the binary, and the second sees a different current holder and gets `ErrServerIDConflict` instead of overwriting the winner.
+
+**The hazard this amendment closes.** A displaced incumbent's own handler is still running — it entered `ServerHandler` normally, and its forwarder's `Read` eventually errors once the handler closes it, which runs the same disconnect defer every binary handler runs. Before #112 that defer called the unscoped `ScheduleReleaseServer(serverID, grace)` unconditionally. Fired 30s later, that timer would delete whatever is in `binaries[serverID]` — by then, the *new* binary that displaced it, not the empty slot the old code assumed. The fix, `ScheduleReleaseServerIfHeld(serverID, conn, d) bool`, checks under the same lock that `conn` is still the current holder before arming the timer; for a displaced conn it's a no-op. Every route that reassigns `binaries[serverID]` while a timer is pending — the pre-existing `ClaimServer` grace branch and the new `TakeoverServer` alike — deletes that timer entry via `replaceBinaryLocked`, so the pointer-identity stale-fire defence above continues to be the only guard expiry needs; no second guard was added.
+
+**Consequences.**
+
+- A crash-restarted daemon whose predecessor dropped silently (no FIN/RST — power loss, NAT timeout) no longer waits for the heartbeat (up to 60s) to reclaim its `serverID`; the very next conflicting claim reclaims it within the probe timeout (≤10s).
+- A live incumbent is never displaced by this path: the probe only proceeds to `TakeoverServer` once the incumbent has failed to answer within the timeout, and the handler treats a request-context cancellation (server shutdown) during the probe as "inconclusive," not "dead."
+- The "Squatting on a serverID" threat entry in [`server-endpoint.md`](../features/server-endpoint.md) is updated: the window a squatter can hold a slot after going silent only shrinks, it does not grow, and a squatter that keeps answering probes is unaffected.
+- One residual risk was recorded rather than fixed: an incumbent's pong is only processed while its forwarder sits in `Read`, and a synchronous `phone.Send` to a stalled phone can hold that `Read` for up to `writeTimeout` (10s) — so a *live* incumbent stalled on a slow phone can, in principle, also miss the probe and be displaced. Tracked as issue #140 and in `docs/threat-model.md` § DoS resistance.
+
+Implementation notes: [codebase/112.md](../codebase/112.md).
 

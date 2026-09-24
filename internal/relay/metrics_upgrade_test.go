@@ -183,6 +183,7 @@ func TestUpgradeMetrics_ServerEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("dial #1: %v", err)
 		}
 		defer c1.Close(websocket.StatusNormalClosure, "")
+		c1.CloseRead(context.Background()) // answer the conflict probe (#112)
 		if !pollUntil(time.Now().Add(time.Second), func() bool {
 			_, ok := reg.BinaryFor("s1")
 			return ok

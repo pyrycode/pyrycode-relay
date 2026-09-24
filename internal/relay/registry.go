@@ -163,8 +163,7 @@ const reclaimCloseReason = "binary reclaimed server-id"
 // against the live binary. See ADR-0006 (amended for #127).
 func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 	r.mu.Lock()
-	entry, gracing := r.timers[serverID]
-	if !gracing {
+	if _, gracing := r.timers[serverID]; !gracing {
 		defer r.mu.Unlock()
 		if _, ok := r.binaries[serverID]; ok {
 			return ErrServerIDConflict
@@ -172,21 +171,67 @@ func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 		r.binaries[serverID] = conn
 		return nil
 	}
-	// Grace window in flight: cancel the pending release, atomically
-	// replace the binary Conn, and snapshot-and-delete the phones. The
-	// expiry handler defends against a concurrent stale fire via
-	// pointer-identity on r.timers.
-	entry.timer.Stop()
-	delete(r.timers, serverID)
+	// Grace window in flight: the reclaim path. The expiry handler
+	// defends against a concurrent stale fire via pointer-identity on
+	// r.timers.
+	evicted := r.replaceBinaryLocked(serverID, conn)
+	r.mu.Unlock()
+
+	evictPhones(evicted)
+	return nil
+}
+
+// TakeoverServer hands serverID to conn when incumbent, the binary a
+// caller found unresponsive to a liveness probe (#112), still holds it.
+// It is identity-scoped: if any other Conn holds the slot by the time the
+// lock is taken (a concurrent reclaim, or another prober's takeover), it
+// returns ErrServerIDConflict and touches nothing. A nil incumbent means
+// the slot was empty when the caller looked, and is refused the same way
+// once anyone holds it.
+//
+// On success the semantics are the grace-window reclaim of ClaimServer:
+// any pending grace timer is cancelled, the binary Conn is replaced, and
+// every phone registered for serverID is removed under the lock and closed
+// with reclaimCloseCode outside it (ADR-0006). The registry does not close
+// incumbent; the caller owns that, as it owns the close code.
+func (r *Registry) TakeoverServer(serverID string, incumbent, conn Conn) error {
+	r.mu.Lock()
+	if cur, held := r.binaries[serverID]; held && cur != incumbent {
+		r.mu.Unlock()
+		return ErrServerIDConflict
+	}
+	evicted := r.replaceBinaryLocked(serverID, conn)
+	r.mu.Unlock()
+
+	evictPhones(evicted)
+	return nil
+}
+
+// replaceBinaryLocked is the reclaim semantics shared by ClaimServer's
+// grace branch and TakeoverServer: cancel any pending release, install
+// conn, and take the phones slice out of the registry. The caller holds
+// r.mu and passes the returned phones to evictPhones after unlocking.
+// Deleting the timer entry here is what makes a stale expiry of the
+// replaced binary's timer no-op at the pointer-identity guard in
+// handleGraceExpiry.
+func (r *Registry) replaceBinaryLocked(serverID string, conn Conn) []Conn {
+	if entry, ok := r.timers[serverID]; ok {
+		entry.timer.Stop()
+		delete(r.timers, serverID)
+	}
 	r.binaries[serverID] = conn
 	evicted := r.phones[serverID]
 	delete(r.phones, serverID)
-	r.mu.Unlock()
+	return evicted
+}
 
-	for _, p := range evicted {
+// evictPhones closes each phone with reclaimCloseCode, one goroutine per
+// phone as Shutdown does, because a close can block on the peer's close
+// handshake. Called outside r.mu.
+func evictPhones(phones []Conn) {
+	for _, p := range phones {
 		go closeWithCode(p, reclaimCloseCode, reclaimCloseReason)
 	}
-	return nil
 }
 
 // closeWithCode closes c with the given application close code when the
@@ -243,7 +288,29 @@ func (r *Registry) ReleaseServer(serverID string) (released bool) {
 func (r *Registry) ScheduleReleaseServer(serverID string, d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.armGraceLocked(serverID, d)
+}
 
+// ScheduleReleaseServerIfHeld is ScheduleReleaseServer scoped to conn: it
+// arms the grace timer only while conn holds serverID, and returns whether
+// it did. A binary displaced by TakeoverServer (#112) runs its handler's
+// disconnect path after the new binary holds the slot; scoping the release
+// to its own Conn stops it arming a timer whose expiry would delete the new
+// binary. Expiry needs no scoping of its own: every replacement of the
+// binary deletes the pending timer under the same lock (replaceBinaryLocked).
+func (r *Registry) ScheduleReleaseServerIfHeld(serverID string, conn Conn, d time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, held := r.binaries[serverID]; !held || cur != conn {
+		return false
+	}
+	r.armGraceLocked(serverID, d)
+	return true
+}
+
+// armGraceLocked arms (or replaces) the grace timer for serverID. The
+// caller holds r.mu.
+func (r *Registry) armGraceLocked(serverID string, d time.Duration) {
 	if existing, ok := r.timers[serverID]; ok {
 		existing.timer.Stop()
 		delete(r.timers, serverID)

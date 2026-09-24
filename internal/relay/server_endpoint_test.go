@@ -154,6 +154,9 @@ func TestServerEndpoint_DuplicateClaim_4409(t *testing.T) {
 		t.Fatalf("dial #1: %v", err)
 	}
 	defer c1.Close(websocket.StatusNormalClosure, "")
+	// A live binary reads, and reading is what answers the relay's
+	// conflict probe (#112); a client that never reads is unresponsive.
+	c1.CloseRead(context.Background())
 
 	// Wait for the first claim to land.
 	deadline := time.Now().Add(time.Second)
@@ -165,6 +168,10 @@ func TestServerEndpoint_DuplicateClaim_4409(t *testing.T) {
 	}
 	if _, ok := reg.BinaryFor("s1"); !ok {
 		t.Fatalf("first claim did not register")
+	}
+	phone := &fakeConn{id: "p-1"}
+	if err := reg.RegisterPhone("s1", phone); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
 	}
 
 	c2, _, err := dialWith(t, wsURL, validHeaders("s1"))
@@ -192,6 +199,9 @@ func TestServerEndpoint_DuplicateClaim_4409(t *testing.T) {
 
 	if _, ok := reg.BinaryFor("s1"); !ok {
 		t.Fatalf("first claim was evicted by duplicate; registry no longer holds s1")
+	}
+	if phone.isClosed() {
+		t.Fatalf("incumbent's phone was closed by a refused duplicate claim")
 	}
 }
 
@@ -352,5 +362,102 @@ func TestServerEndpoint_WrongMethod_NoPanic(t *testing.T) {
 				t.Fatalf("registry counts = (%d, %d), want (0, 0)", b, p)
 			}
 		})
+	}
+}
+
+// startServerProbe is startServer with a short conflict-probe timeout and a
+// captured log, for the #112 takeover tests.
+func startServerProbe(t *testing.T, grace, probeTimeout time.Duration) (*Registry, string, *lockedBuffer, func()) {
+	t.Helper()
+	reg := NewRegistry()
+	logger, logs := captureLogger()
+	srv := httptest.NewServer(serverHandler(reg, logger, grace, probeTimeout, 256*1024, nil))
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	return reg, wsURL, logs, srv.Close
+}
+
+// awaitBinary polls until serverID is held and returns the holder.
+func awaitBinary(t *testing.T, reg *Registry, serverID string) Conn {
+	t.Helper()
+	var conn Conn
+	if !pollUntil(time.Now().Add(time.Second), func() bool {
+		c, ok := reg.BinaryFor(serverID)
+		conn = c
+		return ok
+	}) {
+		t.Fatalf("no binary claimed %q", serverID)
+	}
+	return conn
+}
+
+// TestServerEndpoint_UnresponsiveIncumbent_TakenOver covers #112's first
+// and third acceptance criteria. The incumbent client never reads, so it
+// never answers the conflict probe: the second claim takes the slot within
+// the probe timeout, the incumbent's phones get 4404, the incumbent gets
+// the heartbeat's 1011, and the displaced handler's release defer does not
+// remove the new binary once grace has long passed.
+func TestServerEndpoint_UnresponsiveIncumbent_TakenOver(t *testing.T) {
+	grace := 100 * time.Millisecond
+	probeTimeout := 200 * time.Millisecond
+	reg, wsURL, logs, cleanup := startServerProbe(t, grace, probeTimeout)
+	defer cleanup()
+
+	c1, _, err := dialWith(t, wsURL, validHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial #1: %v", err)
+	}
+	defer c1.Close(websocket.StatusNormalClosure, "")
+	incumbent := awaitBinary(t, reg, "s1")
+
+	phone := &codedFakeConn{fakeConn: fakeConn{id: "p-1", closeCh: make(chan struct{})}}
+	if err := reg.RegisterPhone("s1", phone); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	start := time.Now()
+	c2, _, err := dialWith(t, wsURL, validHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial #2: %v", err)
+	}
+	defer c2.Close(websocket.StatusNormalClosure, "")
+
+	var holder Conn
+	if !pollUntil(start.Add(probeTimeout+2*time.Second), func() bool {
+		c, ok := reg.BinaryFor("s1")
+		holder = c
+		return ok && c != incumbent
+	}) {
+		t.Fatalf("second claim did not take over the unresponsive incumbent's slot")
+	}
+
+	select {
+	case <-phone.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("incumbent's phone not closed on takeover")
+	}
+	if got := phone.closeCode(); got != websocket.StatusCode(4404) {
+		t.Errorf("phone close code: got %d, want 4404", got)
+	}
+
+	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, readErr := c1.Read(readCtx)
+	if got := websocket.CloseStatus(readErr); got != websocket.StatusInternalError {
+		t.Fatalf("incumbent close: got %v (code %d), want 1011", readErr, got)
+	}
+
+	// AC3: the displaced handler's disconnect path has run...
+	if !pollUntil(time.Now().Add(2*time.Second), func() bool {
+		return strings.Contains(logs.String(), "msg=server_released")
+	}) {
+		t.Fatal("displaced handler never ran its release defer")
+	}
+	// ...and well past grace the new binary still holds the slot.
+	time.Sleep(3 * grace)
+	if got, ok := reg.BinaryFor("s1"); !ok || got != holder {
+		t.Fatalf("after displaced release + 3×grace: BinaryFor = (%v, %v), want the new binary", got, ok)
+	}
+	if !strings.Contains(logs.String(), "msg=server_id_takeover") {
+		t.Error("takeover not logged as server_id_takeover")
 	}
 }
