@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -459,5 +460,92 @@ func TestServerEndpoint_UnresponsiveIncumbent_TakenOver(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "msg=server_id_takeover") {
 		t.Error("takeover not logged as server_id_takeover")
+	}
+}
+
+// TestServerEndpoint_StalledPhone_LiveIncumbentKeepsSlot pins #140: a
+// phone write blocked on a stalled phone must not delay the incumbent's
+// pong past the conflict probe. Before #113 the forwarder wrote to phones
+// synchronously, so a pong waited behind the blocked write (up to
+// writeTimeout) and a live incumbent was taken over.
+func TestServerEndpoint_StalledPhone_LiveIncumbentKeepsSlot(t *testing.T) {
+	probeTimeout := 200 * time.Millisecond
+	reg := NewRegistry()
+	var written atomic.Int64
+	reg.SetForwarderHooks(nil, func() { written.Add(1) })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mux := http.NewServeMux()
+	mux.Handle("/v1/server", serverHandler(reg, logger, 100*time.Millisecond, probeTimeout, 1<<20, nil))
+	mux.Handle("/v1/client", ClientHandler(reg, logger, 256*1024, 0, nil))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	c1, _, err := dialWith(t, wsURL+"/v1/server", validHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial incumbent: %v", err)
+	}
+	defer c1.CloseNow()
+	// The incumbent answers pings only while it reads.
+	c1.CloseRead(context.Background())
+	incumbent := awaitBinary(t, reg, "s1")
+
+	// The phone never reads, so its socket buffers fill and stay full.
+	pc, _, err := dialWithClient(t, wsURL+"/v1/client", validClientHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial phone: %v", err)
+	}
+	defer pc.CloseNow()
+	phones := waitForPhones(t, reg, "s1", 1, time.Second)
+	phoneID := phones[0].ConnID()
+
+	// Send one frame at a time until a write to the phone stops
+	// completing. At most one frame is ever queued behind the blocked
+	// write, far under phoneOutboxDepth, so the outbox never overflows
+	// into a 1011 close.
+	frame := []byte(`"` + strings.Repeat("a", 256*1024) + `"`)
+	env := mustMarshal(t, phoneID, frame)
+	var sent int64
+	blocked := false
+	for sent < 400 && !blocked {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c1.Write(ctx, websocket.MessageText, env)
+		cancel()
+		if err != nil {
+			t.Fatalf("binary write %d: %v", sent+1, err)
+		}
+		sent++
+		want := sent
+		blocked = !pollUntil(time.Now().Add(300*time.Millisecond), func() bool {
+			return written.Load() == want
+		})
+	}
+	if !blocked {
+		t.Fatalf("phone writes never blocked after %d frames of %d bytes", sent, len(frame))
+	}
+	stuck := written.Load()
+
+	c2, _, err := dialWith(t, wsURL+"/v1/server", validHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial duplicate: %v", err)
+	}
+	defer c2.CloseNow()
+	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, readErr := c2.Read(readCtx)
+	if got := websocket.CloseStatus(readErr); got != websocket.StatusCode(4409) {
+		t.Fatalf("duplicate claim close: got %v (code %d), want 4409", readErr, got)
+	}
+
+	if got, ok := reg.BinaryFor("s1"); !ok || got != incumbent {
+		t.Fatalf("BinaryFor(s1) = (%v, %v), want the incumbent", got, ok)
+	}
+	// The write stayed blocked across the whole probe, so the pong was
+	// answered while a phone write was in flight.
+	if got := written.Load(); got != stuck || got >= sent {
+		t.Fatalf("phone writes = %d of %d sent (was %d before the probe), want still blocked", got, sent, stuck)
+	}
+	if got := reg.PhonesFor("s1"); len(got) != 1 || got[0].ConnID() != phoneID {
+		t.Fatalf("PhonesFor(s1) = %v, want the stalled phone still registered", got)
 	}
 }
