@@ -353,6 +353,50 @@ func TestStartPhoneForwarder_NoBinary_ReturnsNil(t *testing.T) {
 	}
 }
 
+// A non-JSON phone frame ends the phone forwarder (and so the connection) —
+// the deliberate opposite of the binary side's drop-and-continue. See the
+// malformed-frame paragraph on StartPhoneForwarder for why.
+func TestStartPhoneForwarder_NonJSONFrame_TearsDown(t *testing.T) {
+	t.Parallel()
+
+	reg := NewRegistry()
+	bin := &fakeBinary{id: "bin-s1"}
+	if err := reg.ClaimServer("s1", bin); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	phone := newFakePhone("client-s1-66cc77dd")
+	if err := reg.RegisterPhone("s1", &registryConn{phone}); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+
+	done, cancel := runForwarder(reg, "s1", phone)
+	defer cancel()
+
+	// A good frame first proves the pipe works, so the absence below means
+	// something.
+	phone.frames <- []byte(`{"type":"k","v":1}`)
+	waitForSent(t, bin, 1, time.Second)
+
+	phone.frames <- []byte("not json")
+	phone.frames <- []byte(`{"type":"k","v":2}`)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidFrameJSON) {
+			t.Fatalf("forwarder return = %v, want ErrInvalidFrameJSON", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not return on a non-JSON frame")
+	}
+
+	if got := bin.snapshot(); len(got) != 1 {
+		t.Fatalf("binary received %d frames, want only the 1 sent before the bad frame", len(got))
+	}
+	if n := len(phone.frames); n != 1 {
+		t.Fatalf("phone frames left unread = %d, want 1 (the frame after the bad one)", n)
+	}
+}
+
 func TestStartPhoneForwarder_ContextCancellation_Returns(t *testing.T) {
 	t.Parallel()
 

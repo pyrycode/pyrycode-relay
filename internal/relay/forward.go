@@ -55,6 +55,14 @@ type phoneSource interface {
 // cancelled, the registered binary disappears, or a Send to the binary
 // fails — the underlying error is returned for observability.
 //
+// A frame Marshal rejects (ErrInvalidFrameJSON) also ends the loop, and the
+// caller's defer then closes the phone. This is deliberate, and the opposite
+// of StartBinaryForwarder's drop-and-continue: the bad frame came from this
+// phone, so teardown drops only the sender; it bounds phone_forwarder_marshal_err
+// to one warn line per connection from an internet peer, with every reconnect
+// re-passing the upgrade rate limiter; and no real client has been seen
+// dropped by an encoding glitch that tolerance would have saved.
+//
 // The caller's defer (in /v1/client) handles UnregisterPhone and Close;
 // the forwarder must NOT touch either. The relay treats inner frames as
 // opaque bytes: only Marshal's structural json.Valid check inspects them.
@@ -148,7 +156,10 @@ type binarySource interface {
 // binary MUST NOT tear the binary connection down — phones come and go,
 // and an envelope addressing a just-disconnected phone is a normal race,
 // not a binary fault. This diverges from StartPhoneForwarder, where the
-// only sink is the binary so a Send failure ends the loop.
+// only sink is the binary so a Send failure ends the loop, and where a
+// malformed frame also ends the loop: there only the sending phone pays,
+// whereas closing a binary on a bad envelope would drop every phone it
+// serves.
 //
 // The caller's defer (in /v1/server) handles ScheduleReleaseServer,
 // wsconn.Close, and the heartbeat cancel; the forwarder must NOT touch
