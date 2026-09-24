@@ -6,6 +6,8 @@ This is the public, internet-exposed endpoint. The peer is *less* trusted than `
 
 This is the phone side only. After header validation and `RegisterPhone`, the handler hands the connection to `StartPhoneForwarder` ([phone-forwarder.md](phone-forwarder.md), #25), which is the read pump for the data path. The heartbeat goroutine ([Heartbeat feature](heartbeat.md), #7) runs alongside the handler — see § Concurrency below for the LIFO defer ordering.
 
+When the phone's connection ends on its own — as opposed to a close the binary itself requested — the handler tells the binary about it (#152). See [§ Close notice to the binary](#close-notice-to-the-binary-152) below.
+
 ## Wire shape
 
 ```http
@@ -42,6 +44,49 @@ The relay does not validate the token — the binary does. The token is read int
 
 `4404` / `4429` are application-defined per RFC 6455 (4000–4999 range); both mirror the `4409` pattern on `/v1/server` (the convention is `WS app code = HTTP status code value` — 4404 → 404, 4409 → 409, 4429 → 429). The close-reasons are protocol-spec literals — they deliberately do not echo the requested server-id (or the exact cap value) back, to avoid probe oracles. `4429` is pending a coordinated addition to `pyrycode/pyrycode/docs/protocol-mobile.md`'s close-code table; per RFC 6455 a phone client that does not recognise it sees a generic abort.
 
+## Close notice to the binary (#152)
+
+Before #152, a phone disconnect was invisible to the binary: the daemon kept
+that phone's v2 session open until its own 15-minute idle sweep, and its
+push-wake logic skipped a device it still believed was present
+(pyrycode/pyrycode-mobile#955). Now, once `StartPhoneForwarder` returns, the
+handler sends the binary a [close notice](routing-envelope.md#close-notice-relay-to-binary-152)
+— `{conn_id, close_code}`, no `frame` — naming this phone's `conn_id`.
+
+**Close code** (`phoneCloseCode(err error) uint16`): `websocket.CloseStatus(err)`
+when the forwarder's return error carries a valid non-zero close status
+(the phone sent a close frame), otherwise `1001` (`StatusGoingAway`) — an
+abrupt drop, or the forwarder ending on a nil or non-close error.
+
+**Which binary, and when to skip it.** Right after a successful
+`RegisterPhoneCapped`, the handler snapshots `reg.BinaryFor(serverID)`. Once
+the forwarder returns, the notice is sent only if:
+
+1. the phone's close was **not** binary-requested — tracked by
+   [`phoneOutbox.closedByBinary()`](phone-outbox.md#binary-requested-close-tracking-152),
+   which the binary forwarder sets the moment it hands this phone any close
+   directive (`Enqueue(_, closeCode != 0)`), whether or not that directive
+   is ever delivered; and
+2. `reg.BinaryFor(serverID)` still returns the *same* `Conn` (interface
+   identity) as the snapshot.
+
+Condition 2 is what "skip it when the binary is gone" means in practice: a
+released server-id returns nothing to compare against, and a server-id a new
+binary has reclaimed (grace-reclaim or the `/v1/server` conflict-probe
+takeover) returns a binary that never saw this `conn_id` — sending it the
+notice would be noise, and would queue a stray envelope ahead of the new
+phone registrations that binary is about to see. A binary still sitting in
+its grace window is unaffected by this check (it's still the same `Conn`);
+its `Send` simply fails fast on the closed underlying conn, logged and
+dropped like any other failed send.
+
+The notice is sent **before** the teardown `defer` runs (`UnregisterPhone` /
+`wsconn.Close` / `phone_unregistered` log), on the same goroutine that just
+forwarded the phone's frames — so it reaches the binary strictly after the
+phone's last routed frame. A send (or, unreachably, a marshal) failure logs
+`phone_close_notice_send_failed` and is otherwise ignored: the phone is gone
+either way, and the daemon's idle sweep remains the fallback path.
+
 ## API
 
 Package `internal/relay` (`client_endpoint.go`):
@@ -74,14 +119,16 @@ The literal `16` lives at the wiring site, mirroring `30*time.Second` on the `Se
 
    Branch order is `ErrNoServer` first, then `ErrPhonesAtCap` — mirrors the registry's internal check order so an empty slot yields `4404`, not `4429`, even when the cap would otherwise apply.
 7. Log `phone_registered`.
-8. `defer { reg.UnregisterPhone(serverID, connID); wsconn.Close(); log phone_unregistered }`. Registered **after** the successful `RegisterPhone` so a no-server path never tries to unregister a slot we never owned.
-9. `_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)` — synchronous read pump that wraps inbound frames and `Send`s them to the binary holding `serverID`. Returns on phone close, ctx cancel, missing binary, or `Send` failure. The handler discards the return; the forwarder logs the cause. See [phone-forwarder.md](phone-forwarder.md).
+8. Snapshot `bin, _ := reg.BinaryFor(serverID)` — the only binary that may later hear about this phone's close (#152).
+9. `defer { reg.UnregisterPhone(serverID, connID); wsconn.Close(); log phone_unregistered }`. Registered **after** the successful `RegisterPhone` so a no-server path never tries to unregister a slot we never owned.
+10. `fwdErr := StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)` — synchronous read pump that wraps inbound frames and `Send`s them to the binary holding `serverID`. Returns on phone close, ctx cancel, missing binary, or `Send` failure. The forwarder logs the cause.
+11. If the phone's outbox reports the close was **not** binary-requested, send `bin` the close notice — see [§ Close notice to the binary](#close-notice-to-the-binary-152). See [phone-forwarder.md](phone-forwarder.md) for the forwarder itself.
 
 `randHex8` and `remoteHost` are reused verbatim from `server_endpoint.go` — same package, no duplication.
 
 ## Logging
 
-Three structured event types. Field set is fixed; nothing else (token, full headers, payloads) is logged.
+Five structured event types. Field set is fixed; nothing else (token, full headers, payloads) is logged.
 
 | event | fields |
 |---|---|
@@ -89,6 +136,7 @@ Three structured event types. Field set is fixed; nothing else (token, full head
 | `phone_register_no_server` | `server_id`, `remote` |
 | `phone_register_at_cap` | `server_id`, `remote` |
 | `phone_unregistered` | `server_id`, `conn_id` |
+| `phone_close_notice_send_failed` | `server_id`, `conn_id`, `close_code`, `err` |
 
 Explicitly **not logged on any path:**
 
@@ -110,9 +158,10 @@ Header gate failures (`400`) are not logged — same hygiene rationale as `/v1/s
 | `websocket.Accept` | request goroutine | none | conn allocated on success |
 | `RegisterPhone` | request goroutine | registry write lock (held internally) | one-shot |
 | `StartPhoneForwarder` | request goroutine, blocking; sole reader of the WS | per-frame `BinaryFor` RLock + `WSConn.writeMu` on the binary | returns on (a) phone-side close, (b) `r.Context()` cancel, (c) `Send` failure to the binary, (d) registry-driven `Close` from binary-grace expiry |
+| close notice (#152) | request goroutine, after the forwarder returns | `reg.BinaryFor` RLock + the target binary's `WSConn.writeMu` | reads `phone.closedByBinary()` (atomic, no lock) then sends at most once; runs before the `defer` below |
 | `defer` (unregister/close/log) | request goroutine | `wsconn.closeOnce` | runs only on the success path; idempotent |
 
-The handler takes no lock of its own. `WSConn.Close`'s `closeOnce` is a `sync.Once`, not a held lock. `UnregisterPhone` is a no-op on unknown `(serverID, connID)`. **No lock-order risk; no goroutine-leak path.**
+The handler takes no lock of its own. `WSConn.Close`'s `closeOnce` is a `sync.Once`, not a held lock. `UnregisterPhone` is a no-op on unknown `(serverID, connID)`. **No lock-order risk; no goroutine-leak path.** The close-notice send reuses `reg.BinaryFor` and `Conn.Send`'s existing concurrency guarantees — no new lock, no new goroutine (#152).
 
 ### Phone close on binary-grace expiry
 
@@ -140,6 +189,7 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **`StartPhoneForwarder` is the sole reader; `CloseRead` is gone.** Pre-#25 the handler used `c.CloseRead(r.Context())` to drain control frames pending the real read loop. With the forwarder in place, the read loop processes control frames inline with data; retaining `CloseRead` would race the sole-reader contract. See [phone-forwarder.md](phone-forwarder.md).
 - **`crypto/rand`-backed `connID` suffix.** 32 bits is sufficient — scoped per server-id, used only as an opaque map key in `UnregisterPhone`. `RegisterPhone` does not dedupe by `ConnID` (registry contract); collision odds at v1 scale are negligible. Using `crypto/rand` over `math/rand` is forward-compat hardening: if a future ticket exposes the conn-id, unguessable bytes avoid creating an oracle.
 - **No length cap or charset check on `device_name`.** Informational only; slog escapes control characters; no observed failure motivates a check. If oversized headers ever become an issue, mitigation lives upstream (per-IP rate limit, per-header byte cap) — both deferred to the DoS ticket.
+- **Identity comparison, not just presence, for "is the binary still there" (#152).** The close-notice decision doesn't just check `reg.BinaryFor(serverID)` returns *something* — it compares the returned `Conn` against the snapshot taken at registration time. A server-id occupied by a *different* binary (grace-reclaim, or the conflict-probe takeover) is not "the binary is still there"; it's a binary that never had this `conn_id`, and telling it about a phone it doesn't know is worse than telling no one.
 
 ## What this handler deliberately does NOT do
 
@@ -163,6 +213,8 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 - **Many devices share a leaked binary token to balloon `phones[serverID]`.** Past 16 concurrent registrations on the same server-id, the next attempt closes with `4429`. The in-cap 16 remain unaffected; the data-path fanout in `StartBinaryForwarder` (#26) is bounded by the same 16. Slot churn (disconnect-then-re-register) is allowed by design — a legitimate user re-pairing after a network blip must not be permanently locked out.
 - **Token-presence oracle via 4404.** Token-absent → 400; token-present + no binary → 4404; token-present + binary → success. The 400 vs 4404 difference is gated on token presence, but the *validity* of the token is not testable through the relay (the binary owns that). 4404 is not a presence oracle — it confirms the gate passed, which an attacker already knew because they sent a non-empty value.
 - **`crypto/rand` panic.** Same posture as `/v1/server`: panic terminates the connection, http server recovers, defer is not yet registered (panic fires inside `randHex8`, before `RegisterPhone`), registry stays clean.
+- **Reclaimed binary receiving a notice for a `conn_id` it never saw (#152).** Prevented structurally by the identity check on `reg.BinaryFor(serverID)` — see § Close notice to the binary above. Without it, a stray envelope for an unknown `conn_id` could land ahead of the new phone registrations the reclaiming binary is about to see.
+- **Binary-requested close double-reported back to itself (#152).** A binary that closes a phone (auth reject, etc.) already knows why; `phoneOutbox.closedByBinary()` suppresses the notice for exactly that phone's close, so the binary never gets a redundant, information-free echo of its own directive.
 
 Verdict from the security review: **PASS**. Reuses `/v1/server`'s audited shape (validate-pre-upgrade, defer-after-success, application-close-codes-on-underlying-conn), narrows the token's lifetime to a single presence-check, excludes the token from every log path by explicit field-set enumeration. The phone/binary lifecycle interactions with #20's grace machinery are walked end-to-end and idempotent on every path.
 
@@ -181,8 +233,12 @@ Tests (1:1 with AC bullets):
 - `TestClientEndpoint_PeerClose_UnregistersPhone` — seed; dial; close client; poll `reg.PhonesFor` until empty; binary remains claimed.
 - `TestClientEndpoint_MultiplePhones_IndependentLifecycle` — seed; dial three phones; close them in non-FIFO order; assert removal order does not corrupt other entries (covers `UnregisterPhone`'s swap-with-last-then-truncate).
 - `TestClientEndpoint_DeviceNameOptional_HandlerAccepts` — dial without and with `X-Pyrycode-Device-Name`; both succeed.
+- `TestClientEndpoint_PhoneClose_NotifiesBinary` (#152) — phone closes with `1000`; the seeded binary receives exactly one message decoding to `conn_id` = the phone's, `close_code` = `1000`, no `frame` key.
+- `TestClientEndpoint_PhoneDrop_NotifiesBinaryGoingAway` (#152) — phone drops via `CloseNow` (no close frame); binary receives one notice with `close_code` = `1001`.
+- `TestClientEndpoint_BinaryRequestedClose_NoNotice` (#152) — `Enqueue(nil, 4401)` on the registered phone; the phone observes `4401` and unregisters; the binary receives nothing.
+- `TestClientEndpoint_BinaryReplaced_NoNotice` (#152) — a second binary claims the server-id before the phone closes; neither binary receives a notice.
 
-Not tested: registry mocks (use the real one — race-tested in #3); library mocks; exact log output; token-not-logged invariant (would require diverting slog to a buffer; defended by code review + spec).
+Not tested: registry mocks (use the real one — race-tested in #3); library mocks; exact log output; token-not-logged invariant (would require diverting slog to a buffer; defended by code review + spec). The reclaim-during-grace path is covered end to end by `cmd/pyrycode-relay/main_e2e_test.go`'s `TestRun_ReclaimDuringGraceClosesPhoneWith4404`, which also asserts the reclaiming binary's first received frame is the new phone's probe, not a stray close notice (#152).
 
 ## Related
 
@@ -194,3 +250,6 @@ Not tested: registry mocks (use the real one — race-tested in #3); library moc
 - [ADR-0006](../decisions/0006-grace-period-as-reclaim-path.md) — phones registered here are torn down by the registry on binary-grace expiry; this handler's defer is idempotent against that path.
 - [Threat model](../../threat-model.md) — log hygiene (token never logged), DoS resistance (connection-cap residual), error-response leakage (generic 4404 reason).
 - [Protocol spec § Phone → relay → binary](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#phone--relay--binary) — authoritative wire shape and close-code set.
+- [Routing envelope § Close notice](routing-envelope.md#close-notice-relay-to-binary-152) — the wire shape this handler sends; `marshalCloseNotice`.
+- [Per-phone delivery queue § Binary-requested close tracking](phone-outbox.md#binary-requested-close-tracking-152) — `phoneOutbox.closedByBinary()`, the signal this handler checks before sending the notice.
+- [Codebase note #152](../codebase/152.md) — implementation summary and design rationale.

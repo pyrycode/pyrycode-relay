@@ -21,7 +21,7 @@ var (
     ErrPhoneOutboxClosed = errors.New("relay: phone outbox closed")
 )
 
-type phoneOutbox struct { /* conn Conn; items chan outboxItem; done chan struct{}; doneOnce sync.Once; serverID string; logger *slog.Logger; onWritten func() */ }
+type phoneOutbox struct { /* conn Conn; items chan outboxItem; done chan struct{}; doneOnce sync.Once; closeRequested atomic.Bool; serverID string; logger *slog.Logger; onWritten func() */ }
 
 func newPhoneOutbox(conn Conn, serverID string, depth int, onWritten func(), logger *slog.Logger) *phoneOutbox
 
@@ -32,6 +32,7 @@ func (o *phoneOutbox) CloseWithCode(code websocket.StatusCode, reason string) //
 func (o *phoneOutbox) Enqueue(frame []byte, closeCode uint16) error           // never blocks
 func (o *phoneOutbox) run()                                                   // drain loop; caller's own goroutine
 func (o *phoneOutbox) stop()                                                  // idempotent
+func (o *phoneOutbox) closedByBinary() bool                                   // #152, see below
 ```
 
 `outboxItem{frame []byte; closeCode uint16}` is one pending delivery;
@@ -73,8 +74,9 @@ preserves those codes.
 **`Enqueue`** (called from the binary forwarder's goroutine), never blocks:
 
 1. `done` already closed → `ErrPhoneOutboxClosed`.
-2. Non-blocking send into `items` (capacity `phoneOutboxDepth`) → success, `nil`.
-3. `items` full — the phone can't keep up: mark `done` (via `doneOnce`) and,
+2. `closeCode != 0` → `closeRequested.Store(true)` (see § Binary-requested close tracking below), then continue; this runs even if the send below turns out to overflow.
+3. Non-blocking send into `items` (capacity `phoneOutboxDepth`) → success, `nil`.
+4. `items` full — the phone can't keep up: mark `done` (via `doneOnce`) and,
    only on the call that actually closes it, spawn `go closeWithCode(conn,
    code, "phone backlog full")` — off-goroutine because a close can block on
    the handshake, and guarded by `doneOnce` so repeated overflow calls can't
@@ -109,6 +111,27 @@ closed the socket by then. The `1011` close is best-effort on an
 already-timed-out conn (it can't reach the wire), but `CloseWithCode` still
 runs through `closeOnce`, and the phone's own `Read` in `StartPhoneForwarder`
 fails right after — so the handler's existing teardown defer runs regardless.
+
+## Binary-requested close tracking (#152)
+
+`closeRequested atomic.Bool`, set by `Enqueue` the moment it accepts (or
+overflows on) a close directive (`closeCode != 0`), while the outbox is
+still live — step 2 above. `closedByBinary()` reads it back.
+
+This is the signal [`ClientHandler`](client-endpoint.md#close-notice-to-the-binary-152)
+checks after the phone's forwarder loop ends, to decide whether to send the
+binary a [close notice](routing-envelope.md#close-notice-relay-to-binary-152):
+a phone the binary itself asked to close must not be reported back to that
+same binary as if it had disconnected on its own. Every production close
+directive reaches a phone through `Enqueue` — there is no other path — so
+this one flag is a complete record of "did the binary ask for this."
+
+`atomic.Bool` rather than a mutex-guarded field because the write
+(`Enqueue`, on the binary forwarder's goroutine) and the read
+(`ClientHandler`, on the phone handler's own goroutine, after `run` has
+already exited) cross goroutines with no other synchronisation between
+them — the same reasoning that already governs every other cross-goroutine
+field on this type (see § Concurrency model).
 
 ## Queue depth: 16 frames
 
@@ -151,6 +174,10 @@ gap this ticket introduces.
 - The overflow-close goroutine spawned from `Enqueue` exits once
   `CloseWithCode` returns, bounded by the library's close-handshake
   timeouts — the same shape `evictPhones`'s per-conn goroutines already use.
+- `closeRequested` (#152) is written by `Enqueue` (binary forwarder
+  goroutine) and read by `closedByBinary()` (phone handler goroutine, after
+  `run` has exited) — `atomic.Bool`, no lock, see § Binary-requested close
+  tracking above.
 - No new locks. The registry lock is never held while calling into an
   outbox; `WSConn.writeMu` still serialises `run`'s writes against nothing
   else (the heartbeat's pings go through the library's own control-frame
@@ -291,3 +318,7 @@ path through `fakePhone` (which does not implement `phoneQueue`). All under
   in-flight `Send` the queue's `run` goroutine makes.
 - `docs/specs/architecture/113-per-phone-delivery-queue.md` — the architect's
   plan, including the security review this doc's verdict is drawn from.
+- [`/v1/client` § Close notice to the binary](client-endpoint.md#close-notice-to-the-binary-152) —
+  the sole reader of `closedByBinary()`.
+- [Routing envelope § Close notice](routing-envelope.md#close-notice-relay-to-binary-152) —
+  the wire shape `closedByBinary()` gates.

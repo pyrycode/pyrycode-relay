@@ -21,6 +21,7 @@ The wire protocol lives in [`pyrycode/pyrycode/docs/protocol-mobile.md`](https:/
 4. Forward frames between phones and the corresponding binary, prepending/stripping the routing envelope.
 5. Surface `4404` (no server) when a phone connects with a server-id no binary holds.
 6. Surface `4409` (server-id conflict) when a binary tries to claim a held server-id.
+7. Tell the binary when one of its phones' connections ends on its own, via a frameless `{conn_id, close_code}` routing envelope (#152) — skipped when the binary itself requested the close, or no longer holds that server-id. See [`/v1/client` § Close notice to the binary](knowledge/features/client-endpoint.md#close-notice-to-the-binary-152).
 
 ## What this binary does NOT do
 

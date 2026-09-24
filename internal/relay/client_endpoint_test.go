@@ -3,7 +3,9 @@ package relay
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -393,5 +395,144 @@ func TestClientEndpoint_PhoneQueue_DeliversAndStopsOnDisconnect(t *testing.T) {
 			t.Fatalf("Enqueue after disconnect = %v, want ErrPhoneOutboxClosed", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// startClientLogged is startClient with a captured log, so a test can wait
+// for the handler's final phone_unregistered line: by then every step of
+// the phone's teardown, the close notice included, has run.
+func startClientLogged(t *testing.T) (*Registry, string, *lockedBuffer, func()) {
+	t.Helper()
+	reg := NewRegistry()
+	logger, logs := captureLogger()
+	srv := httptest.NewServer(ClientHandler(reg, logger, 256*1024, 0, nil))
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	return reg, wsURL, logs, srv.Close
+}
+
+func waitForUnregistered(t *testing.T, logs *lockedBuffer, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Count(logs.String(), "msg=phone_unregistered") >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("phone_unregistered logged fewer than %d times after 2s", want)
+}
+
+// dialNoticePhone claims bin for s1, dials one phone and returns it with
+// its relay-assigned conn id.
+func dialNoticePhone(t *testing.T, reg *Registry, wsURL string, bin Conn) (*websocket.Conn, string) {
+	t.Helper()
+	if err := reg.ClaimServer("s1", bin); err != nil {
+		t.Fatalf("ClaimServer: %v", err)
+	}
+	c, _, err := dialWithClient(t, wsURL, validClientHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return c, waitForPhones(t, reg, "s1", 1, time.Second)[0].ConnID()
+}
+
+// assertCloseNotice checks that sent holds exactly one message and that it
+// is the spec's frameless {conn_id, close_code} notice.
+func assertCloseNotice(t *testing.T, sent [][]byte, connID string, code uint16) {
+	t.Helper()
+	if len(sent) != 1 {
+		t.Fatalf("binary received %d messages, want exactly 1: %q", len(sent), sent)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(sent[0], &got); err != nil {
+		t.Fatalf("notice is not a JSON object: %v (raw %q)", err, sent[0])
+	}
+	if _, ok := got["frame"]; ok {
+		t.Fatalf("notice carries a frame key: %s", sent[0])
+	}
+	want := fmt.Sprintf(`{"conn_id":%q,"close_code":%d}`, connID, code)
+	if string(sent[0]) != want {
+		t.Fatalf("notice = %s, want %s", sent[0], want)
+	}
+}
+
+// #152: a phone that closes on its own is reported to its binary once,
+// with the phone's own close status.
+func TestClientEndpoint_PhoneClose_NotifiesBinary(t *testing.T) {
+	reg, wsURL, logs, cleanup := startClientLogged(t)
+	defer cleanup()
+	bin := &fakeBinary{id: "bin-s1"}
+	c, connID := dialNoticePhone(t, reg, wsURL, bin)
+
+	if err := c.Close(websocket.StatusNormalClosure, ""); err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	waitForUnregistered(t, logs, 1)
+	assertCloseNotice(t, bin.snapshot(), connID, uint16(websocket.StatusNormalClosure))
+}
+
+// #152: a phone that drops without a close frame is reported with 1001.
+func TestClientEndpoint_PhoneDrop_NotifiesBinaryGoingAway(t *testing.T) {
+	reg, wsURL, logs, cleanup := startClientLogged(t)
+	defer cleanup()
+	bin := &fakeBinary{id: "bin-s1"}
+	c, connID := dialNoticePhone(t, reg, wsURL, bin)
+
+	if err := c.CloseNow(); err != nil {
+		t.Fatalf("client CloseNow: %v", err)
+	}
+	waitForUnregistered(t, logs, 1)
+	assertCloseNotice(t, bin.snapshot(), connID, uint16(websocket.StatusGoingAway))
+}
+
+// #152: a close the binary asked for is not echoed back to it.
+func TestClientEndpoint_BinaryRequestedClose_NoNotice(t *testing.T) {
+	reg, wsURL, logs, cleanup := startClientLogged(t)
+	defer cleanup()
+	bin := &fakeBinary{id: "bin-s1"}
+	c, _ := dialNoticePhone(t, reg, wsURL, bin)
+	defer c.CloseNow()
+
+	phone, _ := reg.PhonesFor("s1")[0].(phoneQueue)
+	if err := phone.Enqueue(nil, 4401); err != nil {
+		t.Fatalf("Enqueue close directive: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Read(ctx); websocket.CloseStatus(err) != 4401 {
+		t.Fatalf("phone Read err = %v, want close status 4401", err)
+	}
+	waitForUnregistered(t, logs, 1)
+	if sent := bin.snapshot(); len(sent) != 0 {
+		t.Fatalf("binary received %q after its own close directive, want nothing", sent)
+	}
+}
+
+// #152: a phone evicted because a new binary reclaimed its server-id is
+// reported to neither binary: the old one is gone and the new one never
+// saw the phone.
+func TestClientEndpoint_BinaryReplaced_NoNotice(t *testing.T) {
+	reg, wsURL, logs, cleanup := startClientLogged(t)
+	defer cleanup()
+	bin1 := &fakeBinary{id: "bin-1"}
+	c, _ := dialNoticePhone(t, reg, wsURL, bin1)
+	defer c.CloseNow()
+
+	reg.ScheduleReleaseServer("s1", time.Minute)
+	bin2 := &fakeBinary{id: "bin-2"}
+	if err := reg.ClaimServer("s1", bin2); err != nil {
+		t.Fatalf("reclaim ClaimServer: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Read(ctx); websocket.CloseStatus(err) != 4404 {
+		t.Fatalf("phone Read err = %v, want close status 4404", err)
+	}
+	waitForUnregistered(t, logs, 1)
+	if sent := bin1.snapshot(); len(sent) != 0 {
+		t.Fatalf("old binary received %q, want nothing", sent)
+	}
+	if sent := bin2.snapshot(); len(sent) != 0 {
+		t.Fatalf("new binary received %q, want nothing", sent)
 	}
 }
