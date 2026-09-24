@@ -64,6 +64,20 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
     # explicit `handlers = ["http"]` here would steal port 80 from the
     # autocert HTTP-01 listener and ADR-0002's 404 fallback.
 
+  # TCP, not HTTP: no port a Fly check can reach serves `/healthz`. 8080
+  # 404s everything but ACME (ADR-0002), and 8443 requires a PROXY v2
+  # header that Fly's checker does not send. The 8443 service has no
+  # check on purpose: a TCP probe there fails in the TLS path of a server
+  # with no ErrorLog and logs a line per probe. Checking 8080 covers 443
+  # too: a boot refusal exits before either listener binds, and a failed
+  # listener drains the process, taking both ports down together.
+  # A failing check pulls port 80 from Fly's proxy on this one-machine
+  # fleet, so the timings are generous; boot is local-only and sub-second.
+  [[services.tcp_checks]]
+    grace_period = "30s"
+    interval = "15s"
+    timeout = "5s"
+
 [[services]]
   processes = ["app"]
   protocol = "tcp"
@@ -94,9 +108,12 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   memory = "256mb"
 
 [deploy]
-  # Single machine — rolling/canary are inapplicable. `immediate`
-  # replaces in place; a brief drop in availability during deploy is
-  # acceptable (clients reconnect; no state to drain).
-  strategy = "immediate"
+  # `rolling` updates machines one at a time and waits for each one's
+  # checks, so a relay that refuses to boot fails the deploy. `immediate`
+  # replaces machines without waiting for checks. On this one-machine
+  # fleet rolling updates in place and never creates a second machine,
+  # so the single-instance invariant holds. A brief drop in availability
+  # during deploy is acceptable (clients reconnect; no state to drain).
+  strategy = "rolling"
   # Redundant with a 1-machine fleet, but documents intent.
   max_unavailable = 1
