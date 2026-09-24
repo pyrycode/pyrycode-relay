@@ -347,3 +347,51 @@ func TestClientEndpoint_AtCap_4429(t *testing.T) {
 	}
 	waitForPhones(t, reg, "s1", 0, 2*time.Second)
 }
+
+// #113: the handler registers each phone behind its own delivery queue, runs
+// the queue's writer for the connection's lifetime, and stops it on
+// disconnect so nothing is left accepting or blocked on the phone.
+func TestClientEndpoint_PhoneQueue_DeliversAndStopsOnDisconnect(t *testing.T) {
+	reg, wsURL, cleanup := startClient(t)
+	defer cleanup()
+	seedBinary(t, reg, "s1")
+
+	c, _, err := dialWithClient(t, wsURL, validClientHeaders("s1"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	phones := waitForPhones(t, reg, "s1", 1, time.Second)
+	q, ok := phones[0].(phoneQueue)
+	if !ok {
+		t.Fatalf("registered phone %T does not implement phoneQueue", phones[0])
+	}
+
+	if err := q.Enqueue([]byte(`{"hello":1}`), 0); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, got, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("phone Read: %v", err)
+	}
+	if string(got) != `{"hello":1}` {
+		t.Fatalf("phone got %s, want {\"hello\":1}", got)
+	}
+
+	if err := c.Close(websocket.StatusNormalClosure, ""); err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	waitForPhones(t, reg, "s1", 0, 2*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := q.Enqueue([]byte(`{}`), 0)
+		if errors.Is(err, ErrPhoneOutboxClosed) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Enqueue after disconnect = %v, want ErrPhoneOutboxClosed", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

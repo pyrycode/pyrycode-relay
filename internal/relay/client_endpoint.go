@@ -63,8 +63,11 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 
 		connID := "client-" + serverID + "-" + randHex8()
 		wsconn := NewWSConn(c, connID, maxFrameBytes)
+		// The registry holds the phone behind its own bounded delivery
+		// queue (#113), so the binary forwarder never waits on this socket.
+		phone := newPhoneOutbox(wsconn, serverID, phoneOutboxDepth, reg.onBinaryForwarded, logger)
 
-		if err := reg.RegisterPhoneCapped(serverID, wsconn, maxPhones); err != nil {
+		if err := reg.RegisterPhoneCapped(serverID, phone, maxPhones); err != nil {
 			if errors.Is(err, ErrNoServer) {
 				// Stillborn WSConn — close directly on the underlying
 				// *websocket.Conn so the 4404 application code reaches the
@@ -95,9 +98,20 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 			"device_name", deviceName,
 			"remote", remoteHost(r))
 
+		// The queue's writer lives exactly as long as the connection: the
+		// defer below closes the conn (aborting any in-flight write), stops
+		// the queue and waits for the writer before the handler returns.
+		outboxDone := make(chan struct{})
+		go func() {
+			defer close(outboxDone)
+			phone.run()
+		}()
+
 		defer func() {
 			reg.UnregisterPhone(serverID, connID)
 			wsconn.Close()
+			phone.stop()
+			<-outboxDone
 			logger.Info("phone_unregistered",
 				"server_id", serverID,
 				"conn_id", connID)
