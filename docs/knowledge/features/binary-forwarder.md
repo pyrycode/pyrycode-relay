@@ -87,8 +87,8 @@ All termination paths terminate the single goroutine; the handler's defer cleans
 - One forwarder per binary — runs on the HTTP handler goroutine itself; no extra goroutine spawned. Runs in parallel with the heartbeat goroutine on a sibling goroutine; the two never share state.
 - `binary.Read` (and `WSConn.Read`) is **single-caller**: the forwarder is the sole reader by contract. Concurrent `Read` is not supported by the underlying library.
 - `phone.Send` is multi-caller across the system: every binary's forwarder writing to a given phone, plus any future server-side signal path. `WSConn.writeMu` (#15) serialises them. No new locks added by this ticket.
-- `reg.PhonesFor` takes RLock and returns a fresh snapshot; cheap, contention-free. Iteration runs outside the registry lock — `phone.ConnID()` and `phone.Send` are called on snapshot entries, not registry state. Matches the established passive-store contract.
-- Backpressure: a slow phone blocks only its own `Send` call; concurrent phones for the same binary are not affected because the forwarder iterates one envelope at a time and each `Send` is independent. The `WSConn.Send` 10 s deadline (#15) bounds any single write — a wedged phone causes a `binary_forwarder_phone_send_failed` log + continue within ~10 s.
+- `reg.PhonesFor` takes RLock and returns a fresh snapshot; cheap, contention-free. Iteration runs outside the registry lock — `phone.ConnID()` is called on snapshot entries, not registry state. Matches the established passive-store contract.
+- Backpressure: since #113, delivery to a phone goes through its own bounded [`phoneOutbox`](phone-outbox.md) instead of a direct `phone.Send` — the forwarder only enqueues (`Enqueue`, never blocks) and the phone's own writer goroutine drains it. A slow or stalled phone therefore no longer blocks this loop, its siblings, or the binary's own pong processing at all; it only blocks its own writer, bounded first by the outbox's 16-frame depth and then by `WSConn.Send`'s 10 s deadline once a write is actually in flight. A phone whose backlog fills or whose write fails is closed with `1011` and its pending frames dropped. `env.CloseCode != 0` close directives go through the same queue, ordered behind every frame enqueued before them. The direct-`Send` / direct-`closePhone` code below this loop is the fallback for a `Conn` that does not implement the outbox's `phoneQueue` capability — in production that's every registered phone, so the fallback serves only this package's unit-test fakes.
 
 ## Edits to neighbouring code
 
@@ -105,6 +105,7 @@ Field set is fixed; nothing else (envelope bytes, frame bytes, headers, tokens) 
 | `binary_forwarder_unmarshal_err` | warn | `server_id`, `binary_conn_id`, `err` |
 | `binary_forwarder_push_wake_dropped` | warn | `server_id`, `binary_conn_id`, `err` |
 | `binary_forwarder_unknown_conn_id` | warn | `server_id`, `conn_id` |
+| `binary_forwarder_phone_enqueue_failed` | info | `server_id`, `conn_id`, `err` |
 | `binary_forwarder_phone_send_failed` | info | `server_id`, `conn_id`, `err` |
 
 `err` carries library errors (close codes, ctx cancellation, write deadlines) and `Unmarshal` sentinels — none of which embed user payloads (the `Unmarshal` wrap in `envelope.go:70` includes the JSON decoder error, which can name a byte offset but not payload contents). The handler's `server_released` log bookends the lifecycle.
@@ -114,7 +115,7 @@ Field set is fixed; nothing else (envelope bytes, frame bytes, headers, tokens) 
 - **No `ScheduleReleaseServer`, no `wsconn.Close()`, no `cancelHB`.** The handler's defers own all three. Doing them here would either double-close or arm a stray grace timer.
 - **No inner-frame parsing.** The relay's role per `protocol-mobile.md` § Routing envelope is "wrap, address, forward; never inspect." `Unmarshal`'s structural checks inspect envelope shape only, never `env.Frame`.
 - **No retries.** Drop the offending frame and keep serving.
-- **No buffering, no bounded channels.** A slow phone blocks this goroutine for one envelope at a time; `WSConn.Send`'s 10 s deadline bounds the worst case.
+- **No direct phone writes.** Since #113, the forwarder hands every frame and close directive to the addressed phone's [`phoneOutbox`](phone-outbox.md) via `Enqueue`, which never blocks; the outbox's own writer goroutine does the actual `Send`. This loop is never the one waiting on a phone's socket.
 - **No per-frame size cap.** Inherited from `WSConn`'s underlying `*websocket.Conn` (nhooyr's default 32 MiB read limit). A deliberate per-message cap is a follow-up against `WSConn` so it covers both forwarders. Not a regression introduced by this ticket; named explicitly in the architect's security review.
 - **No branching on specific `Unmarshal` sentinels.** All sentinels funnel through one warn-and-continue branch — `errors.Is` is not needed when every case is the same.
 - **No heartbeat / ping-pong.** Separate goroutine (#7).
@@ -125,7 +126,7 @@ Field set is fixed; nothing else (envelope bytes, frame bytes, headers, tokens) 
 - **Malformed envelope.** `Unmarshal` returns a sentinel; loop logs + continues. The binary owns its own protocol health; the relay does not punish it for one bad frame.
 - **Unknown `conn_id`.** Phone disconnected between the binary's last observation and this envelope, or the binary addressed a phone it shouldn't know about. Either way, a normal race or a binary bug — drop, continue.
 - **Adversarial `env.Frame` contents.** Forwarded verbatim as opaque bytes. The downstream phone's protocol layer already knows it receives untrusted-via-relay bytes (the binary is trusted relative to the phone, not relative to the relay).
-- **Slow phone.** Bounded by `WSConn.Send`'s 10 s deadline. A wedged phone causes log + continue within ~10 s.
+- **Slow phone.** Since #113, bounded by the phone's own [`phoneOutbox`](phone-outbox.md) rather than this loop: a slow or stalled phone never blocks the read pump, other phones on the same server-id, or the binary's pong processing. Its backlog fills at 16 frames, or a write times out at `WSConn.Send`'s 10 s deadline, and either way the phone is closed with `1011` and its pending frames dropped.
 - **Frame larger than any phone's tolerance.** Forwarder doesn't know or care; per-message size on the inbound side is the inherited residual on `WSConn`.
 - **Crafted log content.** `err` strings come from the WS library or `Unmarshal` sentinels; no envelope/frame bytes enter logs.
 
@@ -158,6 +159,7 @@ Tests (1:1 with AC):
 - [Phone-side forwarder](phone-forwarder.md) — mirror image; explains why the two have distinct named source interfaces despite identical shape.
 - [Routing envelope](routing-envelope.md) — `Unmarshal` is the per-frame structural check; all four sentinels funnel through one warn-and-continue branch.
 - [Push wake dispatch](push-wake-dispatch.md) — what happens to a `push_wake` envelope after this forwarder hands it off: validation, rate limit, in-flight cap, async send.
+- [Per-phone delivery queue](phone-outbox.md) — where a routed frame or close directive actually goes since #113: the addressed phone's bounded outbox, not a direct `Send` from this loop.
 - [WSConn adapter](ws-conn-adapter.md) — `Read` (added in #25) satisfies `binarySource` in production.
 - [Connection registry](connection-registry.md) — `PhonesFor` is the per-frame lookup; snapshot semantics guarantee lock-free iteration.
 - [Heartbeat](heartbeat.md) — sibling per-conn goroutine; closes the conn with `1011` on pong timeout, which aborts the forwarder's in-flight `Read`.
