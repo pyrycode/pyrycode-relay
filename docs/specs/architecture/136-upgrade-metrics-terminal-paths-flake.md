@@ -16,3 +16,7 @@ No in-flight feature branch touches the test file.
 ## Testing strategy
 
 The subtests are their own proof. Deterministic check that a wrong count still fails in bounded time: temporarily flip one expected count locally, confirm the failure names the missing line with the scrape body after ~2s, revert. Flake check per the AC: `go test -race -count=1 ./internal/relay/` 20 runs in a row, plus `go vet ./...`.
+
+## Revisions
+
+- **2026-09-24, implementation.** The Change paragraph says "six" `httptest.NewServer` subtests; its own list names seven (three server, four client), and all seven moved to `awaitUpgradeCounters`. A miscount, not a design change. `gofmt -w` also dropped a pre-existing trailing blank line at the end of the test file.

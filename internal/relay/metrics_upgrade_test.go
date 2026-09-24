@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -81,6 +82,39 @@ func assertFailureKinds(t *testing.T, h http.Handler, want map[string]int) {
 	}
 }
 
+// awaitUpgradeCounters waits up to 2s for one scrape to show every
+// endpoint outcome cell and every failure-kind cell at its want value
+// (missing keys at 0), then asserts them all. The handlers increment
+// after the event a test observes (the registry claim, the close
+// frame), so a single scrape can land before the increment (#136). On
+// timeout the asserts fail with the scrape body in the message.
+func awaitUpgradeCounters(t *testing.T, h http.Handler, endpoint string, outcomes, kinds map[string]int) {
+	t.Helper()
+	allOutcomes, assertOutcomes := allServerOutcomes, assertServerOutcomes
+	if endpoint == "client" {
+		allOutcomes, assertOutcomes = allClientOutcomes, assertClientOutcomes
+	}
+	var lines []string
+	for _, o := range allOutcomes {
+		lines = append(lines, fmt.Sprintf(`pyrycode_relay_ws_upgrade_attempts_total{endpoint="%s",outcome="%s"} %d`, endpoint, o, outcomes[o]))
+	}
+	for _, k := range allFailureKinds {
+		lines = append(lines, fmt.Sprintf(`pyrycode_relay_register_failures_total{kind="%s"} %d`, k, kinds[k]))
+	}
+	pollUntil(time.Now().Add(2*time.Second), func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		for _, l := range lines {
+			if !strings.Contains(rec.Body.String(), l) {
+				return false
+			}
+		}
+		return true
+	})
+	assertOutcomes(t, h, outcomes)
+	assertFailureKinds(t, h, kinds)
+}
+
 func TestUpgradeMetrics_ServerEndpoint_TerminalPaths(t *testing.T) {
 	t.Parallel()
 
@@ -107,8 +141,7 @@ func TestUpgradeMetrics_ServerEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("BinaryFor(s1) never registered")
 		}
 
-		assertServerOutcomes(t, scrape, map[string]int{"accept": 1})
-		assertFailureKinds(t, scrape, nil)
+		awaitUpgradeCounters(t, scrape, "server", map[string]int{"accept": 1}, nil)
 	})
 
 	t.Run("reject_headers", func(t *testing.T) {
@@ -131,8 +164,7 @@ func TestUpgradeMetrics_ServerEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("status = %d, want 400", resp.StatusCode)
 		}
 
-		assertServerOutcomes(t, scrape, map[string]int{"reject_headers": 1})
-		assertFailureKinds(t, scrape, nil)
+		awaitUpgradeCounters(t, scrape, "server", map[string]int{"reject_headers": 1}, nil)
 		_ = reg
 	})
 
@@ -171,8 +203,9 @@ func TestUpgradeMetrics_ServerEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("close err = %v, want 4409", readErr)
 		}
 
-		assertServerOutcomes(t, scrape, map[string]int{"accept": 1, "reject_409": 1})
-		assertFailureKinds(t, scrape, map[string]int{"server_in_use": 1})
+		awaitUpgradeCounters(t, scrape, "server",
+			map[string]int{"accept": 1, "reject_409": 1},
+			map[string]int{"server_in_use": 1})
 	})
 
 	t.Run("reject_rate_limit", func(t *testing.T) {
@@ -231,8 +264,7 @@ func TestUpgradeMetrics_ClientEndpoint_TerminalPaths(t *testing.T) {
 		defer c.Close(websocket.StatusNormalClosure, "")
 		waitForPhones(t, reg, "s1", 1, time.Second)
 
-		assertClientOutcomes(t, scrape, map[string]int{"accept": 1})
-		assertFailureKinds(t, scrape, nil)
+		awaitUpgradeCounters(t, scrape, "client", map[string]int{"accept": 1}, nil)
 	})
 
 	t.Run("reject_headers", func(t *testing.T) {
@@ -254,8 +286,7 @@ func TestUpgradeMetrics_ClientEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("status = %d, want 400", resp.StatusCode)
 		}
 
-		assertClientOutcomes(t, scrape, map[string]int{"reject_headers": 1})
-		assertFailureKinds(t, scrape, nil)
+		awaitUpgradeCounters(t, scrape, "client", map[string]int{"reject_headers": 1}, nil)
 		_ = reg
 	})
 
@@ -283,8 +314,9 @@ func TestUpgradeMetrics_ClientEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("close err = %v, want 4404", readErr)
 		}
 
-		assertClientOutcomes(t, scrape, map[string]int{"reject_404": 1})
-		assertFailureKinds(t, scrape, map[string]int{"no_server": 1})
+		awaitUpgradeCounters(t, scrape, "client",
+			map[string]int{"reject_404": 1},
+			map[string]int{"no_server": 1})
 		_ = reg
 	})
 
@@ -322,11 +354,12 @@ func TestUpgradeMetrics_ClientEndpoint_TerminalPaths(t *testing.T) {
 			t.Fatalf("close err = %v, want 4429", readErr)
 		}
 
-		assertClientOutcomes(t, scrape, map[string]int{
-			"accept":     1, // first phone
-			"reject_429": 1, // second phone
-		})
-		assertFailureKinds(t, scrape, map[string]int{"phones_at_cap": 1})
+		awaitUpgradeCounters(t, scrape, "client",
+			map[string]int{
+				"accept":     1, // first phone
+				"reject_429": 1, // second phone
+			},
+			map[string]int{"phones_at_cap": 1})
 	})
 
 	t.Run("reject_rate_limit", func(t *testing.T) {
@@ -452,4 +485,3 @@ func TestUpgradeMetrics_NoGlobalRegistrarLeak(t *testing.T) {
 			"see ADR-0008 § Scope of use)", before, after)
 	}
 }
-
