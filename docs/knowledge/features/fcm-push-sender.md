@@ -66,8 +66,9 @@ Both HTTP calls (the token fetch and the FCM POST) are bounded by the shared
 honours the caller's `ctx` via `context.WithTimeout`. The client refuses
 redirects (`CheckRedirect` → `http.ErrUseLastResponse`) so a 3xx becomes a
 non-2xx error instead of replaying the bearer token and device token to a
-second URL. An FCM reply is drained up to `fcmMaxDrainBytes` (4 KiB) before
-close; the reply body is never read further or kept.
+second URL. An FCM reply is read into memory up to `fcmMaxDrainBytes` (4 KiB,
+same cap as before) then closed; on a non-2xx reply that buffer is decoded
+for FCM's error reason (below), otherwise it is discarded.
 
 ## Error handling — nothing leaks
 
@@ -77,13 +78,35 @@ close; the reply body is never read further or kept.
 | Token endpoint non-2xx | `ErrFCMTokenFetch: status N` | HTTP status only |
 | Token transport/decode failure | `ErrFCMTokenFetch` | nothing |
 | FCM transport failure / cancelled ctx | `ErrFCMSend: <url.Error>` | the constant send URL + net error — the device token is in the body, never the URL |
-| FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N` | HTTP status only |
+| FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N (REASON[, CODE])` | HTTP status plus FCM's enum-shaped `error.status` and/or FcmError `errorCode`, when present — see below; exactly `status N` otherwise |
 
 `oauth2.RetrieveError` formats the token endpoint's response body into its
 `Error()` string, so `Send` never returns or wraps it as-is — it extracts
 only `Response.StatusCode`. The sender holds no logger, so it logs nothing;
 [`log_allowlist.go`](../../../internal/relay/log_allowlist.go) is unchanged
 by this ticket.
+
+### Naming FCM's reason (#150)
+
+On a non-2xx reply, `fcmErrorReason` decodes the drained buffer into an
+unexported struct (`fcmErrorReply`) that declares only two fields:
+`error.status` and the `errorCode` of any `error.details[]` entry whose
+`@type` is `type.googleapis.com/google.firebase.fcm.v1.FcmError`
+(`fcmErrorType`). `error.message` is not a field in that struct — FCM's free
+text is never held in a typed value, let alone returned — because it can
+echo request data (2026-09-24: every wake to `pyrycode-mobile` came back
+`status 404`, from both an ATD and a Play emulator, and the log alone
+couldn't say `UNREGISTERED` from a project mismatch; pyrycode-mobile #955).
+
+Each of the two values is kept only when `isFCMEnum` accepts it — 1–64 bytes
+of `[A-Z0-9_]` — so even a hostile or misconfigured-proxy reply that echoed
+request data into `error.status`/`errorCode` can't smuggle it into the log;
+a decode failure, an empty body, or fields missing/malformed is silently the
+same status-only error as before. When both values are present the error
+reads `relay: fcm send failed: status 404 (NOT_FOUND, UNREGISTERED)`; with
+only one, only that one appears in the parentheses. No new log key —
+[`push_wake.go`](../../../internal/relay/push_wake.go)'s `PushWaker.send`
+still logs the whole error under the already-allowlisted `err` key.
 
 ## Concurrency
 
@@ -118,5 +141,5 @@ residual-risk accounting.
   `PYRYCODE_RELAY_FCM_CREDENTIALS` joins.
 - [Codebase note #132](../codebase/132.md) — implementation summary and
   lessons for the sender itself; [#133](../codebase/133.md) for the
-  dispatch wiring.
+  dispatch wiring; [#150](../codebase/150.md) for naming FCM's error reason.
 - [`internal/relay/push.go`](../../../internal/relay/push.go) — implementation.
