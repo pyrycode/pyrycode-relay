@@ -521,3 +521,71 @@ func waitForDial(addr string, deadline time.Duration) error {
 	}
 	return fmt.Errorf("dial %s: %w", addr, errors.New("deadline elapsed"))
 }
+
+// TestRun_MaxConnectionsNonPositiveRefusesStart: a zero or negative
+// --max-connections is a boot-time refusal (exit 2), not an uncapped relay.
+func TestRun_MaxConnectionsNonPositiveRefusesStart(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		t.Run(v, func(t *testing.T) {
+			got := run([]string{
+				"--insecure-listen", "127.0.0.1:0",
+				"--metrics-listen", "",
+				"--max-connections", v,
+			}, context.Background())
+			if got != 2 {
+				t.Errorf("run exit code: got %d, want 2", got)
+			}
+		})
+	}
+}
+
+// TestRun_ConnCapGatesUpgradesNotHealthz boots run with a cap of one. A
+// live binary holds the only slot: both upgrade routes answer 503, and
+// /healthz still answers 200.
+func TestRun_ConnCapGatesUpgradesNotHealthz(t *testing.T) {
+	addr, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	sigCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exit := make(chan int, 1)
+	go func() {
+		exit <- run([]string{
+			"--insecure-listen", addr,
+			"--metrics-listen", "",
+			"--max-connections", "1",
+		}, sigCtx)
+	}()
+	if err := waitForDial(addr, 3*time.Second); err != nil {
+		t.Fatalf("relay did not accept connections: %v", err)
+	}
+
+	bin := dialServer(t, addr, "s-cap")
+	defer bin.Close(websocket.StatusNormalClosure, "")
+
+	for path, want := range map[string]int{
+		"/v1/client": http.StatusServiceUnavailable,
+		"/v1/server": http.StatusServiceUnavailable,
+		"/healthz":   http.StatusOK,
+	} {
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s: status %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+
+	cancel()
+	select {
+	case got := <-exit:
+		if got != 0 {
+			t.Errorf("run exit code: got %d, want 0", got)
+		}
+	case <-time.After(drainDeadline + 2*time.Second):
+		t.Fatal("run did not return after shutdown")
+	}
+}
