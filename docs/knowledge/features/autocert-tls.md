@@ -87,7 +87,7 @@ Both `httpsSrv` and `httpSrv` mirror the insecure path's timeouts:
 | `WriteTimeout` | 60s |
 | `IdleTimeout` | 120s |
 
-`ReadHeaderTimeout` bounds slow-loris on the pre-upgrade window on both ports and keeps `gosec` G114 quiet. Tightened from 10s to 5s in #35; post-upgrade slow peers are covered by per-frame deadlines (#15) and heartbeat (#7).
+`ReadHeaderTimeout` bounds slow-loris on the pre-upgrade window on both ports and keeps `gosec` G114 quiet. Tightened from 10s to 5s in #35; post-upgrade slow peers are covered by the per-message read deadline on `WSConn.Read` ([`readMessageTimeout`](ws-conn-adapter.md), 30s, #111), the write timeout on `Send` (#15), and heartbeat (#7).
 
 ## TLS version
 

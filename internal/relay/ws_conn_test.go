@@ -3,6 +3,8 @@ package relay
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -239,5 +241,214 @@ func TestWSConn_Read_FrameAtCap_DeliveredIntact(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("client Read returned %d bytes, want %d (and equal payload)", len(got), len(payload))
+	}
+}
+
+// testReadTimeout is the shortened per-message read deadline the
+// read-deadline tests install on their WSConn in place of
+// readMessageTimeout.
+const testReadTimeout = 500 * time.Millisecond
+
+// dialWSConn dials srv and wraps the client side in a WSConn whose
+// per-message read deadline is shortened to testReadTimeout.
+func dialWSConn(t *testing.T, srv *httptest.Server) *WSConn {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, _, err := websocket.Dial(dialCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	wc := NewWSConn(client, "test-conn-id", 256*1024)
+	wc.readTimeout = testReadTimeout
+	return wc
+}
+
+// startScriptedPeer stands up an httptest server whose handler upgrades
+// and runs peer against the server-side *websocket.Conn, and returns the
+// connected client-side WSConn. peer's ctx is cancelled at cleanup, so a
+// peer that stalls on it exits and the server can shut down.
+func startScriptedPeer(t *testing.T, peer func(ctx context.Context, c *websocket.Conn)) *WSConn {
+	t.Helper()
+	peerCtx, stopPeer := context.WithCancel(context.Background())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer c.Close(websocket.StatusInternalError, "test ended")
+		peer(peerCtx, c)
+	}))
+	wc := dialWSConn(t, srv)
+	t.Cleanup(func() {
+		wc.Close()
+		stopPeer()
+		srv.Close()
+	})
+	return wc
+}
+
+// readWithin runs wc.Read in a goroutine and returns its result and the
+// time it took, failing the test if Read has not returned within limit.
+func readWithin(t *testing.T, wc *WSConn, limit time.Duration) ([]byte, time.Duration, error) {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		data, err := wc.Read(context.Background())
+		done <- result{data, err}
+	}()
+	select {
+	case r := <-done:
+		return r.data, time.Since(start), r.err
+	case <-time.After(limit):
+		wc.Close()
+		t.Fatalf("Read did not return within %v", limit)
+		return nil, 0, nil
+	}
+}
+
+// TestWSConn_Read_StalledFragmentedMessage_ClosesWithinDeadline pins the
+// slowloris bound: a peer that starts a message (one non-final data
+// frame, header plus part of the payload) and never finishes it is cut
+// off within the message deadline, even though it keeps answering pings
+// and so would satisfy the heartbeat indefinitely.
+func TestWSConn_Read_StalledFragmentedMessage_ClosesWithinDeadline(t *testing.T) {
+	wc := startScriptedPeer(t, func(ctx context.Context, c *websocket.Conn) {
+		// Read loop so the peer answers the relay's pings.
+		go func() {
+			for {
+				if _, _, err := c.Read(ctx); err != nil {
+					return
+				}
+			}
+		}()
+		w, err := c.Writer(ctx, websocket.MessageText)
+		if err != nil {
+			t.Errorf("peer Writer: %v", err)
+			return
+		}
+		if _, err := w.Write([]byte(`{"partial":`)); err != nil {
+			t.Errorf("peer Write: %v", err)
+			return
+		}
+		<-ctx.Done() // never finish the message
+	})
+
+	// The non-final frame sits in the peer's write buffer until the
+	// peer's next flush; the pong answering the first ping is that flush.
+	// The second ping lands mid-stall, after the message has started.
+	pings := make(chan error, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), testReadTimeout/2)
+			pings <- wc.Ping(ctx)
+			cancel()
+			time.Sleep(testReadTimeout / 4)
+		}
+	}()
+
+	_, elapsed, err := readWithin(t, wc, testReadTimeout+2*time.Second)
+	if err == nil {
+		t.Fatal("Read of a stalled message returned nil error, want non-nil")
+	}
+	if elapsed > testReadTimeout+time.Second {
+		t.Errorf("Read returned after %v, want within deadline %v plus slack", elapsed, testReadTimeout)
+	}
+	for i := 0; i < 2; i++ {
+		if perr := <-pings; perr != nil {
+			t.Errorf("ping %d during stall: %v; the peer must look alive to the heartbeat", i, perr)
+		}
+	}
+	if err := wc.Send([]byte("late")); err == nil {
+		t.Error("Send after the read deadline fired returned nil error; want the connection closed")
+	}
+}
+
+// TestWSConn_Read_DribbledFrame_ClosesWithinDeadline covers the
+// single-frame form: the peer sends a frame header declaring a payload
+// and then dribbles it one byte at a time, faster than the deadline but
+// never finishing. Progress within the frame does not extend the
+// deadline. The peer is hand-rolled over a hijacked conn because
+// coder/websocket cannot emit a partial frame; it cannot answer pings
+// mid-frame (a control frame may not interrupt a frame's payload).
+func TestWSConn_Read_DribbledFrame_ClosesWithinDeadline(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sum := sha1.Sum([]byte(r.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+			base64.StdEncoding.EncodeToString(sum[:]))
+		// Final text frame, unmasked (server to client), 16-bit length 100.
+		brw.Write([]byte{0x81, 126, 0x00, 100})
+		if err := brw.Flush(); err != nil {
+			return
+		}
+		tick := time.NewTicker(testReadTimeout / 10)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				if _, err := conn.Write([]byte("x")); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	wc := dialWSConn(t, srv)
+	t.Cleanup(func() {
+		wc.Close()
+		close(stop)
+		srv.Close()
+	})
+
+	_, elapsed, err := readWithin(t, wc, testReadTimeout+2*time.Second)
+	if err == nil {
+		t.Fatal("Read of a dribbled frame returned nil error, want non-nil")
+	}
+	if elapsed > testReadTimeout+time.Second {
+		t.Errorf("Read returned after %v, want within deadline %v plus slack", elapsed, testReadTimeout)
+	}
+}
+
+// TestWSConn_Read_IdleLongerThanDeadline_ThenMessage_DeliveredIntact pins
+// the idle-safety half of the contract: the deadline bounds receipt of a
+// message once it starts, never the gap before it. A peer that is silent
+// for several deadlines and then sends a complete message is not dropped.
+func TestWSConn_Read_IdleLongerThanDeadline_ThenMessage_DeliveredIntact(t *testing.T) {
+	payload := []byte(`{"after":"idle"}`)
+	wc := startScriptedPeer(t, func(ctx context.Context, c *websocket.Conn) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * testReadTimeout):
+		}
+		if err := c.Write(ctx, websocket.MessageText, payload); err != nil {
+			t.Errorf("peer Write: %v", err)
+			return
+		}
+		// Read until the client closes, so its close handshake is answered.
+		_, _, _ = c.Read(ctx)
+	})
+
+	got, _, err := readWithin(t, wc, 3*testReadTimeout+2*time.Second)
+	if err != nil {
+		t.Fatalf("Read after idle gap: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("Read returned %q, want %q", got, payload)
 	}
 }
