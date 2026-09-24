@@ -70,6 +70,18 @@ var envContracts = []envContract{
 			return fmt.Errorf("expected %q or unset, got %q", "1", v)
 		},
 	},
+	{
+		// Unset means push is off. The reason never quotes the value: it
+		// is a private key.
+		name:     envFCMCredentials,
+		required: false,
+		validate: func(v string) error {
+			if _, err := parseFCMCredentials([]byte(v)); err != nil {
+				return errors.New("not a service-account JSON key (value withheld)")
+			}
+			return nil
+		},
+	},
 }
 
 // CheckEnvConfig walks envContracts and returns *ErrInvalidConfig on the
