@@ -57,6 +57,30 @@ No `conn_id`, no `frame`. `Unmarshal` treats an envelope as a wake request when 
 
 `PushWake` stays a raw `json.RawMessage` at this layer — only `parsePushWake` (called from `PushWaker.Request`, never from `Unmarshal` itself) decodes it into the unexported `pushWake{Platform, Token string}` struct and applies the platform/token checks above. Keeping the validation off `Unmarshal` means a `conn_id` envelope that happens to carry a malformed `push_wake` still decodes normally — the wake path and the phone-routing path can't interfere with each other.
 
+## Close notice (relay-to-binary, #152)
+
+```json
+{ "conn_id": "c-7f3a...", "close_code": 1001 }
+```
+
+The relay's own outbound counterpart to the `conn_id` envelope above: sent by
+the relay, never received by it, telling a binary that one of its phones'
+WebSocket connections ended on its own. No `frame` key. Built by the
+unexported `marshalCloseNotice(connID string, code uint16) ([]byte, error)`
+in `envelope.go` as a standalone two-field struct rather than
+`Envelope{ConnID: connID}` — `Envelope.Frame` has no `omitempty`, so
+marshalling a frameless `Envelope` would emit `"frame":null`, not this shape.
+Returns `ErrEmptyConnID` on an empty `connID` (unreachable in production: the
+caller always has a live `conn_id`). `code` is the phone's own WS close
+status, or `1001` (`StatusGoingAway`) when it closed without sending one.
+
+Sent from [`ClientHandler`](client-endpoint.md#close-notice-to-the-binary-152)
+once the phone's forwarder loop ends — skipped when the binary itself
+requested the close (tracked by
+[`phoneOutbox.closedByBinary`](phone-outbox.md#binary-requested-close-tracking-152))
+or when the binary that served this phone is gone or has since been
+replaced under the same server-id.
+
 ## Opacity invariant
 
 `Frame` is the only field the relay ever forwards from the wire. The relay never deserialises it. The type enforces this via `json.RawMessage`, which preserves the underlying bytes verbatim through marshal/unmarshal (modulo insignificant whitespace canonicalised by `encoding/json`).
@@ -92,3 +116,5 @@ Both functions are pure and stateless. No goroutines, no shared state, no I/O. S
 
 - [ADR-0001: Routing envelope shape and opacity](../decisions/0001-routing-envelope-shape-and-opacity.md) — why `json.RawMessage` and sentinel errors.
 - [Architecture overview](../../architecture.md) — where this fits in the relay's data flow.
+- [`/v1/client`](client-endpoint.md) — sends the close notice; owns the decision of when to send it.
+- [Per-phone delivery queue](phone-outbox.md) — tracks whether a phone's close was binary-requested, so the notice isn't sent for one.
