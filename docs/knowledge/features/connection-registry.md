@@ -33,6 +33,7 @@ func (r *Registry) RegisterPhone(serverID string, conn Conn) error
 func (r *Registry) RegisterPhoneCapped(serverID string, conn Conn, max int) error
 func (r *Registry) UnregisterPhone(serverID string, connID string)
 func (r *Registry) BinaryFor(serverID string) (Conn, bool)
+func (r *Registry) PhoneFor(serverID, connID string) (Conn, bool)
 func (r *Registry) PhonesFor(serverID string) []Conn
 func (r *Registry) Counts() (binaries, phones int)
 ```
@@ -100,6 +101,7 @@ The duration `d` is fully trusted — degenerate values (`d <= 0` fires immediat
 - **One `sync.RWMutex` covers all three maps** (`binaries`, `phones`, `timers`). Mutating methods take `Lock`; lookups take `RLock`. Sharding is a possible later optimisation but irrelevant at v1 (tens to hundreds of conns, sub-microsecond critical sections, no measured contention).
 - **Conn callbacks are never invoked under the lock,** with one documented exception: `UnregisterPhone` calls `ConnID()` while holding the write lock to scan for the target. The `Conn` contract requires `ConnID` to be a non-blocking getter.
 - **Broadcast pattern.** A caller wanting to fan out a frame to all phones for a server-id calls `PhonesFor` (returns a freshly allocated copy) and iterates the snapshot calling `Send` per conn — no registry lock held during I/O.
+- **Single-phone lookup.** `PhoneFor(serverID, connID)` (#116) is the zero-allocation counterpart for a caller that only needs one phone by conn-id — the binary forwarder's per-frame resolution, see [Binary-side frame forwarder](binary-forwarder.md). It scans the live `phones[serverID]` slice under `RLock` instead of copying it, returning `(nil, false)` for an unknown server-id or conn_id. The scan (not an index) is deliberate: phones per server-id are capped at 16 (`maxPhones`), so a linear scan is cheap, and a conn_id index would need to stay in sync across the register, unregister, reclaim-eviction and grace-expiry paths for no measured benefit. The returned `Conn` is live past the unlock with the same semantics as an element of a `PhonesFor` snapshot — it may be concurrently unregistered, which callers already tolerate via `Send`/`Enqueue` errors.
 - **No callbacks, no channels.** The registry is a passive store. Notification of binary loss / new phone arrival happens elsewhere (the WS upgrade handlers and the grace timer the registry arms in `ScheduleReleaseServer`).
 - **Liveness probing lives entirely outside the registry.** `TakeoverServer` (#112) never pings a `Conn` — the caller has already decided, off-lock, that the incumbent is unresponsive, before calling in. The registry's only new responsibility is the identity check and the atomic swap.
 
@@ -172,6 +174,7 @@ go test -race -count=20 -run TestRegistry_RaceFreedom ./internal/relay
 ## Related
 
 - [Connection-count gauges](connection-count-gauges.md) — `pyrycode_relay_connected_binaries` reads `Counts()` directly, so the grace-window exclusion (#115) applies to the gauge with no code of its own.
+- [Binary-side frame forwarder](binary-forwarder.md) — the sole production caller of `PhoneFor`, resolving `env.ConnID` once per forwarded frame (#116).
 - [ADR-0003: Connection registry as a passive store](../decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, the orphan-phones invariant.
 - [ADR-0006: Grace window IS the reclaim path](../decisions/0006-grace-period-as-reclaim-path.md) — why a `ClaimServer` during grace succeeds rather than conflicts; the pointer-identity stale-fire defence; amended for probe-driven takeover (#112).
 - [`/v1/server`](server-endpoint.md) — the sole caller of `TakeoverServer` and `ScheduleReleaseServerIfHeld`; owns the liveness probe and the incumbent's close code.
