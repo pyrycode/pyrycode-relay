@@ -425,6 +425,22 @@ func (r *Registry) BinaryFor(serverID string) (Conn, bool) {
 	return c, ok
 }
 
+// PhoneFor returns the phone registered for serverID whose ConnID equals
+// connID, if any. It scans the live phones slice under the read lock and
+// allocates nothing, so the binary forwarder can resolve a conn_id per
+// frame without GC pressure (#116). The scan is bounded by the per-server-id
+// phone cap, which is why no conn_id index is kept.
+func (r *Registry) PhoneFor(serverID, connID string) (Conn, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, c := range r.phones[serverID] {
+		if c.ConnID() == connID {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
 // PhonesFor returns a snapshot of the phones registered for serverID. The
 // returned slice is freshly allocated; the caller may iterate, append, or
 // otherwise mutate it without affecting the registry's internal state or

@@ -38,7 +38,7 @@ Per iteration:
 1. `binary.Read(ctx)` for the next wire-encoded envelope. Any error → log `binary_forwarder_read_end` (info) and **return**.
 2. `Unmarshal(wrapped)`. Any sentinel (`ErrMalformedEnvelope`, `ErrMissingConnID`, `ErrMissingFrame`, defensive catch-all) → log `binary_forwarder_unmarshal_err` (warn) and **continue**.
 3. `env.ConnID == ""` (a [`push_wake` envelope](routing-envelope.md#push_wake-shape-relay-addressed), the only way `Unmarshal` returns an empty `ConnID` without erroring) → hand off to the registry's `PushWaker` (see [§ push_wake handling](#push_wake-handling) below) and **continue**.
-4. Linear-scan `reg.PhonesFor(serverID)` for the first `p.ConnID() == env.ConnID`. Miss → log `binary_forwarder_unknown_conn_id` (warn) and **continue**.
+4. `reg.PhoneFor(serverID, env.ConnID)` (#116, zero-allocation — scans the live phones slice under the registry's read lock rather than copying a `PhonesFor` snapshot). Miss → log `binary_forwarder_unknown_conn_id` (warn) and **continue**.
 5. `phone.Send(env.Frame)`. Error → log `binary_forwarder_phone_send_failed` (info) and **continue**.
 
 The relay neither parses nor canonicalises the inner bytes; `env.Frame` is forwarded verbatim. `json.RawMessage` makes accidental inspection hard.
@@ -87,7 +87,7 @@ All termination paths terminate the single goroutine; the handler's defer cleans
 - One forwarder per binary — runs on the HTTP handler goroutine itself; no extra goroutine spawned. Runs in parallel with the heartbeat goroutine on a sibling goroutine; the two never share state.
 - `binary.Read` (and `WSConn.Read`) is **single-caller**: the forwarder is the sole reader by contract. Concurrent `Read` is not supported by the underlying library.
 - `phone.Send` is multi-caller across the system: every binary's forwarder writing to a given phone, plus any future server-side signal path. `WSConn.writeMu` (#15) serialises them. No new locks added by this ticket.
-- `reg.PhonesFor` takes RLock and returns a fresh snapshot; cheap, contention-free. Iteration runs outside the registry lock — `phone.ConnID()` is called on snapshot entries, not registry state. Matches the established passive-store contract.
+- `reg.PhoneFor` takes `RLock`, scans the live phones slice for `serverID`, and returns before this loop touches the result — allocating nothing per frame (#116; previously `reg.PhonesFor` copied the whole slice every frame). The scan itself runs under the lock rather than outside it, but stays cheap: phones per server-id are capped at `maxPhones` (16), so the critical section is bounded and short, matching the established passive-store contract.
 - Backpressure: since #113, delivery to a phone goes through its own bounded [`phoneOutbox`](phone-outbox.md) instead of a direct `phone.Send` — the forwarder only enqueues (`Enqueue`, never blocks) and the phone's own writer goroutine drains it. A slow or stalled phone therefore no longer blocks this loop, its siblings, or the binary's own pong processing at all; it only blocks its own writer, bounded first by the outbox's 16-frame depth and then by `WSConn.Send`'s 10 s deadline once a write is actually in flight. A phone whose backlog fills or whose write fails is closed with `1011` and its pending frames dropped. `env.CloseCode != 0` close directives go through the same queue, ordered behind every frame enqueued before them. The direct-`Send` / direct-`closePhone` code below this loop is the fallback for a `Conn` that does not implement the outbox's `phoneQueue` capability — in production that's every registered phone, so the fallback serves only this package's unit-test fakes.
 
 ## Edits to neighbouring code
@@ -122,7 +122,7 @@ Field set is fixed; nothing else (envelope bytes, frame bytes, headers, tokens) 
 
 ## Adversarial framing
 
-- **Cross-server addressing.** `PhonesFor(serverID)` scopes the lookup to the binary's own slot. A binary cannot address phones registered under a different server-id even if it forges an `env.ConnID` collision — the iteration only considers phones it owns. Structural defence, not a runtime check; follows from the registry's per-server-id map shape (#3).
+- **Cross-server addressing.** `PhoneFor(serverID, connID)` scopes the lookup to the binary's own slot. A binary cannot address phones registered under a different server-id even if it forges an `env.ConnID` collision — the scan only considers phones it owns. Structural defence, not a runtime check; follows from the registry's per-server-id map shape (#3).
 - **Malformed envelope.** `Unmarshal` returns a sentinel; loop logs + continues. The binary owns its own protocol health; the relay does not punish it for one bad frame.
 - **Unknown `conn_id`.** Phone disconnected between the binary's last observation and this envelope, or the binary addressed a phone it shouldn't know about. Either way, a normal race or a binary bug — drop, continue.
 - **Adversarial `env.Frame` contents.** Forwarded verbatim as opaque bytes. The downstream phone's protocol layer already knows it receives untrusted-via-relay bytes (the binary is trusted relative to the phone, not relative to the relay).
@@ -161,7 +161,7 @@ Tests (1:1 with AC):
 - [Push wake dispatch](push-wake-dispatch.md) — what happens to a `push_wake` envelope after this forwarder hands it off: validation, rate limit, in-flight cap, async send.
 - [Per-phone delivery queue](phone-outbox.md) — where a routed frame or close directive actually goes since #113: the addressed phone's bounded outbox, not a direct `Send` from this loop.
 - [WSConn adapter](ws-conn-adapter.md) — `Read` (added in #25) satisfies `binarySource` in production.
-- [Connection registry](connection-registry.md) — `PhonesFor` is the per-frame lookup; snapshot semantics guarantee lock-free iteration.
+- [Connection registry](connection-registry.md) — `PhoneFor` is the per-frame lookup (#116); it allocates nothing, scanning the live phones slice under the read lock instead of copying a `PhonesFor` snapshot.
 - [Heartbeat](heartbeat.md) — sibling per-conn goroutine; closes the conn with `1011` on pong timeout, which aborts the forwarder's in-flight `Read`.
 - [ADR-0001](../decisions/0001-routing-envelope-shape-and-opacity.md) — opacity-by-type and sentinel errors.
 - [ADR-0006](../decisions/0006-grace-period-as-reclaim-path.md) — grace-window semantics; the forwarder is dead before grace expiry and never sees expiry-time state.
