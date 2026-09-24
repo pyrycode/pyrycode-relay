@@ -475,14 +475,22 @@ func (r *Registry) Snapshot() []Conn {
 	return out
 }
 
-// Counts returns the number of binaries currently claimed and the total
+// Counts returns the number of binaries currently connected and the total
 // number of phone connections summed across all server-ids. For the health
-// endpoint (#10). One call is internally consistent; two concurrent calls
-// may observe different values.
+// endpoint (#10) and the connection gauges. A binary in its grace window
+// (a pending ScheduleReleaseServer timer) still holds its slot but is not
+// connected, so it is left out (#115); its phones are still counted. One
+// call is internally consistent; two concurrent calls may observe
+// different values.
 func (r *Registry) Counts() (binaries, phones int) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	b := len(r.binaries)
+	for id := range r.timers {
+		if _, held := r.binaries[id]; held {
+			b--
+		}
+	}
 	p := 0
 	for _, s := range r.phones {
 		p += len(s)

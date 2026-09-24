@@ -22,7 +22,7 @@ Cache-Control: no-store
 |---|---|---|
 | `status` | string | Always `"ok"` in v1. No `degraded` / `unhealthy` states yet. |
 | `version` | string | Build-time `Version` (matches `--version`). Defaults to `"dev"` when not overridden via `-ldflags`. |
-| `connected_binaries` | int | Currently-claimed binary slots, from `Registry.Counts()`. |
+| `connected_binaries` | int | Currently-connected binaries, from `Registry.Counts()`. Excludes a binary in its grace window (disconnected, pending reclaim) (#115). |
 | `connected_phones` | int | Phones summed across all server-ids, from `Registry.Counts()`. |
 | `uptime_seconds` | int64 | `time.Since(startedAt)` in whole seconds, floored at zero. |
 
