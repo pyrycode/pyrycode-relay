@@ -69,6 +69,8 @@ The binary connection is never affected by a refused wake — same "one bad fram
 
 The phone-side forwarder has one sink (the binary); a failing sink means the conn is dead, so the loop ends. The binary-side forwarder has N sinks (phones); a single failing sink does not justify dropping every other phone served by this binary. The phone-side semantics encode "frame loop owns the lifecycle of its single pair"; the binary-side semantics encode "frame loop is decoupled from the lifecycle of its sinks." A bad frame from the binary MUST NOT tear the binary connection down — phones come and go, and an envelope addressing a just-disconnected phone is a normal race.
 
+The same "who pays" reasoning explains the malformed-envelope row specifically (#117, decided posture, not an oversight): a malformed *phone* frame came from the one phone the phone-forwarder serves, so tearing that connection down drops only the sender. A malformed *binary* envelope, by contrast, arrives on the one connection that fans out to every phone behind that `serverID` — closing it on one bad envelope would drop all of them for a fault that, per-frame, is cheap to just skip. Log-volume bounding pushes the same direction: the binary side's `binary_forwarder_unmarshal_err` warn line recurs per bad frame from a still-connected binary with no forced reconnect, which is acceptable because a misbehaving binary is operator infrastructure, not an anonymous internet peer the way a phone is.
+
 The forwarder does not branch on specific `Unmarshal` sentinels — all four get the same warn-and-continue treatment. Branching would add no behaviour and risks divergence if envelope errors are added later.
 
 ## Termination paths
