@@ -37,10 +37,26 @@ Per iteration:
 
 1. `binary.Read(ctx)` for the next wire-encoded envelope. Any error → log `binary_forwarder_read_end` (info) and **return**.
 2. `Unmarshal(wrapped)`. Any sentinel (`ErrMalformedEnvelope`, `ErrMissingConnID`, `ErrMissingFrame`, defensive catch-all) → log `binary_forwarder_unmarshal_err` (warn) and **continue**.
-3. Linear-scan `reg.PhonesFor(serverID)` for the first `p.ConnID() == env.ConnID`. Miss → log `binary_forwarder_unknown_conn_id` (warn) and **continue**.
-4. `phone.Send(env.Frame)`. Error → log `binary_forwarder_phone_send_failed` (info) and **continue**.
+3. `env.ConnID == ""` (a [`push_wake` envelope](routing-envelope.md#push_wake-shape-relay-addressed), the only way `Unmarshal` returns an empty `ConnID` without erroring) → hand off to the registry's `PushWaker` (see [§ push_wake handling](#push_wake-handling) below) and **continue**.
+4. Linear-scan `reg.PhonesFor(serverID)` for the first `p.ConnID() == env.ConnID`. Miss → log `binary_forwarder_unknown_conn_id` (warn) and **continue**.
+5. `phone.Send(env.Frame)`. Error → log `binary_forwarder_phone_send_failed` (info) and **continue**.
 
 The relay neither parses nor canonicalises the inner bytes; `env.Frame` is forwarded verbatim. `json.RawMessage` makes accidental inspection hard.
+
+## `push_wake` handling
+
+A `push_wake` envelope addresses the relay itself, not a phone, so it never reaches the `PhonesFor` lookup. `StartBinaryForwarder` hands `env.PushWake` straight to `reg.pushWaker.Request(serverID, env.PushWake)` (`internal/relay/registry.go`'s `pushWaker` field, set once at boot via `SetPushWaker` — nil means push is off, same "optional collaborator" shape as `SetForwarderHooks`). See [Push wake dispatch](push-wake-dispatch.md) for what `Request` does: structural validation, a per-server-id rate limit, a relay-wide in-flight cap, and an async send off this loop so a blocking `FCMSender.Send` never stalls frame forwarding.
+
+Every refusal — bad platform, empty token, malformed object, over either limit, or push off — comes back from `Request` as an error and is logged as a single line, same as any other per-frame drop:
+
+```go
+if err := reg.pushWaker.Request(serverID, env.PushWake); err != nil {
+    logger.Warn("binary_forwarder_push_wake_dropped", "server_id", …, "binary_conn_id", …, "err", err)
+}
+continue
+```
+
+The binary connection is never affected by a refused wake — same "one bad frame doesn't tear down the loop" contract the rest of this forwarder follows. No token or credential value ever reaches this log line; `err` is one of `Request`'s sentinels, none of which carry the token (see [Push wake dispatch § Error handling](push-wake-dispatch.md#error-handling)).
 
 ## Error policy divergence from `StartPhoneForwarder`
 
@@ -87,6 +103,7 @@ Field set is fixed; nothing else (envelope bytes, frame bytes, headers, tokens) 
 |---|---|---|
 | `binary_forwarder_read_end` | info | `server_id`, `binary_conn_id`, `err` |
 | `binary_forwarder_unmarshal_err` | warn | `server_id`, `binary_conn_id`, `err` |
+| `binary_forwarder_push_wake_dropped` | warn | `server_id`, `binary_conn_id`, `err` |
 | `binary_forwarder_unknown_conn_id` | warn | `server_id`, `conn_id` |
 | `binary_forwarder_phone_send_failed` | info | `server_id`, `conn_id`, `err` |
 
@@ -140,6 +157,7 @@ Tests (1:1 with AC):
 - [`/v1/server`](server-endpoint.md) — sole production caller; owns the cleanup defers the forwarder must not touch.
 - [Phone-side forwarder](phone-forwarder.md) — mirror image; explains why the two have distinct named source interfaces despite identical shape.
 - [Routing envelope](routing-envelope.md) — `Unmarshal` is the per-frame structural check; all four sentinels funnel through one warn-and-continue branch.
+- [Push wake dispatch](push-wake-dispatch.md) — what happens to a `push_wake` envelope after this forwarder hands it off: validation, rate limit, in-flight cap, async send.
 - [WSConn adapter](ws-conn-adapter.md) — `Read` (added in #25) satisfies `binarySource` in production.
 - [Connection registry](connection-registry.md) — `PhonesFor` is the per-frame lookup; snapshot semantics guarantee lock-free iteration.
 - [Heartbeat](heartbeat.md) — sibling per-conn goroutine; closes the conn with `1011` on pong timeout, which aborts the forwarder's in-flight `Read`.

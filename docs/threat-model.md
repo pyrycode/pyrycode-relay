@@ -29,6 +29,21 @@ Each threat below records four fields:
 
 **Future hardening:** SBOM generation in CI; pinned-version review on every `go.mod` change; consider Go module proxy mirroring once any user data flows through the relay.
 
+## Outbound network calls — FCM push wake
+
+**Severity:** `medium`. Trips the "new outbound network call" re-review trigger below (#133).
+
+**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the only trigger for the relay originating an outbound call. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then admits or refuses the wake under two independent, named limits before a single outbound call is made:
+
+- **Per-server-id rate** — `pushWakeRefillEvery` (10s) / `pushWakeBurst` (6), an `IPRateLimiter` keyed on server-id. Bounds how fast one binary can push wakes at Google.
+- **Relay-wide in-flight cap** — `pushWakeMaxInFlight` (32), a buffered channel. Bounds concurrent goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
+
+A wake over either limit is dropped with a log line, never queued — no backpressure state accumulates. The credential (`PYRYCODE_RELAY_FCM_CREDENTIALS`, a whole Google service-account JSON key) and the device token are never logged: every drop and send-failure log line carries only `server_id` / `binary_conn_id` / `err`, and `FCMSender`'s errors carry at most an HTTP status (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
+
+**Residual risk:** The relay cannot verify a binary's claimed device token belongs to one of that binary's own phones — any binary that has claimed a server-id can ask the relay to wake an arbitrary FCM token. The two limits bound the *rate* of abuse, not eliminate it: a single binary can still cause up to `pushWakeBurst` wakes per `pushWakeRefillEvery` window indefinitely. Because the wake carries no payload, the worst case is an app repeatedly reconnecting, not data exposure. The in-flight cap bounds concurrency relay-wide, not total throughput when many server-ids are claimed simultaneously — a set of colluding binaries, each under its own per-server-id bucket, can still saturate the 32-slot cap. No metric exists yet to see this happening (out of scope per the ticket).
+
+**Future hardening:** A global wakes-per-second ceiling (distinct from the in-flight cap) if abuse across many server-ids is observed; a metric on dropped/refused wakes to make the residual risk observable; telling the daemon a token is dead (currently out of scope — no retry, no dead-token callback).
+
 ## DoS resistance — connection floods, slow-loris, fork-bomb retry
 
 **Severity:** `medium`.
@@ -93,6 +108,7 @@ This document must be revisited when any of the following occurs:
 - A new dependency is added to `go.mod`.
 - The deploy target changes (new VPS provider, container platform, managed Kubernetes).
 - A new public endpoint is exposed (any new path under `/v1/*` or otherwise).
+- A new outbound network call is added — the relay itself originates a request, rather than only serving one. First tripped by [Outbound network calls — FCM push wake](#outbound-network-calls--fcm-push-wake) (#133).
 - A security incident occurs — any unexpected behaviour with security implications, even if no compromise is confirmed.
 
 ## Out of scope
