@@ -315,6 +315,54 @@ func TestCounts_AcrossLifecycle(t *testing.T) {
 	assert("after orphan unregister", 0, 0)
 }
 
+// TestCounts_ExcludesGracingBinary pins #115: a binary in its grace window
+// is not counted as connected, its phones still are, and a reclaim or
+// takeover counts the slot again.
+func TestCounts_ExcludesGracingBinary(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+
+	assert := func(stage string, wantB, wantP int) {
+		t.Helper()
+		b, p := r.Counts()
+		if b != wantB || p != wantP {
+			t.Errorf("%s: Counts=(%d,%d), want (%d,%d)", stage, b, p, wantB, wantP)
+		}
+	}
+
+	for _, id := range []string{"s1", "s2"} {
+		if err := r.ClaimServer(id, &fakeConn{id: "b-" + id}); err != nil {
+			t.Fatalf("ClaimServer %s: %v", id, err)
+		}
+	}
+	if err := r.RegisterPhone("s1", &fakeConn{id: "p-1"}); err != nil {
+		t.Fatalf("RegisterPhone: %v", err)
+	}
+	assert("both claimed", 2, 1)
+
+	// A timer armed for an unheld id must not reduce the count.
+	r.ScheduleReleaseServer("unheld", time.Hour)
+	assert("grace on unheld id", 2, 1)
+
+	r.ScheduleReleaseServer("s1", time.Hour)
+	assert("s1 gracing", 1, 1)
+
+	if err := r.ClaimServer("s1", &fakeConn{id: "b-s1-new"}); err != nil {
+		t.Fatalf("reclaim ClaimServer: %v", err)
+	}
+	// Reclaim evicts s1's phones (#127).
+	assert("s1 reclaimed", 2, 0)
+
+	incumbent, _ := r.BinaryFor("s2")
+	r.ScheduleReleaseServer("s2", time.Hour)
+	assert("s2 gracing", 1, 0)
+
+	if err := r.TakeoverServer("s2", incumbent, &fakeConn{id: "b-s2-new"}); err != nil {
+		t.Fatalf("TakeoverServer: %v", err)
+	}
+	assert("s2 taken over", 2, 0)
+}
+
 func TestUnregisterPhone_RemovesEmptySlice(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
