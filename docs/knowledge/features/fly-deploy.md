@@ -5,7 +5,7 @@ The relay's production host is a single [Fly.io](https://fly.io) machine in one 
 ## What it does
 
 - **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and a single-machine hard cap.
-- **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `immediate` strategy. No GHA workflow auto-deploys.
+- **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `rolling` strategy, which waits for the `internal_port = 8080` service's TCP check before finishing — a relay that refuses to boot fails the deploy rather than leaving production down ([#118](../codebase/118.md)). No GHA workflow auto-deploys.
 - **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment); no GitHub repo secret is involved anymore.
 
 ## Why this shape
@@ -31,9 +31,23 @@ Fly Apps v2 has **no `max_machines` key**. The cap is encoded via four declarati
 | `[[services]] min_machines_running` | `1` | Don't drop below one |
 | `[[services]] auto_start_machines` | `false` | Don't let Fly create new machines on demand |
 | `[[services]] auto_stop_machines` | `"off"` | Don't stop the one machine |
-| `[deploy] strategy` | `"immediate"` | Don't create a second machine during deploy for blue/green |
+| `[deploy] strategy` | `"rolling"` | Updates the one machine in place and waits for its health check; never creates a second machine |
 
 Operator discipline at `flyctl scale count` is the platform-level ceiling — Fly itself does not enforce one. The in-binary `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing backstop for an operator mistake.
+
+### Deploy health check — TCP on 8080, `rolling` waits for it ([#118](../codebase/118.md))
+
+`[deploy] strategy` is `"rolling"`, not `"immediate"`. `rolling` replaces machines one at a time and waits for each machine's checks before finishing; `immediate` replaces machines without waiting for any check, even when one exists. On this one-machine fleet `rolling` still updates in place — it creates no second machine, so the single-machine hard cap above is unaffected; only `immediate` vs. `rolling` changed, not `min_machines_running` / `auto_start_machines` / `auto_stop_machines`.
+
+The `internal_port = 8080` service carries a `[[services.tcp_checks]]` block (`grace_period = "30s"`, `interval = "15s"`, `timeout = "5s"`). The `internal_port = 8443` service has no check. The check is TCP, not HTTP, and lives on 8080 rather than 8443, because no port a Fly check can reach serves `/healthz`:
+
+- On 8080 everything except the ACME HTTP-01 challenge gets a 404 fallback ([ADR-0002](../decisions/0002-autocert-explicit-failure-on-port-80.md)) — there is no `/healthz` route to probe here, but a bare TCP connect is enough to prove the listener is up.
+- On 8443, `NewProxyProtoListener` ([PROXY protocol listener](proxy-protocol-listener.md), #110) requires a PROXY v2 header before the TLS handshake even starts; Fly's checker connects directly with no such header, so every HTTP or TCP probe there would fail in the TLS path. That server has no `ErrorLog` set, so each failed probe would also log a line to stderr — a TCP check on 8443 would just add log noise for a check that can never pass.
+- Checking 8080 still covers 443: a boot refusal exits before either listener binds, and `runServers` drains and exits if any listener fails, so both ports go down together. One check on 8080 is sufficient signal for both.
+
+Serving `/healthz` on a new surface reachable by Fly's checker would be a new public endpoint and a threat-model re-review — out of scope here; see [`docs/security-followups.md` § *`/healthz` exposure*](../../security-followups.md).
+
+Risk accepted: a spurious check failure pulls port 80 off Fly's proxy on this single-machine fleet (443 has no check, so the WebSocket surface is unaffected by a spurious 8080 failure). The timings above are deliberately generous — boot is local-only and sub-second on a shared-cpu-1x / 256 MB machine, so 30s grace is roughly a 30× margin. Operator follow-up after each deploy: `flyctl checks list -a pyrycode-relay` should show the check passing.
 
 ### Argv, not shell
 
@@ -100,6 +114,7 @@ A rollback does **not** revert the `main` commit. Because deploys are operator-d
 
 - [Ticket #38 codebase notes](../codebase/38.md) — what landed for the initial Fly wiring.
 - [Ticket #97 codebase notes](../codebase/97.md) — fly.toml gotchas captured after the 2026-05-24 first-deploy bootstrap (the `[env]` block and per-`[[services]]` `processes = ["app"]` mapping).
+- [Ticket #118 codebase notes](../codebase/118.md) — the `internal_port = 8080` TCP health check and the `immediate` → `rolling` deploy-strategy switch.
 - [Architect spec](../../specs/architecture/38-fly-deploy-manifest.md) — full design rationale + security review.
 - [`docs/deploy.md`](../../deploy.md) — operator-facing bootstrap / steady-state / rollback.
 - [`docs/architecture.md` § Hosting](../../architecture.md#hosting) — the decision record.

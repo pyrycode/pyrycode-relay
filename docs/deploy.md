@@ -148,7 +148,14 @@ GHA workflow auto-deploys on push.
    final pre-deploy gate, then `flyctl deploy --remote-only -a
    pyrycode-relay`. Fly's remote builder rebuilds the image from
    `Dockerfile` and replaces the single machine in place via the
-   `immediate` deploy strategy.
+   `rolling` deploy strategy, which waits for the machine to pass its
+   `internal_port = 8080` TCP check before finishing — a relay that
+   refuses to boot now fails the deploy instead of silently leaving
+   production down. `flyctl deploy` exits non-zero if the check never
+   passes; see [`docs/knowledge/features/fly-deploy.md` § *Deploy
+   health check*](knowledge/features/fly-deploy.md#deploy-health-check--tcp-on-8080-rolling-waits-for-it-118)
+   for why the check is TCP on 8080 and not an HTTP probe of
+   `/healthz`.
 3. Verify post-deploy: `flyctl status -a pyrycode-relay` (machine
    `started`), `curl -sS https://pyrycode-relay.pyryco.de/healthz`
    (`200`), and a tail of `flyctl logs -a pyrycode-relay` for any
