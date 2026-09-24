@@ -145,9 +145,13 @@ GHA workflow auto-deploys on push.
    operator-direct PR for runner/release-adjacent or other
    pipeline-incompatible work).
 2. From a clean local checkout of `main`, run `make check` for the
-   final pre-deploy gate, then `flyctl deploy --remote-only -a
-   pyrycode-relay`. Fly's remote builder rebuilds the image from
-   `Dockerfile` and replaces the single machine in place via the
+   final pre-deploy gate. Tag the commit and push the tag
+   (`git tag -a vX.Y.Z -m "pyrycode-relay vX.Y.Z" && git push origin
+   vX.Y.Z`), then deploy with the tag stamped into the binary:
+   `flyctl deploy --remote-only -a pyrycode-relay --build-arg
+   VERSION=vX.Y.Z`. Without `--build-arg` the image falls back to
+   `VERSION=dev` and the running relay cannot say which build it is.
+   Fly's remote builder rebuilds the image from `Dockerfile` and replaces the single machine in place via the
    `rolling` deploy strategy, which waits for the machine to pass its
    `internal_port = 8080` TCP check before finishing — a relay that
    refuses to boot now fails the deploy instead of silently leaving
@@ -158,10 +162,16 @@ GHA workflow auto-deploys on push.
    `/healthz`.
 3. Verify post-deploy: `flyctl status -a pyrycode-relay` (machine
    `started`), `curl -sS https://pyrycode-relay.pyryco.de/healthz`
-   (`200`), and a tail of `flyctl logs -a pyrycode-relay` for any
-   startup-time errors.
+   (`200`, and `version` matches the tag you deployed), and a tail of
+   `flyctl logs -a pyrycode-relay` for any startup-time errors.
+4. Publish the GitHub release for the tag (`gh release create vX.Y.Z
+   --verify-tag`), listing the changes since the previous release and
+   the rollback target.
 
-Deploy history: the live instance was redeployed 2026-07-03 from commit
+Deploy history: releases are listed on the repo's
+[Releases page](https://github.com/pyrycode/pyrycode-relay/releases),
+starting with `v0.1.0` (2026-09-24). Earlier deploys were untagged: the
+live instance was redeployed 2026-07-03 from commit
 [`67ffa46`](https://github.com/pyrycode/pyrycode-relay/commit/67ffa46),
 picking up the #108 text-frames fix; before that it ran the initial
 2026-05-29 deploy.
@@ -186,9 +196,13 @@ the repo and not CI. Two independent readings, and they should agree:
    on the same moment as the machine's `LAST UPDATED`.
 
 On 2026-08-05 those two agreed to the minute on a build 33 days old, which is
-what established that the CVE patch had never shipped. Note `version` in the
-health payload is the build-stamp string and reads `dev` on every deploy, so it
-distinguishes nothing — do not use it as a version check.
+what established that the CVE patch had never shipped.
+
+Since `v0.1.0` there is a third, direct reading: the `version` field in the
+same health payload carries the release tag, set by `--build-arg VERSION=…` at
+deploy time. It reads `dev` when a deploy left the build arg out, as every
+deploy before 2026-09-24 did, so `dev` says the stamp is missing, not which
+build is running.
 
 Two flyctl gotchas on the operator MacBook, both of which look like something
 worse than they are:

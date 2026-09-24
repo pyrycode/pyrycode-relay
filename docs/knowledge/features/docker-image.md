@@ -28,7 +28,7 @@ go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
 - `CGO_ENABLED=0` → fully-static binary that runs on distroless/static (no glibc on the runtime image).
 - `-trimpath` → strips host build paths from the binary; defends against accidental disclosure of build-host directory structure via panic stack traces.
 - `-s -w` → strips symbol table and DWARF; reduces post-exploitation reverse-engineering convenience and signals build hygiene.
-- `-X main.Version=${VERSION}` → mirrors the `Makefile`'s `LDFLAGS`. Image builds default to `VERSION=dev` (matches the bare-binary default); a release-tooling override via `--build-arg VERSION=…` remains available for future use (not wired into #38's CI deploy, which builds from `Dockerfile` defaults via `flyctl deploy --remote-only`).
+- `-X main.Version=${VERSION}` → mirrors the `Makefile`'s `LDFLAGS`. Image builds default to `VERSION=dev` (matches the bare-binary default); release deploys override it with `--build-arg VERSION=<tag>` (see [`docs/deploy.md` § *Steady-state flow*](../../deploy.md#steady-state-flow)), so `/healthz` reports the release tag.
 
 `go mod download` runs in a separate layer before `COPY . .` so source-only edits don't bust the dependency-cache layer.
 
