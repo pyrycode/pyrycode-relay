@@ -52,9 +52,11 @@ func ServerHandler(reg *Registry, logger *slog.Logger, grace time.Duration, maxF
 }
 
 // conflictProbeTimeout bounds the liveness probe a conflicting claim sends
-// to the incumbent binary (#112). It is the ticket's 10s ceiling because a
-// live incumbent's pong is only read between its forwarder's frames, and
-// one synchronous phone Send can hold the forwarder for writeTimeout.
+// to the incumbent binary (#112). A live incumbent's pong is only read
+// between its forwarder's frames; since #113 the forwarder only enqueues
+// to per-phone queues and never waits on a phone write, so the pong waits
+// at most for one binary read. 10s stays as a conservative ceiling for a
+// slow network path to the incumbent.
 const conflictProbeTimeout = 10 * time.Second
 
 // serverHandler is ServerHandler with the conflict probe timeout exposed,

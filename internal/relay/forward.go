@@ -26,6 +26,16 @@ func closePhone(phone Conn, code uint16) {
 	phone.Close()
 }
 
+// phoneQueue is the non-blocking delivery capability StartBinaryForwarder
+// prefers: Enqueue hands a frame, and a close directive when closeCode is
+// non-zero, to the phone's own writer and returns without touching the
+// socket. Defined at the consumer like phoneCloser. *phoneOutbox, which
+// ClientHandler registers for every phone, satisfies it; a Conn that does
+// not is written synchronously on the forwarder.
+type phoneQueue interface {
+	Enqueue(frame []byte, closeCode uint16) error
+}
+
 // phoneSource is the read-side contract the forwarder needs from a phone
 // connection. Defined at the consumer (this file), not on WSConn, so tests
 // can substitute a fake. Production passes *WSConn, which satisfies it via
@@ -122,6 +132,12 @@ type binarySource interface {
 // socket with that WS close code, honoring the daemon's disconnect requests.
 // A missing addressed phone (already gone) is a normal race, logged + skipped.
 //
+// A phone that implements phoneQueue (every production phone, via
+// phoneOutbox) gets the frame and any close directive enqueued instead: its
+// own writer delivers them in order, so a stalled phone never holds this
+// loop or delays its siblings (#113). A refused enqueue (backlog full, phone
+// gone) is logged and skipped like any other per-frame drop.
+//
 // A push_wake envelope (no conn_id) goes to the registry's PushWaker, which
 // sends asynchronously; with no waker set, push is off and the wake is
 // logged and dropped.
@@ -191,6 +207,19 @@ func StartBinaryForwarder(
 			logger.Warn("binary_forwarder_unknown_conn_id",
 				"server_id", serverID,
 				"conn_id", env.ConnID)
+			continue
+		}
+
+		// Queued delivery (#113): the phone's own writer sends the frame
+		// and applies any close directive in order, so this loop never
+		// waits on a phone socket.
+		if q, ok := phone.(phoneQueue); ok {
+			if err := q.Enqueue(env.Frame, env.CloseCode); err != nil {
+				logger.Info("binary_forwarder_phone_enqueue_failed",
+					"server_id", serverID,
+					"conn_id", env.ConnID,
+					"err", err)
+			}
 			continue
 		}
 
