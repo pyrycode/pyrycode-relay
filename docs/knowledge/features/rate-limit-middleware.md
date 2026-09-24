@@ -112,7 +112,7 @@ The middleware is stateless aside from the shared `*IPRateLimiter`. Concurrency 
 
 ## Out of scope
 
-- **Connection-count cap** (per-IP and global): different threat surface — this ticket caps *attempt rate*, not *resident connection count*. Stays in `docs/threat-model.md` § *Future hardening*.
+- **Connection-count cap** (per-IP and global): different threat surface — this ticket caps *attempt rate*, not *resident connection count*. The global cap shipped in [#114](../codebase/114.md) — see [Global connection cap](connection-cap.md). The per-IP concurrency cap is still deferred (`docs/security-followups.md`).
 - **CIDR-aware trusted-proxy chain**: today's flag is flat all-or-nothing (#51's design choice).
 - **Multi-instance shared-state rate limiting**: v1 is single-instance; multi-instance would need Redis or equivalent.
 - **Rate-limit metrics counter**: a future ticket, parallel to #58's frame-forward / grace-expiry counters.

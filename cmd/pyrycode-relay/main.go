@@ -39,6 +39,26 @@ const drainDeadline = 10 * time.Second
 // docs/specs/architecture/110-proxy-protocol-https-listener.md.
 const proxyHeaderTimeout = 5 * time.Second
 
+// defaultMaxConnections: global cap on live /v1/server + /v1/client
+// connections, sized for the 256 MB Fly machine. Derivation, charging
+// every connection at the phone worst case (a binary has no outbox):
+//
+//   - handler, heartbeat and phone-outbox goroutines: 3 stacks, ~8 KiB
+//     each once grown ≈ 24 KiB;
+//   - websocket, bufio and TLS record buffers ≈ 64 KiB;
+//   - phoneOutboxDepth × maxFrameBytes = 16 × 256 KiB = 4 MiB of queued
+//     frames, reachable by anyone who owns both a binary and a
+//     non-reading phone;
+//   - one maxFrameBytes frame in flight on the read side = 256 KiB.
+//
+// ≈ 4.4 MiB per connection. Reserving ~56 MiB for the binary, Go runtime,
+// autocert and kernel socket buffers leaves ~200 MiB; with no GOMEMLIMIT
+// set, GOGC=100 lets the heap reach ~2× live before collecting, so
+// ~100 MiB of live connection state ≈ 22 connections, rounded down to 20.
+// Raise it with --max-connections on a bigger machine. See
+// docs/specs/architecture/114-global-connection-cap.md.
+const defaultMaxConnections = 20
+
 // Version is overridden at build time via -ldflags.
 var Version = "dev"
 
@@ -80,6 +100,9 @@ func run(args []string, sigCtx context.Context) int {
 				"--https-listen connection and use its source address as the client IP. "+
 				"Pair with Fly's proxy_proto handler on the 443 service; with this set, "+
 				"any connection without a valid header is closed unserved.")
+		maxConnections = fs.Int("max-connections", defaultMaxConnections,
+			"Global cap on live WebSocket connections across /v1/server and /v1/client. "+
+				"Upgrades beyond it get HTTP 503 before the handshake. Must be positive.")
 		showVersion = fs.Bool("version", false, "Print version and exit.")
 	)
 	_ = fs.Parse(args)
@@ -112,6 +135,15 @@ func run(args []string, sigCtx context.Context) int {
 			"fix", "use --insecure-listen alone (proxy-fronted plaintext mode), "+
 				"OR use --domain with optional --http-listen / --https-listen (autocert mode); "+
 				"the new flags configure the autocert listeners and have no effect in insecure mode")
+		return 2
+	}
+
+	connCap, err := relay.NewConnCap(*maxConnections, logger)
+	if err != nil {
+		logger.Error("refusing to start: invalid --max-connections",
+			"err", err,
+			"value", *maxConnections,
+			"fix", "pass a positive connection count, or omit the flag for the default")
 		return 2
 	}
 
@@ -249,10 +281,13 @@ func run(args []string, sigCtx context.Context) int {
 	// middleware so it observes the middleware's HTTP 429 (the only
 	// HTTP-429 source in either pipe — header-gate writes 400, success
 	// is 101, WS application close codes travel inside the upgrade).
-	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))
+	// connCap sits INSIDE the rate limiter: a rate-limited attempt never
+	// takes a slot, and its 503 never reaches the 429 observers. One
+	// connCap wraps both endpoints so binaries and phones share the cap.
+	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(connCap.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics)))))
 	// maxPhones=16 caps phones per server-id; over-cap registrations are
 	// rejected with WS close 4429. Per #30 architect spec.
-	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))
+	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(connCap.Wrap(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics)))))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)
