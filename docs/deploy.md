@@ -93,6 +93,20 @@ re-cutover, porting to a new app) doesn't trip them again.
    override on any nonroot substrate. The full rationale, mutex with
    `--insecure-listen`, and listener-allowlist interaction live in
    [`docs/specs/architecture/96-autocert-configurable-listener-addrs.md`](specs/architecture/96-autocert-configurable-listener-addrs.md).
+4. **`proxy_proto` on the `443` port and `--https-proxy-protocol` must
+   move together — in both directions.** The `443` `[[services.ports]]`
+   block carries `handlers = ["proxy_proto"]` /
+   `proxy_proto_options = { version = "v2" }`, and `[processes] app`
+   carries `--https-proxy-protocol`. If only one changes, `443` fails
+   **closed**: handler on / flag off feeds the PROXY header to the TLS
+   handshake as garbage; flag on / handler off means every connection
+   lacks a header the listener now requires, so every connection is
+   refused. Editing either side of this pairing (including a rollback,
+   see below) means editing both in the same deploy. See
+   [PROXY protocol listener](knowledge/features/proxy-protocol-listener.md)
+   ([#110](knowledge/codebase/110.md)) for why the relay needs this at
+   all — Fly's TCP passthrough hands the relay its own edge-proxy address
+   as the socket peer, not the client's.
 
 ## Steady-state flow
 
@@ -183,3 +197,13 @@ operator-direct, there is no auto-deploy that would re-roll a broken
 release forward — but the next manual `flyctl deploy --remote-only`
 WILL rebuild from `main`'s current HEAD. Revert the offending PR on
 `main` before the next deploy, or you'll re-ship the bad change.
+
+Both rollback paths redeploy the image only — they do **not** touch the
+checked-in `fly.toml`. A rollback to a pre-#110 image while the manifest
+still carries `handlers = ["proxy_proto"]` on `443` fails `443` closed (the
+older binary has no `--https-proxy-protocol` flag and never opens the
+proxyproto-wrapped listener, so the PROXY header hits its TLS handshake as
+garbage). Rolling back across the #110 boundary means also reverting
+`fly.toml`'s `443` port block and `[processes] app` line to their pre-#110
+state, then deploying that combination — see the *fly.toml gotchas* item
+above.
