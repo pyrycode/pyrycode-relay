@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/coder/websocket v1.8.14
+	github.com/pires/go-proxyproto v0.15.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.66.1

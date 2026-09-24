@@ -115,3 +115,7 @@ Existing tests unchanged (AC3 flag-off).
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-09-24
+
+## Revisions
+
+- 2026-09-24 (implementation): Open question on `proxy_proto_options = { version = "v2" }` — kept as written; `fly.toml` parses as valid TOML with the expected shape, but Fly's acceptance of the key is only provable at `flyctl deploy`, so it is named as an operator follow-up in the PR. No design change.

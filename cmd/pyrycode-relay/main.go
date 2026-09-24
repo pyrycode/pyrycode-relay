@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,14 @@ import (
 // a fly machine update indefinitely. Lives at the wiring site per the
 // established policy-values-in-main convention (#21, #60).
 const drainDeadline = 10 * time.Second
+
+// proxyHeaderTimeout bounds how long an accepted HTTPS connection may take
+// to deliver its PROXY protocol header under --https-proxy-protocol. Fly's
+// edge writes the header as soon as it opens the connection, so a real
+// header never approaches this; it matches the listeners' 5s
+// ReadHeaderTimeout. See
+// docs/specs/architecture/110-proxy-protocol-https-listener.md.
+const proxyHeaderTimeout = 5 * time.Second
 
 // Version is overridden at build time via -ldflags.
 var Version = "dev"
@@ -66,6 +75,11 @@ func run(args []string, sigCtx context.Context) int {
 			"Trust the X-Forwarded-For header as the source IP for per-IP rate limiting. "+
 				"WARNING: enabling this without a trusted reverse proxy in front of the relay "+
 				"allows clients to spoof their source IP and bypass per-IP rate limits.")
+		httpsProxyProtocol = fs.Bool("https-proxy-protocol", false,
+			"Require a PROXY protocol v2 header before the TLS handshake on every "+
+				"--https-listen connection and use its source address as the client IP. "+
+				"Pair with Fly's proxy_proto handler on the 443 service; with this set, "+
+				"any connection without a valid header is closed unserved.")
 		showVersion = fs.Bool("version", false, "Print version and exit.")
 	)
 	_ = fs.Parse(args)
@@ -84,7 +98,8 @@ func run(args []string, sigCtx context.Context) int {
 	}
 
 	// --insecure-listen short-circuits the autocert branch entirely, so
-	// --http-listen / --https-listen would silently no-op alongside it.
+	// --http-listen / --https-listen / --https-proxy-protocol would silently
+	// no-op alongside it.
 	// fs.Visit walks only flags set explicitly on argv: an operator who
 	// passes --http-listen=:80 (the default) alongside --insecure-listen
 	// is still confused and deserves the fast-fail. See
@@ -92,8 +107,8 @@ func run(args []string, sigCtx context.Context) int {
 	// § Mutual-exclusion guard.
 	setFlags := make(map[string]bool)
 	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
-	if *insecureListen != "" && (setFlags["http-listen"] || setFlags["https-listen"]) {
-		logger.Error("refusing to start: --insecure-listen is mutually exclusive with --http-listen / --https-listen",
+	if *insecureListen != "" && (setFlags["http-listen"] || setFlags["https-listen"] || setFlags["https-proxy-protocol"]) {
+		logger.Error("refusing to start: --insecure-listen is mutually exclusive with --http-listen / --https-listen / --https-proxy-protocol",
 			"fix", "use --insecure-listen alone (proxy-fronted plaintext mode), "+
 				"OR use --domain with optional --http-listen / --https-listen (autocert mode); "+
 				"the new flags configure the autocert listeners and have no effect in insecure mode")
@@ -342,7 +357,8 @@ func run(args []string, sigCtx context.Context) int {
 	}
 
 	logger.Info("starting", "version", Version, "mode", "autocert",
-		"domain", *domain, "cert_cache", *certCache)
+		"domain", *domain, "cert_cache", *certCache,
+		"https_proxy_protocol", *httpsProxyProtocol)
 
 	servers := []*http.Server{httpsSrv, httpSrv}
 	if metricsSrv != nil {
@@ -351,7 +367,21 @@ func run(args []string, sigCtx context.Context) int {
 	}
 	return runServers(sigCtx, logger, reg, servers, func(s *http.Server) error {
 		if s == httpsSrv {
-			return s.ListenAndServeTLS("", "")
+			if !*httpsProxyProtocol {
+				return s.ListenAndServeTLS("", "")
+			}
+			// The PROXY header precedes the TLS ClientHello, so the wrapper
+			// sits under ServeTLS's tls.NewListener rather than on top.
+			ln, err := net.Listen("tcp", s.Addr)
+			if err != nil {
+				return err
+			}
+			pln, err := relay.NewProxyProtoListener(ln, proxyHeaderTimeout)
+			if err != nil {
+				ln.Close()
+				return err
+			}
+			return s.ServeTLS(pln, "", "")
 		}
 		return s.ListenAndServe()
 	})
