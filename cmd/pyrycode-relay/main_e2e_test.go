@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +171,15 @@ func TestRun_InsecureMutexWithAutocertListenFlags(t *testing.T) {
 			wantCode: 2,
 		},
 		{
+			name: "insecure+https-proxy-protocol",
+			args: []string{
+				"--insecure-listen", ":8080",
+				"--https-proxy-protocol",
+				"--metrics-listen", "",
+			},
+			wantCode: 2,
+		},
+		{
 			name: "insecure-alone-control",
 			args: []string{
 				"--insecure-listen", controlAddr,
@@ -203,6 +214,85 @@ func TestRun_InsecureMutexWithAutocertListenFlags(t *testing.T) {
 			got := run(tc.args, context.Background())
 			if got != tc.wantCode {
 				t.Errorf("run exit code: got %d, want %d", got, tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestRun_HTTPSProxyProtocolWiring boots run in autocert mode and writes a
+// plain HTTP request to the HTTPS port. Without --https-proxy-protocol,
+// Go's TLS server answers it with its "HTTP request to an HTTPS server"
+// 400 (the listener is unchanged); with the flag, the bytes are not a
+// PROXY header, so the connection is closed with nothing written. Neither
+// path reaches a TLS handshake, so autocert never contacts an ACME server.
+func TestRun_HTTPSProxyProtocolWiring(t *testing.T) {
+	cases := []struct {
+		name       string
+		flag       bool
+		wantPrefix string
+	}{
+		{name: "flag-off", flag: false, wantPrefix: "HTTP/1.0 400"},
+		{name: "flag-on", flag: true, wantPrefix: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			httpsAddr, err := freePort()
+			if err != nil {
+				t.Fatalf("freePort: %v", err)
+			}
+			httpAddr, err := freePort()
+			if err != nil {
+				t.Fatalf("freePort: %v", err)
+			}
+			args := []string{
+				"--domain", "relay.invalid",
+				"--cert-cache", t.TempDir() + "/certs",
+				"--https-listen", httpsAddr,
+				"--http-listen", httpAddr,
+				"--metrics-listen", "",
+			}
+			if tc.flag {
+				args = append(args, "--https-proxy-protocol")
+			}
+
+			sigCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			exit := make(chan int, 1)
+			go func() { exit <- run(args, sigCtx) }()
+			if err := waitForDial(httpsAddr, 3*time.Second); err != nil {
+				t.Fatalf("relay did not accept connections: %v", err)
+			}
+
+			conn, err := net.Dial("tcp", httpsAddr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: relay.invalid\r\n\r\n"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			got, err := io.ReadAll(conn)
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				t.Fatalf("conn neither answered nor closed within the deadline (read %q)", got)
+			}
+			if tc.wantPrefix == "" {
+				if len(got) != 0 {
+					t.Fatalf("flag on: got %q, want connection closed with no bytes", got)
+				}
+			} else if !strings.HasPrefix(string(got), tc.wantPrefix) {
+				t.Fatalf("flag off: got %q, want prefix %q", got, tc.wantPrefix)
+			}
+
+			cancel()
+			select {
+			case code := <-exit:
+				if code != 0 {
+					t.Errorf("run exit code: got %d, want 0", code)
+				}
+			case <-time.After(drainDeadline + 2*time.Second):
+				t.Fatal("run did not return after shutdown")
 			}
 		})
 	}

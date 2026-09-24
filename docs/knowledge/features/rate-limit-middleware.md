@@ -56,6 +56,21 @@ A boolean CLI flag controls whether `X-Forwarded-For` is honoured. Default `fals
 
 The flag's value is captured at process start and threaded once into `NewRateLimitMiddleware`. No per-request mode-flipping.
 
+### Where `RemoteAddr` comes from in production
+
+`ClientIP` reads `r.RemoteAddr`, but on Fly's raw-TCP services the socket
+peer is Fly's edge proxy, not the client — `X-Forwarded-For` is not
+involved either way. Since [#110](../codebase/110.md), the production
+`443` port runs `--https-proxy-protocol`
+([feature doc](proxy-protocol-listener.md)): the autocert HTTPS listener
+requires and parses a PROXY protocol v2 header before the TLS handshake and
+rewrites `RemoteAddr` to the header's source address, so this middleware
+(unchanged) keys on the real client IP without ever reading a forwarding
+header. `--trust-x-forwarded-for` and `--https-proxy-protocol` are
+independent flags addressing different substrates — a deploy that trusts
+neither falls back to the raw socket peer, which is Fly's proxy address on
+Fly and the real peer on a directly-exposed host.
+
 ## Wiring
 
 `cmd/pyrycode-relay/main.go`:
@@ -108,5 +123,6 @@ The middleware is stateless aside from the shared `*IPRateLimiter`. Concurrency 
 - [Codebase: #47 wiring](../codebase/47.md) — implementation notes for this ticket.
 - [Codebase: #50 IP rate-limiter primitive](../codebase/50.md) — the limiter consumed here.
 - [Codebase: #51 client-IP extraction helper](../codebase/51.md) — the IP source consumed here.
+- [Feature: PROXY protocol v2 on the HTTPS listener](proxy-protocol-listener.md) / [Codebase: #110](../codebase/110.md) — the production source of the real client IP on Fly.
 - [Threat model § DoS resistance](../../threat-model.md) — the threat-model entry this ticket converts from future hardening to v1 mitigation.
 - [Log-key allowlist](../../../internal/relay/log_allowlist.go) — the closed set the deny log line conforms to.

@@ -35,7 +35,11 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   # 65532) and can't bind privileged ports < 1024. Fly's TCP passthrough
   # then forwards external 80/443 → internal 8080/8443 (see the matching
   # `internal_port` settings in the [[services]] blocks below).
-  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443"
+  #
+  # `--https-proxy-protocol` pairs with the `proxy_proto` handler on the
+  # 443 port below (#110): the relay reads Fly's PROXY v2 header before
+  # TLS so the per-IP rate limiter keys on the real client IP.
+  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443 --https-proxy-protocol"
 
 [[mounts]]
   source = "relay_autocert"
@@ -44,7 +48,8 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   # account-key + per-domain cert (≤ a few KiB). Resize is operator-side.
 
 # Raw TCP services. NO `handlers = ["http"]` / `handlers = ["tls"]` —
-# either would terminate at Fly's edge and break autocert.
+# either would terminate at Fly's edge and break autocert. The one
+# handler allowed is `proxy_proto` on 443 (see that port's comment).
 [[services]]
   processes = ["app"]
   protocol = "tcp"
@@ -69,9 +74,20 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 
   [[services.ports]]
     port = 443
-    # handlers omitted on purpose: any value here (e.g. ["tls"]) would
-    # terminate TLS at Fly's edge and require a Fly-managed cert,
-    # bypassing autocert.
+    # `proxy_proto` is the only handler allowed here: it prepends a PROXY
+    # protocol v2 header carrying the client's address and otherwise
+    # passes the TCP stream through, so TLS still terminates in the relay
+    # via autocert. Without it the relay sees only Fly's proxy address and
+    # every client shares one rate-limit bucket (#110). Any other handler
+    # (e.g. ["tls"]) would terminate TLS at Fly's edge and require a
+    # Fly-managed cert, bypassing autocert.
+    #
+    # This handler and `--https-proxy-protocol` in [processes] must deploy
+    # and roll back together: handler on / flag off feeds the header to TLS
+    # as garbage; flag on / handler off refuses every connection. Both
+    # mismatches fail closed on 443.
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v2" }
 
 [[vm]]
   size = "shared-cpu-1x"

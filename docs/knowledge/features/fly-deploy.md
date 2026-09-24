@@ -16,7 +16,7 @@ TLS terminates **in the relay** via autocert (#9, shipped). Fly is a raw-TCP sub
 
 - `[[services]]` blocks use `protocol = "tcp"` with no `handlers = ["http"]` / `handlers = ["tls"]`. An explicit handler list would either steal `:80` from autocert's HTTP-01 listener (breaks cert issuance) or terminate TLS at Fly's edge (bypasses autocert entirely and would force a Fly-managed cert).
 - A **dedicated IPv4** is required, not optional. Shared IPv4 + TCP passthrough is not a supported combination on Fly; Let's Encrypt's HTTP-01 challenge needs a deterministic resolution from `<domain>:80` to the running machine. `flyctl ips allocate-v4` is part of the bootstrap.
-- The real socket peer IP reaches the relay verbatim. #34's IP rate limiter reads the socket peer; the TCP-passthrough decision is what keeps that working without needing to trust an `X-Forwarded-For` / `Fly-Client-IP` header. Any future move to platform-terminated TLS would require a security-sensitive follow-up against #34.
+- The client's real IP reaches the relay's rate limiter, but not by default and not as the raw socket peer. On Fly's raw-TCP services the socket peer the relay sees is Fly's edge proxy, not the client — the real address travels only via the `proxy_proto` handler on the `443` port, which prepends a PROXY protocol v2 header. `--https-proxy-protocol` ([feature doc](proxy-protocol-listener.md), #110) makes the autocert HTTPS listener require and parse that header before the TLS handshake, so `RemoteAddr` — and therefore #34's `ClientIP` and the per-IP rate limiter — carry the real client address. TCP passthrough (as opposed to Fly-terminated TLS) is still what makes this possible at all: a `handlers = ["tls"]` or `["http"]` port would terminate at Fly's edge and there would be no relay-owned TLS handshake to attach the wrapper to. Any future move to platform-terminated TLS would require a security-sensitive follow-up against both #34 and #110.
 
 ADR-0002's `:80` 404 fallback (explicit failure on non-ACME `:80` requests, rather than a 302 → `:443`) means `:80` carries non-trivial application logic. The TCP-passthrough manifest preserves that — Fly inserts no MITM-shaped middleware.
 
@@ -105,5 +105,6 @@ A rollback does **not** revert the `main` commit. Because deploys are operator-d
 - [`docs/architecture.md` § Hosting](../../architecture.md#hosting) — the decision record.
 - [Feature: Docker image](docker-image.md) — the portable artifact this manifest wires.
 - [Feature: Autocert TLS](autocert-tls.md) — the in-binary TLS termination this substrate is shaped around.
+- [Feature: PROXY protocol v2 on the HTTPS listener](proxy-protocol-listener.md) — the `proxy_proto` handler on `443` and `--https-proxy-protocol`, so the rate limiter sees the real client IP through TCP passthrough.
 - [ADR-0002](../decisions/0002-autocert-explicit-failure-on-port-80.md) — the `:80` 404 fallback the TCP-passthrough services preserve.
 - [Threat model](../../threat-model.md) — § *Deploy security* (substrate shifts from VPS to Fly account; threat-model update flagged as follow-up).
