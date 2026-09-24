@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 
 	"github.com/coder/websocket"
@@ -25,7 +26,9 @@ import (
 // WebSocket upgrade endpoint. It validates required headers, upgrades the
 // connection, registers the phone in reg under the requested server-id, and
 // holds the connection open until the phone closes it (or the registry tears
-// it down on binary-grace expiry).
+// it down on binary-grace expiry). When the phone's connection ends on its
+// own, the binary still holding serverID gets a close notice naming the
+// phone's conn_id (#152); a close the binary asked for is not reported back.
 //
 // maxFrameBytes is the per-frame read cap threaded into NewWSConn; see
 // docs/specs/architecture/29-wsconn-read-limit.md for the derivation.
@@ -91,6 +94,10 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 			return
 		}
 
+		// The binary this phone was registered against: the only one that
+		// may hear about its close.
+		bin, _ := reg.BinaryFor(serverID)
+
 		metrics.ClientAccept()
 		logger.Info("phone_registered",
 			"server_id", serverID,
@@ -133,6 +140,44 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 		// disappears, or a Send to the binary fails. Replaces the old
 		// CloseRead+Done placeholder. Return value is observability-only;
 		// the forwarder logs the cause.
-		_ = StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)
+		fwdErr := StartPhoneForwarder(r.Context(), reg, serverID, wsconn, logger)
+
+		// Runs before the deferred unregister, on the goroutine that
+		// forwarded the phone's frames, so it reaches the binary after the
+		// phone's last frame.
+		if !phone.closedByBinary() {
+			notifyPhoneClosed(reg, serverID, bin, connID, phoneCloseCode(fwdErr), logger)
+		}
 	})
+}
+
+// phoneCloseCode is the close code a phone's connection ended with: its own
+// close status when it sent one, otherwise 1001 (going away).
+func phoneCloseCode(err error) uint16 {
+	code := websocket.CloseStatus(err)
+	if code <= 0 || code > math.MaxUint16 {
+		return uint16(websocket.StatusGoingAway)
+	}
+	return uint16(code)
+}
+
+// notifyPhoneClosed sends bin the close notice for connID when bin still
+// holds serverID. A released server-id has no binary to tell, and one a new
+// binary reclaimed is held by a binary that never saw this phone. A failed
+// send is logged; the daemon's idle sweep still reaps the session.
+func notifyPhoneClosed(reg *Registry, serverID string, bin Conn, connID string, code uint16, logger *slog.Logger) {
+	if cur, ok := reg.BinaryFor(serverID); !ok || cur != bin {
+		return
+	}
+	notice, err := marshalCloseNotice(connID, code)
+	if err == nil {
+		err = bin.Send(notice)
+	}
+	if err != nil {
+		logger.Info("phone_close_notice_send_failed",
+			"server_id", serverID,
+			"conn_id", connID,
+			"close_code", code,
+			"err", err)
+	}
 }

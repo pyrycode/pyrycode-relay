@@ -65,3 +65,7 @@ In `client_endpoint_test.go`, with a `fakeBinary` claimed as the server's binary
 ## Documentation handoff
 
 Pending for the documentation stage: `docs/architecture.md` (phone lifecycle / routing envelope section) should note that the relay now sends the binary a `{conn_id, close_code}` notice when a phone's connection ends on its own. The protocol spec already documents the shape; no change there.
+
+## Revisions
+
+- **2026-09-24, Phase B — open question resolved, no design change.** No existing test counts binary frames after a phone ends; `go test -race` passes for `./internal/relay/...` and `./cmd/pyrycode-relay/...`, including `TestRun_ReclaimDuringGraceClosesPhoneWith4404`. The new tests wait for the handler's `phone_unregistered` log line (via `captureLogger`) rather than for the registry to drop the phone. That line is the last step of teardown, whereas a reclaim evicts the phone from the registry before its handler has run.

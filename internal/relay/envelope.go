@@ -109,6 +109,25 @@ func Marshal(connID string, frame []byte) ([]byte, error) {
 	return out, nil
 }
 
+// marshalCloseNotice builds the relay→binary close notice: {conn_id,
+// close_code} with no frame key, telling the binary a phone's own
+// connection ended (docs/protocol-mobile.md § Routing envelope). Envelope
+// is not reused because its frame field has no omitempty and would emit
+// "frame":null.
+func marshalCloseNotice(connID string, code uint16) ([]byte, error) {
+	if connID == "" {
+		return nil, ErrEmptyConnID
+	}
+	out, err := json.Marshal(struct {
+		ConnID    string `json:"conn_id"`
+		CloseCode uint16 `json:"close_code"`
+	}{connID, code})
+	if err != nil {
+		return nil, fmt.Errorf("relay: marshalling close notice: %w", err)
+	}
+	return out, nil
+}
+
 // Unmarshal parses a JSON-encoded routing envelope.
 //
 // It returns ErrMalformedEnvelope (wrapping the underlying decoder error)

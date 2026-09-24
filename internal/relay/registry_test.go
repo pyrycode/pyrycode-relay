@@ -26,8 +26,17 @@ type fakeConn struct {
 	closeCh chan struct{}
 }
 
-func (c *fakeConn) ConnID() string        { return c.id }
-func (c *fakeConn) Send(msg []byte) error { c.sent = append(c.sent, msg); return nil }
+func (c *fakeConn) ConnID() string { return c.id }
+
+// Send takes mu: phone handlers now send a close notice to the seeded
+// binary (#152), so phones closing together share this fake.
+func (c *fakeConn) Send(msg []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, msg)
+	return nil
+}
+
 func (c *fakeConn) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

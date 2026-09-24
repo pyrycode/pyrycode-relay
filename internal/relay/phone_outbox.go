@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coder/websocket"
 )
@@ -56,6 +57,10 @@ type phoneOutbox struct {
 	items    chan outboxItem
 	done     chan struct{}
 	doneOnce sync.Once
+
+	// closeRequested records that the binary sent this phone a close
+	// directive, so the handler does not report the close back (#152).
+	closeRequested atomic.Bool
 }
 
 // newPhoneOutbox wraps conn with a queue of depth items. onWritten, which
@@ -97,6 +102,9 @@ func (o *phoneOutbox) Enqueue(frame []byte, closeCode uint16) error {
 	case <-o.done:
 		return ErrPhoneOutboxClosed
 	default:
+	}
+	if closeCode != 0 {
+		o.closeRequested.Store(true)
 	}
 	select {
 	case o.items <- outboxItem{frame: frame, closeCode: closeCode}:
@@ -171,6 +179,11 @@ func (o *phoneOutbox) deliver(it outboxItem) bool {
 	}
 	return true
 }
+
+// closedByBinary reports whether the binary asked for this phone to be
+// closed: Enqueue accepted, or overflowed on, a close directive while the
+// outbox was live.
+func (o *phoneOutbox) closedByBinary() bool { return o.closeRequested.Load() }
 
 // stop releases run and makes later Enqueue calls fail. Idempotent. It
 // does not close the conn: the caller owns that.
