@@ -163,3 +163,44 @@ func TestErrInvalidConfigSentinel_IsBranchable(t *testing.T) {
 		t.Error("*ErrInvalidConfig should satisfy errors.As(_, &*ErrInvalidConfig)")
 	}
 }
+
+func TestCheckEnvConfig_FCMCredentialsValidKeyPasses(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{envFCMCredentials: string(testServiceAccountJSON(t, ""))}
+	if err := CheckEnvConfig(fakeLookup(env)); err != nil {
+		t.Errorf("CheckEnvConfig with a valid service-account key = %v, want nil", err)
+	}
+}
+
+func TestCheckEnvConfig_FCMCredentialsMalformedWithholdsValue(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"not JSON":   testFCMMarker + " {",
+		"wrong type": `{"type":"` + testFCMMarker + `","client_email":"a@b","private_key":"x"}`,
+		"empty":      "",
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := CheckEnvConfig(fakeLookup(map[string]string{envFCMCredentials: value}))
+			if !errors.Is(err, ErrInvalidConfigSentinel) {
+				t.Fatalf("err = %v, want ErrInvalidConfigSentinel", err)
+			}
+			var cfgErr *ErrInvalidConfig
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("err %v should satisfy errors.As(err, &*ErrInvalidConfig)", err)
+			}
+			if cfgErr.Key != envFCMCredentials {
+				t.Errorf("got Key=%q, want %q", cfgErr.Key, envFCMCredentials)
+			}
+			if !strings.HasPrefix(cfgErr.Reason, "malformed-value: ") {
+				t.Errorf("got Reason=%q, want prefix %q", cfgErr.Reason, "malformed-value: ")
+			}
+			if strings.Contains(err.Error(), testFCMMarker) || (value != "" && strings.Contains(err.Error(), value)) {
+				t.Errorf("error %q leaks the credential value", err)
+			}
+		})
+	}
+}
