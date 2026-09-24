@@ -65,3 +65,7 @@ Operator follow-up: reaches production only on the next manual `flyctl deploy`.
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-09-24
+
+## Revisions
+
+- 2026-09-24 (build): the tests shorten the deadline to 500 ms (`testReadTimeout`), not ~300 ms, so the two mid-stall pings in the fragmented test have margin under `-race`. The fragmented test relies on one detail the plan did not state: `coder/websocket` buffers non-final data frames and flushes them only on the next final or control frame, so the stalled fragment reaches the relay when the peer writes its first pong. The design itself is unchanged.

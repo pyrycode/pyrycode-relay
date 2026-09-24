@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 // past this deadline; Send returns the library's wrapped cancellation
 // error and the caller decides whether to drop the connection.
 const writeTimeout = 10 * time.Second
+
+// readMessageTimeout bounds receipt of one complete inbound message,
+// counted from the arrival of its first data-frame header. It never
+// bounds the idle gap before a message starts (the heartbeat covers idle
+// liveness), so a peer may sit silent for as long as it likes but cannot
+// hold a read open by dribbling a started message. 30s over the 256 KiB
+// read cap is a floor of ~8.7 KB/s for a max-size message.
+const readMessageTimeout = 30 * time.Second
 
 // WSConn adapts a *websocket.Conn from github.com/coder/websocket to the
 // registry's Conn interface. It owns the per-connection write mutex
@@ -25,6 +34,10 @@ const writeTimeout = 10 * time.Second
 type WSConn struct {
 	conn   *websocket.Conn
 	connID string
+
+	// readTimeout is readMessageTimeout outside tests, which shorten it
+	// on a single connection; never written after construction otherwise.
+	readTimeout time.Duration
 
 	writeMu sync.Mutex
 
@@ -54,10 +67,11 @@ func NewWSConn(c *websocket.Conn, connID string, maxFrameBytes int64) *WSConn {
 	c.SetReadLimit(maxFrameBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &WSConn{
-		conn:     c,
-		connID:   connID,
-		closeCtx: ctx,
-		cancel:   cancel,
+		conn:        c,
+		connID:      connID,
+		readTimeout: readMessageTimeout,
+		closeCtx:    ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -86,14 +100,28 @@ func (w *WSConn) Send(msg []byte) error {
 
 // Read returns the next inbound message as opaque bytes. ctx bounds the
 // wait; cancellation aborts the read with the library's wrapped error.
-// The message type (binary vs text) is discarded — the relay treats
-// inner frames as opaque bytes. Concurrent Read callers are NOT
-// supported; the per-WSConn forwarder goroutine is the sole reader.
-// After Close, an in-flight Read returns with the library's close
-// error from the underlying *websocket.Conn.
+// Once the message's first data-frame header arrives, the rest of the
+// message (payload and any continuation frames) must arrive within
+// readTimeout; otherwise the library closes the connection and Read
+// returns a non-nil error. The idle wait before a message starts is
+// bounded by ctx alone. The message type (binary vs text) is discarded
+// — the relay treats inner frames as opaque bytes. Concurrent Read
+// callers are NOT supported; the per-WSConn forwarder goroutine is the
+// sole reader. After Close, an in-flight Read returns with the
+// library's close error from the underlying *websocket.Conn.
 func (w *WSConn) Read(ctx context.Context) ([]byte, error) {
-	_, data, err := w.conn.Read(ctx)
-	return data, err
+	// The library binds the whole message read to the context passed to
+	// Reader, so the deadline is a timer that cancels it, armed once
+	// Reader returns (the pattern its Reader doc comment prescribes).
+	msgCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, r, err := w.conn.Reader(msgCtx)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.AfterFunc(w.readTimeout, cancel)
+	defer deadline.Stop()
+	return io.ReadAll(r)
 }
 
 // Close cancels in-flight writes and closes the WebSocket with
