@@ -185,6 +185,21 @@ func run(args []string, sigCtx context.Context) int {
 	startedAt := time.Now()
 	reg := relay.NewRegistry()
 
+	// Push is optional: unset PYRYCODE_RELAY_FCM_CREDENTIALS means the relay
+	// drops every push_wake. CheckEnvConfig has already rejected an unusable
+	// value, so an error here is unexpected and fails loud.
+	pushWaker, err := relay.NewPushWakerFromEnv(os.LookupEnv, logger)
+	if err != nil {
+		logger.Error("refusing to start: cannot build the FCM push sender", "err", err)
+		return 2
+	}
+	if pushWaker == nil {
+		logger.Info("push off: PYRYCODE_RELAY_FCM_CREDENTIALS unset")
+	} else {
+		reg.SetPushWaker(pushWaker)
+		defer pushWaker.Close()
+	}
+
 	metricsReg := relay.NewMetricsRegistry()
 	relay.NewConnectionsMetrics(metricsReg, reg)
 	relay.NewForwardMetrics(metricsReg, reg)

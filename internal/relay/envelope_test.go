@@ -148,3 +148,54 @@ func TestUnmarshal_CloseDirective(t *testing.T) {
 		}
 	})
 }
+
+// TestUnmarshal_PushWake covers the relay-addressed wake shape: no conn_id,
+// no frame, a present push_wake. conn_id envelopes decode exactly as before,
+// whatever push_wake they carry.
+func TestUnmarshal_PushWake(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wake envelope is valid", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"push_wake":{"platform":"fcm","token":"t"}}`))
+		if err != nil {
+			t.Fatalf("Unmarshal: unexpected err %v", err)
+		}
+		if env.ConnID != "" || !bytes.Equal(env.PushWake, []byte(`{"platform":"fcm","token":"t"}`)) {
+			t.Fatalf("Unmarshal: got %+v", env)
+		}
+	})
+
+	t.Run("malformed wake object still reaches the waker", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"push_wake":5}`))
+		if err != nil || string(env.PushWake) != "5" {
+			t.Fatalf("Unmarshal: got (%+v, %v)", env, err)
+		}
+	})
+
+	for _, in := range []string{`{}`, `{"push_wake":null}`, `{"conn_id":"","push_wake":null,"frame":{}}`} {
+		if _, err := Unmarshal([]byte(in)); !errors.Is(err, ErrMissingConnID) {
+			t.Errorf("Unmarshal(%s): err=%v, want ErrMissingConnID", in, err)
+		}
+	}
+
+	t.Run("conn_id envelope ignores push_wake", func(t *testing.T) {
+		t.Parallel()
+		env, err := Unmarshal([]byte(`{"conn_id":"c-1","frame":{"a":1},"push_wake":"garbage"}`))
+		if err != nil || env.ConnID != "c-1" || !hasFrame(env.Frame) {
+			t.Fatalf("Unmarshal: got (%+v, %v)", env, err)
+		}
+		if _, err := Unmarshal([]byte(`{"conn_id":"c-1","push_wake":{"platform":"fcm","token":"t"}}`)); !errors.Is(err, ErrMissingFrame) {
+			t.Fatalf("conn_id + push_wake, no frame: err=%v, want ErrMissingFrame", err)
+		}
+	})
+
+	t.Run("marshal output unchanged", func(t *testing.T) {
+		t.Parallel()
+		out, err := Marshal("c-1", []byte(`{}`))
+		if err != nil || bytes.Contains(out, []byte("push_wake")) {
+			t.Fatalf("Marshal: got (%s, %v)", out, err)
+		}
+	})
+}
