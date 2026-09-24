@@ -48,3 +48,7 @@ None. #113 already updated `conflictProbeTimeout`'s comment, `docs/threat-model.
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-09-24
+
+## Revisions
+
+- 2026-09-24, Phase B: the "can it fail" check became a mutation run instead of the counter-only check in the Testing strategy. With `phoneOutbox.Enqueue` temporarily writing data frames synchronously (the pre-#113 forwarder), the test fails: the duplicate claim takes the slot and never reads 4409. Mutating `phoneOutbox.Send` instead proves nothing, because `StartBinaryForwarder` reaches the outbox through `Enqueue`. The mutation was reverted; no production file changed.
