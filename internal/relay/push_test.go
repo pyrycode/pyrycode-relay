@@ -236,6 +236,59 @@ func TestFCMSender_NonSuccessReplyNamesOnlyStatus(t *testing.T) {
 	}
 }
 
+// fcmErrorBody is a FCM HTTP v1 error reply whose free-text message echoes
+// the marker and the device token.
+func fcmErrorBody(status, detailType, errorCode string) string {
+	return `{"error":{"code":404,"message":"` + testFCMMarker + ` ` + testFCMDeviceToken + `","status":"` + status +
+		`","details":[{"@type":"` + detailType + `","errorCode":"` + errorCode + `"}]}}`
+}
+
+func TestFCMSender_NonSuccessReplyNamesFCMReason(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"standard error body", http.StatusNotFound, fcmErrorBody("NOT_FOUND", fcmErrorType, "UNREGISTERED"), "status 404 (NOT_FOUND, UNREGISTERED)"},
+		{"status only", http.StatusBadRequest, `{"error":{"code":400,"message":"` + testFCMMarker + `","status":"INVALID_ARGUMENT"}}`, "status 400 (INVALID_ARGUMENT)"},
+		{"errorCode only", http.StatusForbidden, `{"error":{"details":[{"@type":"` + fcmErrorType + `","errorCode":"SENDER_ID_MISMATCH"}]}}`, "status 403 (SENDER_ID_MISMATCH)"},
+		{"empty body", http.StatusNotFound, "", "status 404"},
+		{"not JSON", http.StatusNotFound, testFCMMarker + " " + testFCMDeviceToken, "status 404"},
+		{"JSON without the fields", http.StatusNotFound, `{"error":{"code":404,"message":"` + testFCMMarker + `"}}`, "status 404"},
+		{"errorCode under another type", http.StatusNotFound, fcmErrorBody("", "type.googleapis.com/google.rpc.BadRequest", "UNREGISTERED"), "status 404"},
+		{"non-enum values", http.StatusNotFound, fcmErrorBody(testFCMMarker, fcmErrorType, testFCMDeviceToken), "status 404"},
+		{"over-long enum", http.StatusNotFound, fcmErrorBody(strings.Repeat("A", 65), fcmErrorType, "UNREGISTERED"), "status 404 (UNREGISTERED)"},
+		{"truncated past the drain cap", http.StatusNotFound, `{"error":{"status":"NOT_FOUND","message":"` + strings.Repeat("x", fcmMaxDrainBytes) + `"}}`, "status 404"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			oauth, _ := fakeOAuth(t, 0)
+			fcm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(fcm.Close)
+
+			s, err := newFCMSender(testServiceAccountJSON(t, oauth.URL), fcm.URL)
+			if err != nil {
+				t.Fatalf("newFCMSender: %v", err)
+			}
+			err = s.Send(context.Background(), testFCMDeviceToken)
+			if !errors.Is(err, ErrFCMSend) {
+				t.Fatalf("Send err = %v, want ErrFCMSend", err)
+			}
+			if want := ErrFCMSend.Error() + ": " + tc.want; err.Error() != want {
+				t.Errorf("error = %q, want %q", err, want)
+			}
+			assertNoSecrets(t, err.Error())
+		})
+	}
+}
+
 func TestFCMSender_TokenFetchFailureCarriesNoBody(t *testing.T) {
 	t.Parallel()
 	oauth, _ := fakeOAuth(t, http.StatusBadRequest)

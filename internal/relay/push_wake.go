@@ -136,7 +136,8 @@ func (w *PushWaker) send(serverID, token string) {
 	defer w.wg.Done()
 	defer func() { <-w.slots }()
 	if err := w.sender.Send(w.ctx, token); err != nil {
-		// FCMSender's errors carry at most an HTTP status, never the token.
+		// FCMSender's errors carry at most an HTTP status and FCM's enum
+		// reason codes, never the token or free text.
 		w.logger.Warn("push_wake_send_failed",
 			"server_id", serverID,
 			"err", err)

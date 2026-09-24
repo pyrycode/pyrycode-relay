@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -34,7 +35,7 @@ const (
 	// fcmSendTimeout bounds each HTTP call a send makes: the access-token
 	// fetch and the FCM POST.
 	fcmSendTimeout = 10 * time.Second
-	// fcmMaxDrainBytes caps how much of an FCM reply is drained before close.
+	// fcmMaxDrainBytes caps how much of an FCM reply is read before close.
 	fcmMaxDrainBytes = 4 << 10
 )
 
@@ -46,7 +47,8 @@ var (
 	// It carries at most the token endpoint's HTTP status, never its body.
 	ErrFCMTokenFetch = errors.New("relay: fcm access-token fetch failed")
 	// ErrFCMSend is returned when the FCM request fails in transport or
-	// with a non-2xx reply. It carries at most the HTTP status, never a body.
+	// with a non-2xx reply. It carries at most the HTTP status and FCM's
+	// enum-shaped error.status and errorCode, never other reply text.
 	ErrFCMSend = errors.New("relay: fcm send failed")
 )
 
@@ -148,7 +150,8 @@ type fcmAndroid struct {
 }
 
 // Send wakes the device holding deviceToken. Returned errors never contain
-// the device token, the access token, the credentials or a reply body.
+// the device token, the access token, the credentials or reply text beyond
+// FCM's enum reason codes.
 func (s *FCMSender) Send(ctx context.Context, deviceToken string) error {
 	tok, err := s.tokens.Token()
 	if err != nil {
@@ -185,10 +188,63 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) error {
 		return fmt.Errorf("%w: %w", ErrFCMSend, err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, fcmMaxDrainBytes))
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if reason := fcmErrorReason(reply); reason != "" {
+			return fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
+		}
 		return fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
 	}
 	return nil
+}
+
+// fcmErrorType is the @type of the error detail that carries FCM's errorCode.
+const fcmErrorType = "type.googleapis.com/google.firebase.fcm.v1.FcmError"
+
+// fcmErrorReply declares only FCM's two enum fields. error.message is left
+// out on purpose: it is free text and can echo request data.
+type fcmErrorReply struct {
+	Error struct {
+		Status  string `json:"status"`
+		Details []struct {
+			Type      string `json:"@type"`
+			ErrorCode string `json:"errorCode"`
+		} `json:"details"`
+	} `json:"error"`
+}
+
+// fcmErrorReason returns FCM's error.status and FcmError errorCode from a
+// non-2xx reply, comma-joined, or "" when the reply carries neither. Values
+// that are not enum-shaped are dropped, so no free text reaches the error.
+func fcmErrorReason(reply []byte) string {
+	var r fcmErrorReply
+	if json.Unmarshal(reply, &r) != nil {
+		return ""
+	}
+	var parts []string
+	if isFCMEnum(r.Error.Status) {
+		parts = append(parts, r.Error.Status)
+	}
+	for _, d := range r.Error.Details {
+		if d.Type == fcmErrorType && isFCMEnum(d.ErrorCode) {
+			parts = append(parts, d.ErrorCode)
+			break
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// isFCMEnum reports whether s is 1-64 bytes of [A-Z0-9_].
+func isFCMEnum(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
 }
