@@ -111,6 +111,7 @@ The duration `d` is fully trusted — degenerate values (`d <= 0` fires immediat
 - `PhonesFor` returns nil for unknown server-ids or empty slices — callers don't have to distinguish "unknown" from "known with zero phones."
 - `PhonesFor` returns a copy: mutating the returned slice cannot affect registry state.
 - `Counts` is internally consistent for one call (read under RLock); two concurrent calls may observe different values.
+- `Counts`'s `binaries` excludes a server-id in its grace window (a pending `ScheduleReleaseServer` timer) — it still holds its slot for `BinaryFor`/`Snapshot`/routing, but it is not counted as connected. Its phones are still counted; they stay connected through the binary's grace window. A timer armed for an id no binary holds does not lower the count. Reclaim (`ClaimServer` during grace) or takeover (`TakeoverServer`) deletes the timer as part of the same locked swap, so the new binary counts again immediately (#115).
 
 ## What the registry deliberately does NOT do
 
@@ -170,6 +171,7 @@ go test -race -count=20 -run TestRegistry_RaceFreedom ./internal/relay
 
 ## Related
 
+- [Connection-count gauges](connection-count-gauges.md) — `pyrycode_relay_connected_binaries` reads `Counts()` directly, so the grace-window exclusion (#115) applies to the gauge with no code of its own.
 - [ADR-0003: Connection registry as a passive store](../decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, the orphan-phones invariant.
 - [ADR-0006: Grace window IS the reclaim path](../decisions/0006-grace-period-as-reclaim-path.md) — why a `ClaimServer` during grace succeeds rather than conflicts; the pointer-identity stale-fire defence; amended for probe-driven takeover (#112).
 - [`/v1/server`](server-endpoint.md) — the sole caller of `TakeoverServer` and `ScheduleReleaseServerIfHeld`; owns the liveness probe and the incumbent's close code.

@@ -2,10 +2,14 @@
 
 Two Prometheus gauges expose the relay's live connection counts, the same numbers `/healthz` returns as a one-shot snapshot, but as a time series an operator can graph and alert on:
 
-- `pyrycode_relay_connected_binaries` — number of pyrycode binary connections currently held by the registry.
-- `pyrycode_relay_connected_phones` — number of mobile-client connections currently held, summed across all server-ids.
+- `pyrycode_relay_connected_binaries` — number of pyrycode binary connections currently held by the registry. Excludes a binary in its grace window (disconnected, pending reclaim) — see below (#115).
+- `pyrycode_relay_connected_phones` — number of mobile-client connections currently held, summed across all server-ids. Includes phones whose binary is in its grace window; they stay connected through it.
 
 Both are scalar gauges with no labels. Values are non-negative integers.
+
+## Grace-window exclusion (#115)
+
+Both gauges read `Registry.Counts()` verbatim (see [Connection registry § Invariants](connection-registry.md)), so `Counts()`'s definition of "connected" is the gauges' definition, with no code of the gauges' own. A binary that has disconnected keeps its registry entry — and would otherwise keep being counted — until its grace timer fires or it reclaims the slot; `Counts()` now excludes a server-id with a pending grace timer from `binaries`, so the gauge (and `/healthz`'s `connected_binaries`, which reads the same call) reflects live daemon connections rather than live-plus-gracing ones. A reclaim or takeover during the grace window counts the binary again immediately, since both delete the timer as part of the same locked swap that installs the new binary.
 
 ## API
 
