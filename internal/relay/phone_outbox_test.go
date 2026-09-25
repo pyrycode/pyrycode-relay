@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,10 @@ func newStallPhone(id string) *stallPhone {
 func (p *stallPhone) ConnID() string { return p.id }
 
 func (p *stallPhone) Send(msg []byte) error {
-	p.entered <- struct{}{}
+	select {
+	case p.entered <- struct{}{}:
+	default: // a long burst outruns the buffer; waiters need only one signal
+	}
 	select {
 	case <-p.release:
 		p.record("send:" + string(msg))
@@ -93,9 +97,9 @@ func (p *stallPhone) waitClosed(t *testing.T) {
 // startOutbox wraps conn in a phoneOutbox and runs its drain loop the way
 // ClientHandler does. The returned channel closes when run returns. Cleanup
 // mirrors the handler's teardown: close the conn, stop, wait for run.
-func startOutbox(t *testing.T, conn Conn, depth int, onWritten func()) (*phoneOutbox, <-chan struct{}) {
+func startOutbox(t *testing.T, conn Conn, budget int, onWritten func()) (*phoneOutbox, <-chan struct{}) {
 	t.Helper()
-	o := newPhoneOutbox(conn, "s1", depth, onWritten, discardLogger())
+	o := newPhoneOutbox(conn, "s1", budget, onWritten, discardLogger())
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
@@ -127,8 +131,8 @@ func TestStartBinaryForwarder_StalledPhone_DoesNotBlockOthers(t *testing.T) {
 	claimAndRegister(t, reg, "s1")
 	stalled := newStallPhone("client-s1-stalled0")
 	healthy := newFakePhone("client-s1-healthy0")
-	stalledBox, _ := startOutbox(t, stalled, phoneOutboxDepth, nil)
-	healthyBox, _ := startOutbox(t, healthy, phoneOutboxDepth, nil)
+	stalledBox, _ := startOutbox(t, stalled, phoneOutboxBudget, nil)
+	healthyBox, _ := startOutbox(t, healthy, phoneOutboxBudget, nil)
 	for _, c := range []Conn{stalledBox, healthyBox} {
 		if err := reg.RegisterPhone("s1", c); err != nil {
 			t.Fatalf("RegisterPhone: %v", err)
@@ -168,7 +172,7 @@ func TestStartBinaryForwarder_CloseDirective_WaitsForEarlierFrames(t *testing.T)
 	reg := NewRegistry()
 	claimAndRegister(t, reg, "s1")
 	phone := newStallPhone("client-s1-ordered0")
-	box, exited := startOutbox(t, phone, phoneOutboxDepth, nil)
+	box, exited := startOutbox(t, phone, phoneOutboxBudget, nil)
 	if err := reg.RegisterPhone("s1", box); err != nil {
 		t.Fatalf("RegisterPhone: %v", err)
 	}
@@ -207,7 +211,9 @@ func TestPhoneOutbox_BacklogFull_Closes1011(t *testing.T) {
 	t.Parallel()
 
 	phone := newStallPhone("client-s1-backlog0")
-	box, exited := startOutbox(t, phone, 2, nil)
+	// Room for the in-flight item 0 (still charged) and two more.
+	budget := itemCost([]byte(`{"n":0}`)) + 2*itemCost([]byte(`{}`))
+	box, exited := startOutbox(t, phone, budget, nil)
 
 	if err := box.Enqueue([]byte(`{"n":0}`), 0); err != nil {
 		t.Fatalf("Enqueue 0: %v", err)
@@ -232,6 +238,88 @@ func TestPhoneOutbox_BacklogFull_Closes1011(t *testing.T) {
 	}
 }
 
+// #154: a phone that stays stalled is still closed with 1011 once its
+// outbox would pass the byte budget, and never holds more than 4 MiB of
+// frame bytes — whether the frames are max-size or small.
+func TestPhoneOutbox_StalledPhone_BoundedBytes(t *testing.T) {
+	t.Parallel()
+
+	const maxFrameBytes = 256 * 1024 // cmd/pyrycode-relay's read cap
+	for _, tc := range []struct {
+		name        string
+		size        int
+		minAccepted int
+	}{
+		{"max-size frames", maxFrameBytes, 15},
+		// A frame-count bound would refuse well before 300.
+		{"small frames", 1024, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			phone := newStallPhone("client-s1-bounded0")
+			box, exited := startOutbox(t, phone, phoneOutboxBudget, nil)
+			frame := []byte(`"` + strings.Repeat("a", tc.size-2) + `"`)
+
+			accepted := 0
+			for {
+				err := box.Enqueue(frame, 0)
+				if errors.Is(err, ErrPhoneBacklogFull) {
+					break
+				}
+				if err != nil {
+					t.Fatalf("Enqueue %d: %v", accepted, err)
+				}
+				accepted++
+				if accepted > phoneOutboxBudget/tc.size {
+					t.Fatalf("accepted %d frames of %d bytes, past the 4 MiB budget", accepted, tc.size)
+				}
+			}
+			if accepted < tc.minAccepted {
+				t.Fatalf("accepted %d frames of %d bytes, want at least %d", accepted, tc.size, tc.minAccepted)
+			}
+
+			phone.waitClosed(t)
+			waitExited(t, exited)
+			if got := phone.snapshotEvents(); fmt.Sprint(got) != "[close:1011]" {
+				t.Fatalf("events = %v, want [close:1011] (pending frames dropped)", got)
+			}
+			if err := box.Enqueue(frame, 0); !errors.Is(err, ErrPhoneOutboxClosed) {
+				t.Fatalf("Enqueue after overflow = %v, want ErrPhoneOutboxClosed", err)
+			}
+		})
+	}
+}
+
+// #154: a connect-time burst far deeper than 16 frames, enqueued while the
+// phone has not read any, is delivered in full and in order once the phone
+// reads — the outbox bounds bytes, not frame count.
+func TestPhoneOutbox_Burst_DeliveredInOrder(t *testing.T) {
+	t.Parallel()
+
+	phone := newStallPhone("client-s1-burst000")
+	box, _ := startOutbox(t, phone, phoneOutboxBudget, nil)
+
+	const n = 300
+	want := make([]string, n)
+	for i := range want {
+		frame := fmt.Sprintf(`"%04d%s"`, i, strings.Repeat("a", 1024-6))
+		want[i] = "send:" + frame
+		if err := box.Enqueue([]byte(frame), 0); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+	close(phone.release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(phone.snapshotEvents()) < n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := phone.snapshotEvents(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("delivered %d events, want %d frames in order and no close", len(got), n)
+	}
+}
+
 // AC3: a failed or timed-out write closes the phone with 1011, drops what
 // is pending, and counts nothing as forwarded.
 func TestPhoneOutbox_WriteFailure_Closes1011(t *testing.T) {
@@ -240,7 +328,7 @@ func TestPhoneOutbox_WriteFailure_Closes1011(t *testing.T) {
 	phone := newFakePhone("client-s1-failing0")
 	phone.sendErr = errors.New("write timeout")
 	var written atomic.Int32
-	box, exited := startOutbox(t, phone, phoneOutboxDepth, func() { written.Add(1) })
+	box, exited := startOutbox(t, phone, phoneOutboxBudget, func() { written.Add(1) })
 
 	if err := box.Enqueue([]byte(`{"n":1}`), 0); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -264,7 +352,7 @@ func TestPhoneOutbox_CountsWrittenFrames(t *testing.T) {
 
 	phone := newFakePhone("client-s1-counted0")
 	var written atomic.Int32
-	box, exited := startOutbox(t, phone, phoneOutboxDepth, func() { written.Add(1) })
+	box, exited := startOutbox(t, phone, phoneOutboxBudget, func() { written.Add(1) })
 
 	for i := 0; i < 3; i++ {
 		if err := box.Enqueue([]byte(`{}`), 0); err != nil {
@@ -289,7 +377,7 @@ func TestPhoneOutbox_Stop_ReleasesRun(t *testing.T) {
 	t.Parallel()
 
 	phone := newFakePhone("client-s1-stopped0")
-	box := newPhoneOutbox(phone, "s1", 1, nil, discardLogger())
+	box := newPhoneOutbox(phone, "s1", phoneOutboxBudget, nil, discardLogger())
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
@@ -314,7 +402,7 @@ func TestPhoneOutbox_CloseAbortsBlockedWrite(t *testing.T) {
 	t.Parallel()
 
 	phone := newStallPhone("client-s1-blocked0")
-	box := newPhoneOutbox(phone, "s1", phoneOutboxDepth, nil, discardLogger())
+	box := newPhoneOutbox(phone, "s1", phoneOutboxBudget, nil, discardLogger())
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
@@ -336,7 +424,7 @@ func TestPhoneOutbox_CloseWithCode_Delegates(t *testing.T) {
 	t.Parallel()
 
 	phone := newFakePhone("client-s1-coded000")
-	box := newPhoneOutbox(phone, "s1", 1, nil, discardLogger())
+	box := newPhoneOutbox(phone, "s1", phoneOutboxBudget, nil, discardLogger())
 	closeWithCode(box, reclaimCloseCode, reclaimCloseReason)
 	if code, _ := phone.snapshotClose(); code != uint16(reclaimCloseCode) {
 		t.Fatalf("close code = %d, want %d", code, reclaimCloseCode)

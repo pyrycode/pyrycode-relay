@@ -501,7 +501,7 @@ func TestServerEndpoint_StalledPhone_LiveIncumbentKeepsSlot(t *testing.T) {
 
 	// Send one frame at a time until a write to the phone stops
 	// completing. At most one frame is ever queued behind the blocked
-	// write, far under phoneOutboxDepth, so the outbox never overflows
+	// write, far under phoneOutboxBudget, so the outbox never overflows
 	// into a 1011 close.
 	frame := []byte(`"` + strings.Repeat("a", 256*1024) + `"`)
 	env := mustMarshal(t, phoneID, frame)
