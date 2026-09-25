@@ -62,7 +62,7 @@ mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(connCa
 
 - handler, heartbeat and phone-outbox goroutines: 3 stacks, ~8 KiB each once grown ≈ 24 KiB;
 - websocket/bufio/TLS record buffers ≈ 64 KiB;
-- `phoneOutboxDepth` × `maxFrameBytes` = 16 × 256 KiB = 4 MiB of queued frames — reachable by anyone who owns both a binary and a non-reading phone ([phone-outbox.md](phone-outbox.md));
+- `phoneOutboxBudget` = 4 MiB (16 × `maxFrameBytes` worth of budget, charged in bytes rather than counted in frames since [#154](../codebase/154.md)) of queued frames — reachable by anyone who owns both a binary and a non-reading phone ([phone-outbox.md](phone-outbox.md));
 - one `maxFrameBytes` frame in flight on the read side = 256 KiB.
 
 ≈ 4.4 MiB per connection. Reserving ~56 MiB of the 256 MB machine for the binary, Go runtime, autocert and kernel socket buffers leaves ~200 MiB; with no `GOMEMLIMIT` set, `GOGC=100` lets the heap reach ~2× live before collecting, so ~100 MiB of live connection state ≈ 22 connections, rounded down to 20. An operator on a bigger machine raises it with `--max-connections`. At the default, the production `fly.toml` command needs no change.

@@ -14,16 +14,19 @@ only enqueues.
 Package `internal/relay` (`phone_outbox.go`):
 
 ```go
-const phoneOutboxDepth = 16
+const phoneOutboxBudget = 4 << 20 // 4 MiB
+const outboxItemOverhead = 64
 
 var (
     ErrPhoneBacklogFull  = errors.New("relay: phone delivery backlog full")
     ErrPhoneOutboxClosed = errors.New("relay: phone outbox closed")
 )
 
-type phoneOutbox struct { /* conn Conn; items chan outboxItem; done chan struct{}; doneOnce sync.Once; closeRequested atomic.Bool; serverID string; logger *slog.Logger; onWritten func() */ }
+type phoneOutbox struct { /* conn Conn; mu sync.Mutex; queue []outboxItem; queued int; budget int; ready chan struct{}; done chan struct{}; doneOnce sync.Once; closeRequested atomic.Bool; serverID string; logger *slog.Logger; onWritten func() */ }
 
-func newPhoneOutbox(conn Conn, serverID string, depth int, onWritten func(), logger *slog.Logger) *phoneOutbox
+func newPhoneOutbox(conn Conn, serverID string, budget int, onWritten func(), logger *slog.Logger) *phoneOutbox
+
+func itemCost(frame []byte) int // len(frame) + outboxItemOverhead
 
 func (o *phoneOutbox) ConnID() string
 func (o *phoneOutbox) Send(msg []byte) error                                  // = Enqueue(msg, 0)
@@ -74,9 +77,9 @@ preserves those codes.
 **`Enqueue`** (called from the binary forwarder's goroutine), never blocks:
 
 1. `done` already closed → `ErrPhoneOutboxClosed`.
-2. `closeCode != 0` → `closeRequested.Store(true)` (see § Binary-requested close tracking below), then continue; this runs even if the send below turns out to overflow.
-3. Non-blocking send into `items` (capacity `phoneOutboxDepth`) → success, `nil`.
-4. `items` full — the phone can't keep up: mark `done` (via `doneOnce`) and,
+2. `closeCode != 0` → `closeRequested.Store(true)` (see § Binary-requested close tracking below), then continue; this runs even if the item below turns out to overflow.
+3. Compute `cost := itemCost(frame)` (`len(frame) + outboxItemOverhead`). Under `mu`, if `queued + cost <= budget`: append `{frame, closeCode}` to `queue`, add `cost` to `queued`, unlock, then a non-blocking send on `ready` (capacity 1 — `default` if `run` already has a wake-up pending) → success, `nil`. The lock is held only for the slice append and int add, never across I/O.
+4. Otherwise the item would take the outbox past `phoneOutboxBudget` — the phone can't keep up: mark `done` (via `doneOnce`) and,
    only on the call that actually closes it, spawn `go closeWithCode(conn,
    code, "phone backlog full")` — off-goroutine because a close can block on
    the handshake, and guarded by `doneOnce` so repeated overflow calls can't
@@ -89,7 +92,11 @@ preserves those codes.
 **`run`** (the phone's own goroutine, started by `ClientHandler`), FIFO,
 single writer:
 
-- Exits immediately if `done` is closed before the next item is even read.
+- Waits on `done` or `ready`, then pops items one at a time via `next()`
+  (pops `queue[0]` under `mu`, zeroing the vacated slot and resetting the
+  slice to `nil` once it empties so the backing array doesn't grow without
+  bound) and calls `deliver` on each, outside the lock.
+- Exits immediately if `done` is closed before the next item is even popped.
 - A frame item (`closeCode == 0`, or `hasFrame` true on a directive):
   `conn.Send`. On error, marks `done`, closes the conn with `1011` (or the
   directive's own code, logged as `binary_forwarder_close_frame_send_failed`
@@ -99,6 +106,11 @@ single writer:
 - A close directive (`closeCode != 0`): after any frame is written, marks
   `done`, calls `closePhone(conn, closeCode)`, logs
   `binary_forwarder_phone_closed`, and returns.
+- Whether `deliver` returns or not, `run` subtracts the item's `itemCost`
+  from `queued` (under `mu`) only after `deliver` returns — the item being
+  written stays charged against the budget for the whole write, which is
+  why a full-max-size-frame outbox holds 15 pending frames rather than 16
+  (see § Queue budget below).
 
 Because `run` is FIFO and the only writer, a close directive takes effect
 only after its own frame (if any) and every frame queued before it have been
@@ -133,18 +145,47 @@ already exited) cross goroutines with no other synchronisation between
 them — the same reasoning that already governs every other cross-goroutine
 field on this type (see § Concurrency model).
 
-## Queue depth: 16 frames
+## Queue budget: bytes, not frames (#154)
 
-Bound by frame count, not bytes. Worst case every slot holds a
-`maxFrameBytes` (256 KiB) frame: **4 MiB per phone**, and a full server-id
-(`maxPhones` = 16, `main.go`) pins **64 MiB** — a quarter of a 256 MB
-machine. Realistic traffic (streamed deltas of ~1 KiB) keeps a full queue in
-the tens of KiB. The queue only fills once the kernel send buffer for that
-phone is already full — i.e. the phone is already well behind — so 16 is
-headroom for a burst on a briefly stalled link, not a steady-state depth.
-Deeper (32 → 128 MiB per server-id) hands one hostile daemon half the
-machine; shallower (8) risks closing healthy phones on short cellular stalls.
-It is one named constant (`phoneOutboxDepth`), easy to retune on evidence.
+Originally bound by frame count (`phoneOutboxDepth = 16`), on the premise
+that the queue only fills once the kernel send buffer for that phone is
+already full — i.e. the phone is already well behind. That premise held for
+a steadily-writing phone but not for a burst: the daemon's connect-time
+reconciles (`reconcileModals`, `reconcileQuestions`, `reconcileQueues`,
+`reconcileModelLists`, `reconcileSlashCommandLists`,
+`reconcileBackgroundTaskRosters`) each send one small frame per session, so a
+daemon holding a dozen or more sessions can produce well over 16 frames, read
+off the binary socket in a few TCP reads and enqueued in microseconds — long
+before `run` has written more than one or two. The 17th frame overflowed the
+queue and closed a perfectly healthy phone with `1011` (issue #154, reported
+against pyrycode-mobile's live e2e suite).
+
+The bound is now **`phoneOutboxBudget` = 4 MiB**, charged in bytes via
+`itemCost(frame) = len(frame) + outboxItemOverhead` (`outboxItemOverhead` =
+64), the same 4 MiB per-phone figure #113 originally derived and #114's
+`defaultMaxConnections` still assumes — only the mechanism changed, not the
+number. `itemCost` charges the frame being written, not just what's still
+pending, so the whole time a write is in flight it counts against the
+budget too (see § Enqueue and delivery order).
+
+- **Max-size frames** (`maxFrameBytes` = 256 KiB): 15 fit before the 16th
+  would exceed 4 MiB — one fewer than the old design's 16-queued-plus-1-in-flight,
+  so the worst case went down, not up.
+- **Small or empty frames**: `outboxItemOverhead` bounds the count
+  independently of size — at most `phoneOutboxBudget / outboxItemOverhead` =
+  65536 items can ever be charged, so a flood of tiny frames to a
+  non-reading phone can't turn a byte budget into an unbounded-count queue.
+  (Go's slice-growth doubling can transiently add up to ~2 MiB above that on
+  top of the queue's own accounting, at 65536 items — absorbed by, not
+  engineered around by, the `defaultMaxConnections` derivation's rounding.)
+- **A realistic burst** (hundreds of ~1 KiB reconcile frames) now fits
+  comfortably inside 4 MiB and is delivered once the phone starts reading —
+  it is no longer treated as an overflow.
+
+A full server-id (`maxPhones` = 16, `main.go`) still pins **64 MiB** worst
+case — a quarter of a 256 MB machine, unchanged from before this ticket.
+`phoneOutboxBudget` is one named constant, easy to retune on evidence, same
+as `phoneOutboxDepth` was.
 
 The sum across server-ids is **not** bounded by this queue — a hostile
 operator running several daemons, each with 16 non-reading phones, can still
@@ -153,17 +194,35 @@ pin 64 MiB per server-id they control. That is the pre-existing
 [`docs/threat-model.md`](../../threat-model.md) § DoS resistance, not a new
 gap this ticket introduces.
 
+**Unconfirmed: what close code the binary sees for an overflow close.**
+When `Enqueue` overflows the budget it closes the phone with `1011` (or the
+directive's own code). [`phoneCloseCode`](client-endpoint.md) then maps
+whatever error the phone's own `StartPhoneForwarder` read loop sees to the
+close notice sent to the binary — using the phone's own WS close status when
+one is present, otherwise `1001`. Whether a relay-initiated `1011` close
+actually reaches that read loop as a `1011` status, or as a status-less
+error that falls back to `1001`, was not confirmed while building #154 —
+it's plausible the latter, since the relay closed the socket itself rather
+than the phone sending its own close frame, but nobody has traced it end to
+end. Left as an open question for whoever next touches this path.
+
 ## Concurrency model
 
 - One extra goroutine per phone (`run`), started by `ClientHandler` right
   after registration and awaited by its teardown defer. It is the sole
   writer of routed frames and close directives to that phone's socket.
-- `items` is written only by `Enqueue` (a server-id's binary forwarder,
-  single caller at a time per phone since `StartBinaryForwarder` is
-  single-reader) and read only by `run`. It is **never closed** — `done`
-  signals stop — so a late `Enqueue` racing the outbox's shutdown can never
-  panic on a closed channel; anything it manages to buffer is simply
-  garbage-collected with the outbox.
+- `queue` and `queued` are guarded by `mu`, a leaf lock: nothing is called
+  while holding it (no conn I/O, no `markDone`, no channel send). `Enqueue`
+  (a server-id's binary forwarder, single caller at a time per phone since
+  `StartBinaryForwarder` is single-reader) appends under `mu`; `run`'s
+  `next()` pops under `mu`. `ready` (capacity 1) is the wake-up signal
+  between them and is **never closed** — `done` signals stop — so a late
+  `Enqueue` racing the outbox's shutdown can never panic on a closed
+  channel; anything it manages to buffer is simply garbage-collected with
+  the outbox. No lost wake-up: `run` only waits on `ready` after observing
+  an empty `queue` under `mu`, and every `Enqueue` append is followed by a
+  non-blocking send on `ready` — the capacity-1 buffer holds that signal
+  until `run`'s next select even if `run` hasn't reached it yet.
 - `done` closes exactly once (`doneOnce`), whichever of these happens first:
   `stop()` (handler teardown), an `Enqueue` overflow, a write failure in
   `run`, or a close directive delivered in `run`.
@@ -178,15 +237,16 @@ gap this ticket introduces.
   goroutine) and read by `closedByBinary()` (phone handler goroutine, after
   `run` has exited) — `atomic.Bool`, no lock, see § Binary-requested close
   tracking above.
-- No new locks. The registry lock is never held while calling into an
-  outbox; `WSConn.writeMu` still serialises `run`'s writes against nothing
-  else (the heartbeat's pings go through the library's own control-frame
-  path, not `Send`).
+- `mu` (#154) is the outbox's only lock, scoped to `queue`/`queued`; it is
+  never held across conn I/O or another lock. The registry lock is never
+  held while calling into an outbox; `WSConn.writeMu` still serialises
+  `run`'s writes against nothing else (the heartbeat's pings go through the
+  library's own control-frame path, not `Send`).
 
 ## Handler wiring (`client_endpoint.go`)
 
 `ClientHandler` constructs `phone := newPhoneOutbox(wsconn, serverID,
-phoneOutboxDepth, reg.onBinaryForwarded, logger)` and registers `phone` —
+phoneOutboxBudget, reg.onBinaryForwarded, logger)` and registers `phone` —
 not `wsconn` — with `RegisterPhoneCapped`. The stillborn-reject paths
 (`ErrNoServer` → `4404`, `ErrPhonesAtCap` → `4429`) are unchanged: they close
 the underlying `*websocket.Conn` directly, before `run` is ever started.
@@ -213,7 +273,7 @@ the handler cannot return while its writer goroutine is still alive.
 
 | Failure | Where | Outcome |
 |---|---|---|
-| Backlog at bound | `Enqueue` | `done` closed; async close `1011` (or the directive's own code); `ErrPhoneBacklogFull`; forwarder logs `binary_forwarder_phone_enqueue_failed` and continues |
+| Item would exceed `phoneOutboxBudget` | `Enqueue` | `done` closed; async close `1011` (or the directive's own code); `ErrPhoneBacklogFull`; forwarder logs `binary_forwarder_phone_enqueue_failed` and continues |
 | `Enqueue` after stop / after a prior failure | `Enqueue` | `ErrPhoneOutboxClosed`; forwarder logs and continues |
 | Write error or timeout | `run` | close `1011` (or the directive's code); `done` closed; everything still queued dropped; `run` returns |
 | Close directive delivered | `run` | frame (if any) written first, then `closePhone(code)`; `done` closed; later items dropped |
@@ -244,17 +304,24 @@ strings (`"phone backlog full"`, `"phone write failed"`), never an error's
 
 - **Stalled phone.** Can no longer hold up the binary's read loop, its
   siblings, or the binary's pong processing — it only ever blocks its own
-  `run` goroutine, bounded first by `phoneOutboxDepth` (backlog fills, then
+  `run` goroutine, bounded first by `phoneOutboxBudget` (backlog fills, then
   `1011`) and second by `WSConn.Send`'s `writeTimeout` (10s) once a write is
   actually in flight. Closes the residual issue #140 named against
   [`/v1/server`'s conflict probe](server-endpoint.md) (#112): a live
   incumbent's pong now waits at most for the forwarder's current binary read
   and enqueue, never for a phone write.
+- **Connect-time burst.** A daemon with many sessions sending hundreds of
+  small frames in a few TCP reads is no longer mistaken for a stalled phone
+  (#154, see § Queue budget above) — the byte budget, not frame count, is
+  what protects memory, and a realistic burst fits well inside it.
 - **Memory per stalled phone / per server-id.** Bounded structurally at 4 MiB
-  and 64 MiB respectively (see § Queue depth). Only frames the binary
-  addresses to a phone are queued — a phone cannot inflate its own queue.
+  and 64 MiB respectively (see § Queue budget). Only frames the binary
+  addresses to a phone are queued — a phone cannot inflate its own queue. A
+  flood of tiny or empty frames is separately bounded in *count* by
+  `outboxItemOverhead` (≤ 65536 items), so a byte-only budget can't be
+  turned into an unbounded-count queue by shrinking the frame size (#154).
 - **Sum across server-ids.** Not bounded by this queue; existing deferred
-  residual, see § Queue depth above and
+  residual, see § Queue budget above and
   [`docs/security-followups.md`](../../security-followups.md).
 - **Repeated overflow.** `Enqueue`'s async closer is guarded by `doneOnce`
   (`markDone`'s return value), so a phone that keeps racing `Enqueue` calls
@@ -267,7 +334,10 @@ Verdict from the architect's security review (embedded in
 `docs/specs/architecture/113-per-phone-delivery-queue.md`) and the verifier's
 independent pass: **PASS**. The review's one `SHOULD FIX` — guarding the
 overflow closer against goroutine multiplication — is the `doneOnce`-gated
-spawn described above.
+spawn described above. The byte-budget rework (#154, spec at
+`docs/specs/architecture/154-phone-outbox-byte-budget.md`) carries its own
+self-reviewed **PASS** and the verifier's independent pass, with no findings
+against the `mu`/`ready` concurrency change or the per-item overhead charge.
 
 ## Testing
 
@@ -283,10 +353,25 @@ sends/closes in delivery order:
   frames then a close directive with a third frame and a close code; no close
   happens while gated; on release, delivery order is frame, frame, frame,
   then the recorded close code.
-- **Overflow closes with `1011` (AC3).** Depth 2 with a stalled phone: once
-  the queue is full, the next `Enqueue` returns `ErrPhoneBacklogFull`, the
-  phone is closed with `1011`, `run` returns, and a later `Enqueue` returns
+- **Overflow closes with `1011` (AC3).** A stalled phone with a budget sized
+  in `itemCost` units for one in-flight item plus two more: once the budget
+  is exhausted, the next `Enqueue` returns `ErrPhoneBacklogFull`, the phone
+  is closed with `1011`, `run` returns, and a later `Enqueue` returns
   `ErrPhoneOutboxClosed`.
+- **Connect-time burst survives, delivered in order (#154 AC1,
+  `TestPhoneOutbox_Burst_DeliveredInOrder`).** 300 distinct 1 KiB frames
+  enqueued back to back against a stalled phone (all return `nil`, none
+  overflow); on release, all 300 are delivered in order with no close. Fails
+  on `main`'s frame-count bound around frame 18.
+- **Stalled phone still bounded by bytes, not frame count (#154 AC2,
+  `TestPhoneOutbox_StalledPhone_BoundedBytes`).** Table over max-size
+  (256 KiB) and small (1 KiB) frames against a never-released stalled phone:
+  in both cases `Enqueue` eventually returns `ErrPhoneBacklogFull`, the
+  accepted byte total never exceeds `phoneOutboxBudget`, the phone is closed
+  `1011` with pending frames dropped, and a later `Enqueue` returns
+  `ErrPhoneOutboxClosed`. The small-frame case also asserts more than 300
+  frames were accepted — a frame-count bound would fail this well before
+  300.
 - **Write failure closes with `1011` and counts nothing (AC3).** A `Send`
   error closes with `1011`, `run` returns, and `onWritten` is never called —
   contrasted against the success-path tests, which each assert one
@@ -304,6 +389,12 @@ Existing `forward_test.go` tests keep exercising the synchronous fallback
 path through `fakePhone` (which does not implement `phoneQueue`). All under
 `go test -race ./internal/relay/...`.
 
+`stallPhone.Send`'s `entered` signal (used elsewhere to synchronise on "the
+stall has begun") became a non-blocking send with a `default` fallback
+(#154): it previously blocked on a 64-slot buffered channel, which a
+300-write burst test would silently wedge on instead of failing, since
+nothing after the first 64 sends could ever proceed.
+
 ## Related
 
 - [Binary-side frame forwarder](binary-forwarder.md) — the sole production
@@ -318,6 +409,10 @@ path through `fakePhone` (which does not implement `phoneQueue`). All under
   in-flight `Send` the queue's `run` goroutine makes.
 - `docs/specs/architecture/113-per-phone-delivery-queue.md` — the architect's
   plan, including the security review this doc's verdict is drawn from.
+- `docs/specs/architecture/154-phone-outbox-byte-budget.md` — the byte-budget
+  rework's plan and security review.
+- [Codebase: #154](../codebase/154.md) — implementation notes for the
+  byte-budget rework.
 - [`/v1/client` § Close notice to the binary](client-endpoint.md#close-notice-to-the-binary-152) —
   the sole reader of `closedByBinary()`.
 - [Routing envelope § Close notice](routing-envelope.md#close-notice-relay-to-binary-152) —

@@ -68,7 +68,7 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 		wsconn := NewWSConn(c, connID, maxFrameBytes)
 		// The registry holds the phone behind its own bounded delivery
 		// queue (#113), so the binary forwarder never waits on this socket.
-		phone := newPhoneOutbox(wsconn, serverID, phoneOutboxDepth, reg.onBinaryForwarded, logger)
+		phone := newPhoneOutbox(wsconn, serverID, phoneOutboxBudget, reg.onBinaryForwarded, logger)
 
 		if err := reg.RegisterPhoneCapped(serverID, phone, maxPhones); err != nil {
 			if errors.Is(err, ErrNoServer) {

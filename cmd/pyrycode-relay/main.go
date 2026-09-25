@@ -46,9 +46,9 @@ const proxyHeaderTimeout = 5 * time.Second
 //   - handler, heartbeat and phone-outbox goroutines: 3 stacks, ~8 KiB
 //     each once grown ≈ 24 KiB;
 //   - websocket, bufio and TLS record buffers ≈ 64 KiB;
-//   - phoneOutboxDepth × maxFrameBytes = 16 × 256 KiB = 4 MiB of queued
-//     frames, reachable by anyone who owns both a binary and a
-//     non-reading phone;
+//   - phoneOutboxBudget = 4 MiB (16 × maxFrameBytes) of queued frames,
+//     counted in bytes including the frame being written, reachable by
+//     anyone who owns both a binary and a non-reading phone;
 //   - one maxFrameBytes frame in flight on the read side = 256 KiB.
 //
 // ≈ 4.4 MiB per connection. Reserving ~56 MiB for the binary, Go runtime,
