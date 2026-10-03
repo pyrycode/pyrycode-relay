@@ -1,5 +1,7 @@
 # Per-Ticket Codebase Notes
 
+> **Frozen on 2026-10-03 at 53 notes.** Read these as history; never add or edit one. Lessons now fold into the feature doc for the area under `docs/knowledge/features/`, in the section they belong to. The notes were retired because nobody but the documentation stage read them, and the serial documentation stage already prevents the merge conflicts they were introduced to avoid. The daemon and mobile repos froze theirs on 2026-08-19 and 2026-09-05.
+
 One file per ticket: `<ticket-number>.md`. Each file describes what was built for that ticket — **implementation summary, patterns established, AND lessons learned** all live in this per-ticket file.
 
 ## Convention
