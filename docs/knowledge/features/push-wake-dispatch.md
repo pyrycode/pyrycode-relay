@@ -31,7 +31,7 @@ Package `internal/relay` (`push_wake.go`):
 
 ```go
 type pushSender interface {
-    Send(ctx context.Context, deviceToken string) error
+    Send(ctx context.Context, deviceToken string) (string, error)
 }
 
 type PushWaker struct { /* unexported */ }
@@ -106,18 +106,32 @@ channel used as a semaphore) because it bounds a relay-wide resource
 
 No sentinel here, and no `FCMSender` error surfaced by the send goroutine,
 ever carries the device token or the service-account credential. The
-forwarder logs every refusal as `binary_forwarder_push_wake_dropped`; the
-send goroutine logs a failed `Send` as `push_wake_send_failed` — both use
-only `server_id` (or `binary_conn_id`) and `err`, both already in
-`allowedLogKeys` (`internal/relay/log_allowlist.go`). No new log key was
-needed for this ticket.
+forwarder logs a refusal as `binary_forwarder_push_wake_dropped`, using only
+`server_id` (or `binary_conn_id`) and `err`.
+
+Every wake *admitted* by `Request` logs exactly one outcome line from `send`
+(#160), including a send cancelled by `Close` — the cancelled context makes
+`Send` return an error, so it takes the failure branch with no special case:
+
+| Line | Level | Keys |
+|---|---|---|
+| `push_wake_sent` | Info | `server_id`, `token_fp`, `duration`, and `fcm_message_id` when the reply carried a valid one |
+| `push_wake_send_failed` | Warn | `server_id`, `token_fp`, `duration`, `err` |
+
+`token_fp` (`tokenFingerprint`, `push.go`) is the first 8 hex characters of
+the device token's SHA-256 — stable per token, one-way, never the token
+itself. `duration` is the elapsed time of the `Send` call. All three keys
+are in `allowedLogKeys` (`internal/relay/log_allowlist.go`), each with a
+comment explaining why it's safe to log.
 
 ## Concurrency model
 
 - One goroutine per admitted wake, capped at `pushWakeMaxInFlight` by the
   buffered `slots` channel. Each goroutine exits when `Send` returns —
   bounded by `fcmSendTimeout` per HTTP call in production, and by `w.ctx`
-  cancellation on `Close`.
+  cancellation on `Close`. It logs its one outcome line before `wg.Done`
+  (deferred first, so it runs last) — `Close` returning therefore means
+  every admitted wake's outcome line has already been written (#160).
 - `w.mu` makes admission (the `closed` check, `limiter.Allow`, the slot
   acquire, `wg.Add`) atomic with `Close`: no `wg.Add` can race `wg.Wait`,
   and `limiter.Allow` is never called after `limiter.Close`. Lock order is
@@ -159,9 +173,14 @@ while a different server-id is still admitted; a blocking fake sender fills
 `maxInFlight` → the next `Request` → `ErrPushWakeInFlightCap`, and releasing
 one send readmits the next; a nil `*PushWaker` → `ErrPushOff`; `Close`
 cancels a blocked send, waits for it, and a `Request` afterward →
-`ErrPushOff`; a failed send is logged with `server_id`/`err` and the log
-never contains the token; `NewPushWakerFromEnv` returns `(nil, nil)` when
-unset and a non-nil waker for a valid key.
+`ErrPushOff`; `NewPushWakerFromEnv` returns `(nil, nil)` when unset and a
+non-nil waker for a valid key. Since #160: exactly one outcome line for each
+of success-with-id, success-without-id, failure and cancelled-by-`Close`,
+each checked for its keys and for the raw token's absence; and an
+end-to-end run of a real `FCMSender` through `PushWaker` against an
+httptest FCM server, proving neither the device token, the access token,
+nor FCM reply text beyond a validated id ever reaches the log — including a
+hostile `name` and a 404 error body that both echo a marker and the tokens.
 
 `forward_test.go` covers the forwarder's side of the contract: a wake with a
 blocking sender followed by an ordinary `conn_id` frame proves the phone
