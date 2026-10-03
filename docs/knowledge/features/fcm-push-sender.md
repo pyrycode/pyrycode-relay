@@ -2,7 +2,7 @@
 
 `internal/relay/push.go` gives the relay an `FCMSender` that wakes a
 backgrounded Android app by sending it a data-only FCM message. Introduced by
-#132. #133 wires the daemon's `push_wake` routing envelope
+\#132. #133 wires the daemon's `push_wake` routing envelope
 (`protocol-mobile.md` § `push_wake`) to `Send` and constructs the sender
 from `main` — see [Push wake dispatch](push-wake-dispatch.md) for the
 dispatch path (structural validation, per-server-id rate limit, relay-wide
@@ -12,7 +12,7 @@ in-flight cap, async send off the binary read loop).
 
 The Android app closes its WebSocket connection when backgrounded and
 reconnects for 30 seconds on an FCM data message (pyrycode-mobile #361,
-#685). Decided 2026-09-24: the FCM sender lives in the relay, not in every
+\#685). Decided 2026-09-24: the FCM sender lives in the relay, not in every
 copy of `pyry`, so the Firebase service-account credentials sit in one relay
 secret instead of being distributed to every daemon install.
 

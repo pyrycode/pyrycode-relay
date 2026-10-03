@@ -20,8 +20,8 @@ everything lives. Then:
 
 - [`docs/knowledge/INDEX.md`](docs/knowledge/INDEX.md) — one-line summaries of
   the evergreen knowledge base (features, decisions).
-- `docs/knowledge/codebase/<N>.md` — per-ticket implementation notes; one file
-  per ticket, the directory listing is the index.
+- `docs/knowledge/codebase/<N>.md` — per-ticket implementation notes, frozen
+  on 2026-10-03. Read them as history.
 - [`docs/architecture.md`](docs/architecture.md) — system-level design.
 - [`docs/deploy.md`](docs/deploy.md) — Fly.io bootstrap, steady-state deploy,
   rollback.
@@ -41,6 +41,6 @@ exists. The relay is content-blind: the protocol version lives in each frame's
 - `docs/PROJECT-MEMORY.md` is **read-only for agents**. Humans maintain it
   directly.
 - `docs/lessons.md` is **frozen (2026-05-11)**. Historical reference only.
-- Per-ticket knowledge (implementation, patterns established, lessons learned)
-  goes in `docs/knowledge/codebase/<N>.md`.
+- Lessons fold into the feature doc for the area under `docs/knowledge/features/`.
+  `docs/knowledge/codebase/` is frozen (2026-10-03).
 - Run `make check` (`go vet` + `go test -race`) before any push.
