@@ -124,6 +124,47 @@ itself. `duration` is the elapsed time of the `Send` call. All three keys
 are in `allowedLogKeys` (`internal/relay/log_allowlist.go`), each with a
 comment explaining why it's safe to log.
 
+## Metrics
+
+`internal/relay/metrics_push.go`'s `NewPushMetrics(reg, w)` registers
+`pyrycode_relay_push_wakes_total{outcome}` with exactly five pre-bound label
+values, all exposed at 0 from boot: `sent`, `unregistered`, `send_failed`,
+`token_fetch_failed`, `dropped`. It follows the `NewGraceMetrics` hook shape
+([Frame-forwarded and grace-expiry counters](frame-and-grace-counters.md)):
+prometheus stays out of `push_wake.go`, and `setOutcomeHook` installs a
+nil-safe hook that `record` calls. Introduced by #161, after a 2026-10-03
+incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
+20 minutes and only a log line recorded it.
+
+- **`dropped`** — `Request` refuses a wake for the per-server-id rate limit
+  (`ErrPushWakeRateLimited`) or the in-flight cap (`ErrPushWakeInFlightCap`).
+  A malformed `push_wake` object and a push-off refusal (nil or closed
+  waker) count nothing — they never reach admission, so they are not a
+  "drop" in this counter's sense.
+- **`sent` / `unregistered` / `send_failed` / `token_fetch_failed`** — exactly
+  one increments per admitted wake, once its `send` goroutine's call to
+  `Send` returns. `classifyPushWake(err)` maps the result by error identity,
+  never by matching text: `nil` → `sent` (with or without a message id in
+  the reply); `errors.Is(err, ErrFCMUnregistered)` → `unregistered`;
+  `errors.Is(err, ErrFCMTokenFetch)` → `token_fetch_failed`; anything else
+  (another FCM error, a transport failure, or cancellation by `Close`) →
+  `send_failed`.
+
+[`ErrFCMUnregistered`](fcm-push-sender.md) is the sentinel `FCMSender.Send`
+now also wraps, alongside the existing `ErrFCMSend`, when FCM's reply's
+`errorCode` is `UNREGISTERED` — so `errors.Is(err, ErrFCMSend)` still
+matches and the error's text is unchanged; only the classification gains a
+second, checkable identity.
+
+The five label values are hard-coded constants from `pushWakeOutcome` — none
+carries a server id, a device token or any text from Firebase's reply, so
+the series count is fixed at five regardless of traffic.
+
+Wired in `main` right after `NewUpgradeMetrics`, before any listener serves
+— see § Wiring. Push off (`pushWaker == nil`) means no
+`pyrycode_relay_push_wakes_total` series at all, not five series stuck at
+zero.
+
 ## Concurrency model
 
 - One goroutine per admitted wake, capped at `pushWakeMaxInFlight` by the
@@ -166,6 +207,21 @@ if pushWaker == nil {
 interface or extra parameter was threaded through the forwarder's existing
 signature.
 
+The waker is built here, before `metricsReg` exists. Its metrics hook is
+installed later, in the same `main.go` block as the other counters:
+
+```go
+upgradeMetrics := relay.NewUpgradeMetrics(metricsReg)
+if pushWaker != nil {
+    relay.NewPushMetrics(metricsReg, pushWaker)
+}
+```
+
+Guarding on `pushWaker != nil` keeps "with push on" (the AC's condition)
+structural — push off means `NewPushMetrics` is never called, not called
+against a nil-op waker. Both wiring points still run before any listener
+serves, so no `Request` can reach the waker before its hook is in place.
+
 ## Testing
 
 `push_wake_test.go`: burst exhausted for one server-id → `ErrPushWakeRateLimited`
@@ -191,6 +247,23 @@ and leaves a later frame still deliverable; a `conn_id` envelope that also
 carries a `push_wake` is forwarded to the phone exactly as before, with no
 send triggered. Captured logs across every case are asserted to never
 contain the token string.
+
+`metrics_push_test.go` (#161) scrapes a fresh registry per case and asserts
+all five outcome cells together (the one expected, the rest at 0), plus that
+the scrape body contains no server id or token. A real `FCMSender` against
+in-test OAuth and FCM servers drives the four admitted-wake outcomes off the
+errors `Send` actually returns (2xx with and without an id, `UNREGISTERED`,
+another FCM error, a failed token fetch); a fake sender covers
+cancellation-by-`Close` (→ `send_failed`), rate-limit and in-flight-cap
+drops, and that a malformed object or a push-off `Request` counts nothing.
+**A real-`FCMSender` case cannot scrape right after `PushWaker.Close`**:
+`Close` cancels the in-flight send, so every case would classify as
+`send_failed` regardless of what FCM actually returned — a version of the
+test that scraped only after `Close` would have passed while classifying
+nothing correctly. It instead polls for the send's one outcome log line
+(recorded before the line is logged, so the poll and the counter agree) and
+closes the waker afterward. The fake-sender cases, which need no real HTTP
+round trip, still scrape right after `Close`.
 
 ## Related
 
