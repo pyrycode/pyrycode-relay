@@ -246,21 +246,23 @@ func fcmErrorBody(status, detailType, errorCode string) string {
 func TestFCMSender_NonSuccessReplyNamesFCMReason(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   string
+		name         string
+		status       int
+		body         string
+		want         string
+		unregistered bool
 	}{
-		{"standard error body", http.StatusNotFound, fcmErrorBody("NOT_FOUND", fcmErrorType, "UNREGISTERED"), "status 404 (NOT_FOUND, UNREGISTERED)"},
-		{"status only", http.StatusBadRequest, `{"error":{"code":400,"message":"` + testFCMMarker + `","status":"INVALID_ARGUMENT"}}`, "status 400 (INVALID_ARGUMENT)"},
-		{"errorCode only", http.StatusForbidden, `{"error":{"details":[{"@type":"` + fcmErrorType + `","errorCode":"SENDER_ID_MISMATCH"}]}}`, "status 403 (SENDER_ID_MISMATCH)"},
-		{"empty body", http.StatusNotFound, "", "status 404"},
-		{"not JSON", http.StatusNotFound, testFCMMarker + " " + testFCMDeviceToken, "status 404"},
-		{"JSON without the fields", http.StatusNotFound, `{"error":{"code":404,"message":"` + testFCMMarker + `"}}`, "status 404"},
-		{"errorCode under another type", http.StatusNotFound, fcmErrorBody("", "type.googleapis.com/google.rpc.BadRequest", "UNREGISTERED"), "status 404"},
-		{"non-enum values", http.StatusNotFound, fcmErrorBody(testFCMMarker, fcmErrorType, testFCMDeviceToken), "status 404"},
-		{"over-long enum", http.StatusNotFound, fcmErrorBody(strings.Repeat("A", 65), fcmErrorType, "UNREGISTERED"), "status 404 (UNREGISTERED)"},
-		{"truncated past the drain cap", http.StatusNotFound, `{"error":{"status":"NOT_FOUND","message":"` + strings.Repeat("x", fcmMaxDrainBytes) + `"}}`, "status 404"},
+		{"standard error body", http.StatusNotFound, fcmErrorBody("NOT_FOUND", fcmErrorType, "UNREGISTERED"), "status 404 (NOT_FOUND, UNREGISTERED)", true},
+		{"status only", http.StatusBadRequest, `{"error":{"code":400,"message":"` + testFCMMarker + `","status":"INVALID_ARGUMENT"}}`, "status 400 (INVALID_ARGUMENT)", false},
+		{"errorCode only", http.StatusForbidden, `{"error":{"details":[{"@type":"` + fcmErrorType + `","errorCode":"SENDER_ID_MISMATCH"}]}}`, "status 403 (SENDER_ID_MISMATCH)", false},
+		{"empty body", http.StatusNotFound, "", "status 404", false},
+		{"not JSON", http.StatusNotFound, testFCMMarker + " " + testFCMDeviceToken, "status 404", false},
+		{"JSON without the fields", http.StatusNotFound, `{"error":{"code":404,"message":"` + testFCMMarker + `"}}`, "status 404", false},
+		{"errorCode under another type", http.StatusNotFound, fcmErrorBody("", "type.googleapis.com/google.rpc.BadRequest", "UNREGISTERED"), "status 404", false},
+		{"non-enum values", http.StatusNotFound, fcmErrorBody(testFCMMarker, fcmErrorType, testFCMDeviceToken), "status 404", false},
+		{"over-long enum", http.StatusNotFound, fcmErrorBody(strings.Repeat("A", 65), fcmErrorType, "UNREGISTERED"), "status 404 (UNREGISTERED)", true},
+		{"status NOT_FOUND without errorCode", http.StatusNotFound, `{"error":{"status":"NOT_FOUND"}}`, "status 404 (NOT_FOUND)", false},
+		{"truncated past the drain cap", http.StatusNotFound, `{"error":{"status":"NOT_FOUND","message":"` + strings.Repeat("x", fcmMaxDrainBytes) + `"}}`, "status 404", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -283,6 +285,9 @@ func TestFCMSender_NonSuccessReplyNamesFCMReason(t *testing.T) {
 			}
 			if want := ErrFCMSend.Error() + ": " + tc.want; err.Error() != want {
 				t.Errorf("error = %q, want %q", err, want)
+			}
+			if got := errors.Is(err, ErrFCMUnregistered); got != tc.unregistered {
+				t.Errorf("errors.Is(err, ErrFCMUnregistered) = %v, want %v", got, tc.unregistered)
 			}
 			assertNoSecrets(t, err.Error())
 		})

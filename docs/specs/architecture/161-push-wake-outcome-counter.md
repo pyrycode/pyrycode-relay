@@ -63,6 +63,10 @@ Pending for the documentation stage:
 - `docs/knowledge/features/fcm-push-sender.md`: `ErrFCMUnregistered` alongside the other sentinels.
 - `docs/threat-model.md` push section: the "no metric exists yet" residual-risk sentence and the "metric on dropped/refused wakes" future-hardening item are now delivered.
 
+## Revisions
+
+- 2026-10-03 (Phase B): the real-`FCMSender` metrics cases cannot scrape "after `w.Close()`", because `Close` cancels the in-flight send and turns every case into `send_failed`. They instead poll for the send's one outcome log line (recorded before the line is logged) and close afterwards. The fake-sender cases still scrape after `Close`. Design unchanged.
+
 ## Security review
 
 **Verdict:** PASS

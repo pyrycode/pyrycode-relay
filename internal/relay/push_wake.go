@@ -40,6 +40,33 @@ var (
 	ErrPushWakeInFlightCap = errors.New("relay: push_wake in-flight cap reached")
 )
 
+// pushWakeOutcome is the closed set of push wake outcomes the metrics hook
+// counts. NewPushMetrics maps each to a hard-coded label value.
+type pushWakeOutcome int
+
+const (
+	pushWakeSent             pushWakeOutcome = iota // 2xx reply, with or without a message id
+	pushWakeUnregistered                            // FCM errorCode UNREGISTERED
+	pushWakeSendFailed                              // any other send failure, including cancel by Close
+	pushWakeTokenFetchFailed                        // access-token fetch failed
+	pushWakeDropped                                 // refused by the rate limit or the in-flight cap
+	pushWakeOutcomeCount
+)
+
+// classifyPushWake maps a Send result to its outcome by error identity.
+func classifyPushWake(err error) pushWakeOutcome {
+	switch {
+	case err == nil:
+		return pushWakeSent
+	case errors.Is(err, ErrFCMUnregistered):
+		return pushWakeUnregistered
+	case errors.Is(err, ErrFCMTokenFetch):
+		return pushWakeTokenFetchFailed
+	default:
+		return pushWakeSendFailed
+	}
+}
+
 // pushSender is the send capability PushWaker needs. Send returns a
 // validated message id on success, or "". *FCMSender satisfies it; tests
 // substitute a fake.
@@ -55,6 +82,10 @@ type PushWaker struct {
 	limiter *IPRateLimiter
 	slots   chan struct{}
 	logger  *slog.Logger
+
+	// onOutcome counts outcomes; nil is a no-op. Set once at boot by
+	// setOutcomeHook. It must not call back into the waker.
+	onOutcome func(pushWakeOutcome)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -81,6 +112,18 @@ func newPushWaker(sender pushSender, refillEvery time.Duration, burst, maxInFlig
 		logger:  logger,
 		ctx:     ctx,
 		cancel:  cancel,
+	}
+}
+
+// setOutcomeHook installs the outcome hook. Call once at boot, before any
+// Request; concurrent calls during serving are undefined.
+func (w *PushWaker) setOutcomeHook(fn func(pushWakeOutcome)) {
+	w.onOutcome = fn
+}
+
+func (w *PushWaker) record(o pushWakeOutcome) {
+	if w.onOutcome != nil {
+		w.onOutcome(o)
 	}
 }
 
@@ -119,11 +162,13 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		return ErrPushOff
 	}
 	if !w.limiter.Allow(serverID) {
+		w.record(pushWakeDropped)
 		return ErrPushWakeRateLimited
 	}
 	select {
 	case w.slots <- struct{}{}:
 	default:
+		w.record(pushWakeDropped)
 		return ErrPushWakeInFlightCap
 	}
 	w.wg.Add(1)
@@ -131,8 +176,8 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	return nil
 }
 
-// send runs one wake and logs exactly one outcome line for it, keyed by a
-// fingerprint of the token, never the token. It exits when Send returns,
+// send runs one wake, records its outcome and logs exactly one outcome line
+// for it, keyed by a fingerprint of the token, never the token. It exits when Send returns,
 // which the sender's own timeout and the waker's context (cancelled by
 // Close) both bound.
 func (w *PushWaker) send(serverID, token string) {
@@ -141,6 +186,7 @@ func (w *PushWaker) send(serverID, token string) {
 	start := time.Now()
 	id, err := w.sender.Send(w.ctx, token)
 	duration := time.Since(start)
+	w.record(classifyPushWake(err))
 	fp := tokenFingerprint(token)
 	switch {
 	case err != nil:

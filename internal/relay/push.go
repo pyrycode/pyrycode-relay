@@ -55,7 +55,17 @@ var (
 	// with a non-2xx reply. It carries at most the HTTP status and FCM's
 	// enum-shaped error.status and errorCode, never other reply text.
 	ErrFCMSend = errors.New("relay: fcm send failed")
+	// ErrFCMUnregistered is matched, alongside ErrFCMSend, when FCM rejects
+	// the send with errorCode UNREGISTERED: the device token is dead.
+	ErrFCMUnregistered = errors.New("relay: fcm device token unregistered")
 )
+
+// fcmUnregisteredError marks an ErrFCMSend error as ErrFCMUnregistered too,
+// keeping the wrapped error's text unchanged.
+type fcmUnregisteredError struct{ err error }
+
+func (e fcmUnregisteredError) Error() string   { return e.err.Error() }
+func (e fcmUnregisteredError) Unwrap() []error { return []error{e.err, ErrFCMUnregistered} }
 
 // FCMSender sends data-only, high-priority FCM messages that wake the
 // Android app. It holds no logger and is safe for concurrent use.
@@ -198,7 +208,11 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error
 	reply, _ := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		if reason := fcmErrorReason(reply); reason != "" {
+		reason, unregistered := fcmErrorReason(reply)
+		if unregistered {
+			return "", fcmUnregisteredError{fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)}
+		}
+		if reason != "" {
 			return "", fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
 		}
 		return "", fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
@@ -264,10 +278,11 @@ type fcmErrorReply struct {
 // fcmErrorReason returns FCM's error.status and FcmError errorCode from a
 // non-2xx reply, comma-joined, or "" when the reply carries neither. Values
 // that are not enum-shaped are dropped, so no free text reaches the error.
-func fcmErrorReason(reply []byte) string {
+// unregistered reports whether the errorCode is UNREGISTERED.
+func fcmErrorReason(reply []byte) (reason string, unregistered bool) {
 	var r fcmErrorReply
 	if json.Unmarshal(reply, &r) != nil {
-		return ""
+		return "", false
 	}
 	var parts []string
 	if isFCMEnum(r.Error.Status) {
@@ -276,10 +291,11 @@ func fcmErrorReason(reply []byte) string {
 	for _, d := range r.Error.Details {
 		if d.Type == fcmErrorType && isFCMEnum(d.ErrorCode) {
 			parts = append(parts, d.ErrorCode)
+			unregistered = d.ErrorCode == "UNREGISTERED"
 			break
 		}
 	}
-	return strings.Join(parts, ", ")
+	return strings.Join(parts, ", "), unregistered
 }
 
 // isFCMEnum reports whether s is 1-64 bytes of [A-Z0-9_].

@@ -237,6 +237,11 @@ func run(args []string, sigCtx context.Context) int {
 	relay.NewForwardMetrics(metricsReg, reg)
 	relay.NewGraceMetrics(metricsReg, reg)
 	upgradeMetrics := relay.NewUpgradeMetrics(metricsReg)
+	// The waker is built before metricsReg; its hook must still be in place
+	// before any listener serves a binary that could request a wake.
+	if pushWaker != nil {
+		relay.NewPushMetrics(metricsReg, pushWaker)
+	}
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", relay.NewMetricsHandler(metricsReg))
