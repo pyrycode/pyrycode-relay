@@ -79,7 +79,7 @@ reason on a non-2xx reply, or for the message id on a 2xx (both below).
 | Token endpoint non-2xx | `ErrFCMTokenFetch: status N` | HTTP status only |
 | Token transport/decode failure | `ErrFCMTokenFetch` | nothing |
 | FCM transport failure / cancelled ctx | `ErrFCMSend: <url.Error>` | the constant send URL + net error — the device token is in the body, never the URL |
-| FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N (REASON[, CODE])` | HTTP status plus FCM's enum-shaped `error.status` and/or FcmError `errorCode`, when present — see below; exactly `status N` otherwise |
+| FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N (REASON[, CODE])`, also matching `ErrFCMUnregistered` when `errorCode` is `UNREGISTERED` | HTTP status plus FCM's enum-shaped `error.status` and/or FcmError `errorCode`, when present — see below; exactly `status N` otherwise |
 | FCM 2xx | `nil`, plus the message id (below) or `""` | nothing beyond the validated id |
 
 `oauth2.RetrieveError` formats the token endpoint's response body into its
@@ -109,6 +109,21 @@ reads `relay: fcm send failed: status 404 (NOT_FOUND, UNREGISTERED)`; with
 only one, only that one appears in the parentheses. No new log key —
 [`push_wake.go`](../../../internal/relay/push_wake.go)'s `PushWaker.send`
 still logs the whole error under the already-allowlisted `err` key.
+
+**`ErrFCMUnregistered` (#161).** `fcmErrorReason` additionally reports
+whether the `FcmError` detail's `errorCode` is exactly `UNREGISTERED` — the
+same validated, enum-shaped field the reason string already exposes, never
+the HTTP status and never `error.message`. When it is, `Send` returns an
+unexported `fcmUnregisteredError` that wraps the usual
+`fmt.Errorf("%w: status %d (%s)", ErrFCMSend, ...)` error unchanged —
+`Error()` and the `ErrFCMSend` match are both preserved — and additionally
+unwraps (via `Unwrap() []error`) to the sentinel `ErrFCMUnregistered`. A
+caller distinguishes a dead token from any other send failure by
+`errors.Is(err, ErrFCMUnregistered)`, never by matching text; see
+[Push wake dispatch § Metrics](push-wake-dispatch.md#metrics) for the
+counter this drives. `UNREGISTERED` means the device token is permanently
+invalid on Google's side — telling the daemon so (and letting it stop
+retrying that token) is still out of scope; see below.
 
 ### Returning FCM's message id (#160)
 
