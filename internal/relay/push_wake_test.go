@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +24,7 @@ const testWakeToken = "wake-token-SECRET-4f1a"
 type fakePushSender struct {
 	mu      sync.Mutex
 	tokens  []string
+	id      string
 	err     error
 	block   chan struct{}
 	started chan struct{}
@@ -30,20 +34,23 @@ func newFakePushSender() *fakePushSender {
 	return &fakePushSender{started: make(chan struct{}, 64)}
 }
 
-func (s *fakePushSender) Send(ctx context.Context, deviceToken string) error {
+func (s *fakePushSender) Send(ctx context.Context, deviceToken string) (string, error) {
 	s.mu.Lock()
 	s.tokens = append(s.tokens, deviceToken)
-	block, err := s.block, s.err
+	block, id, err := s.block, s.id, s.err
 	s.mu.Unlock()
 	s.started <- struct{}{}
 	if block != nil {
 		select {
 		case <-block:
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 	}
-	return err
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *fakePushSender) sentTokens() []string {
@@ -228,24 +235,138 @@ func TestPushWaker_CloseCancelsBlockedSend(t *testing.T) {
 	}
 }
 
-func TestPushWaker_SendFailureLoggedWithoutToken(t *testing.T) {
+// outcomeLines returns the push_wake_sent and push_wake_send_failed lines.
+func outcomeLines(out string) []string {
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "msg=push_wake_sent ") || strings.Contains(l, "msg=push_wake_send_failed ") {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+func TestPushWaker_LogsOneOutcomePerWake(t *testing.T) {
 	t.Parallel()
-	sender := newFakePushSender()
-	sender.err = errors.New("relay: fcm send failed: status 404")
-	logger, logs := captureLogger()
-	w := NewPushWaker(sender, logger)
-
-	if err := w.Request("s1", wakeJSON("fcm", testWakeToken)); err != nil {
-		t.Fatalf("Request: %v", err)
+	cases := []struct {
+		name   string
+		id     string
+		err    error
+		cancel bool     // block the send until Close cancels it
+		want   []string // substrings of the one outcome line
+		absent []string
+	}{
+		{"sent with id", testFCMMessageID, nil, false,
+			[]string{"level=INFO", "msg=push_wake_sent ", "fcm_message_id=" + testFCMMessageID}, []string{"err="}},
+		{"sent without id", "", nil, false,
+			[]string{"level=INFO", "msg=push_wake_sent "}, []string{"fcm_message_id", "err="}},
+		{"send failed", "", errors.New("relay: fcm send failed: status 404 (NOT_FOUND, UNREGISTERED)"), false,
+			[]string{"level=WARN", "msg=push_wake_send_failed ", "UNREGISTERED"}, []string{"fcm_message_id"}},
+		{"cancelled by Close", "", nil, true,
+			[]string{"level=WARN", "msg=push_wake_send_failed ", "context canceled"}, []string{"fcm_message_id"}},
 	}
-	w.Close() // waits for the send goroutine, so its log line is written
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sender := newFakePushSender()
+			sender.id, sender.err = tc.id, tc.err
+			if tc.cancel {
+				sender.block = make(chan struct{})
+			}
+			logger, logs := captureLogger()
+			w := NewPushWaker(sender, logger)
 
-	out := logs.String()
-	if !strings.Contains(out, "push_wake_send_failed") || !strings.Contains(out, "status 404") {
-		t.Fatalf("send failure not logged by status: %q", out)
+			if err := w.Request("s1", wakeJSON("fcm", testWakeToken)); err != nil {
+				t.Fatalf("Request: %v", err)
+			}
+			sender.waitStarted(t, 1)
+			w.Close() // waits for the send goroutine, so its log line is written
+
+			out := logs.String()
+			lines := outcomeLines(out)
+			if len(lines) != 1 {
+				t.Fatalf("outcome lines = %d, want exactly 1:\n%s", len(lines), out)
+			}
+			want := append([]string{"server_id=s1 ", "token_fp=" + tokenFingerprint(testWakeToken) + " ", "duration="}, tc.want...)
+			for _, s := range want {
+				if !strings.Contains(lines[0], s) {
+					t.Errorf("outcome line %q lacks %q", lines[0], s)
+				}
+			}
+			for _, s := range tc.absent {
+				if strings.Contains(lines[0], s) {
+					t.Errorf("outcome line %q contains %q", lines[0], s)
+				}
+			}
+			if strings.Contains(out, testWakeToken) {
+				t.Fatalf("log contains the token: %q", out)
+			}
+		})
 	}
-	if strings.Contains(out, testWakeToken) {
-		t.Fatalf("log contains the token: %q", out)
+}
+
+// TestPushWaker_FCMEndToEndLogsNoSecrets drives a real FCMSender through
+// PushWaker against replies that echo the tokens and a marker.
+func TestPushWaker_FCMEndToEndLogsNoSecrets(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   []string
+	}{
+		{"2xx with id and extra fields", http.StatusOK,
+			`{"name":"` + testFCMMessageID + `","note":"` + testFCMMarker + ` ` + testFCMDeviceToken + ` ` + testFCMAccessToken + `"}`,
+			[]string{"msg=push_wake_sent ", "fcm_message_id=" + testFCMMessageID}},
+		{"2xx with hostile name", http.StatusOK,
+			`{"name":"1 err=forged ` + testFCMMarker + ` ` + testFCMDeviceToken + `"}`,
+			[]string{"msg=push_wake_sent "}},
+		{"404 echoing secrets", http.StatusNotFound, fcmErrorBody("NOT_FOUND", fcmErrorType, "UNREGISTERED"),
+			[]string{"msg=push_wake_send_failed ", "status 404 (NOT_FOUND, UNREGISTERED)"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			oauth, _ := fakeOAuth(t, 0)
+			fcm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(fcm.Close)
+			sender, err := newFCMSender(testServiceAccountJSON(t, oauth.URL), fcm.URL)
+			if err != nil {
+				t.Fatalf("newFCMSender: %v", err)
+			}
+			logger, logs := captureLogger()
+			w := NewPushWaker(sender, logger)
+
+			if err := w.Request("s1", wakeJSON("fcm", testFCMDeviceToken)); err != nil {
+				t.Fatalf("Request: %v", err)
+			}
+			// Close cancels in-flight sends, so wait for the outcome first.
+			deadline := time.Now().Add(5 * time.Second)
+			for len(outcomeLines(logs.String())) == 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			w.Close()
+
+			out := logs.String()
+			lines := outcomeLines(out)
+			if len(lines) != 1 {
+				t.Fatalf("outcome lines = %d, want exactly 1:\n%s", len(lines), out)
+			}
+			for _, s := range tc.want {
+				if !strings.Contains(lines[0], s) {
+					t.Errorf("outcome line %q lacks %q", lines[0], s)
+				}
+			}
+			for _, s := range []string{testFCMDeviceToken, testFCMAccessToken, testFCMMarker, "forged"} {
+				if strings.Contains(out, s) {
+					t.Errorf("log contains %q: %q", s, out)
+				}
+			}
+		})
 	}
 }
 

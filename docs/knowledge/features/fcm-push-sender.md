@@ -41,9 +41,10 @@ those can echo fragments of the input.
 
 `NewFCMSender(credentialsJSON []byte) (*FCMSender, error)` builds a sender
 against the production FCM endpoint (`fcmDefaultBaseURL`,
-`https://fcm.googleapis.com`). `(*FCMSender).Send(ctx, deviceToken string) error`
-POSTs to `https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send`
-a body shaped:
+`https://fcm.googleapis.com`).
+`(*FCMSender).Send(ctx, deviceToken string) (string, error)` POSTs to
+`https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send` a body
+shaped:
 
 ```json
 {"message": {"token": "<deviceToken>", "android": {"priority": "HIGH"}}}
@@ -67,8 +68,8 @@ honours the caller's `ctx` via `context.WithTimeout`. The client refuses
 redirects (`CheckRedirect` → `http.ErrUseLastResponse`) so a 3xx becomes a
 non-2xx error instead of replaying the bearer token and device token to a
 second URL. An FCM reply is read into memory up to `fcmMaxDrainBytes` (4 KiB,
-same cap as before) then closed; on a non-2xx reply that buffer is decoded
-for FCM's error reason (below), otherwise it is discarded.
+same cap as before) then closed; the buffer is decoded for FCM's error
+reason on a non-2xx reply, or for the message id on a 2xx (both below).
 
 ## Error handling — nothing leaks
 
@@ -79,12 +80,13 @@ for FCM's error reason (below), otherwise it is discarded.
 | Token transport/decode failure | `ErrFCMTokenFetch` | nothing |
 | FCM transport failure / cancelled ctx | `ErrFCMSend: <url.Error>` | the constant send URL + net error — the device token is in the body, never the URL |
 | FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N (REASON[, CODE])` | HTTP status plus FCM's enum-shaped `error.status` and/or FcmError `errorCode`, when present — see below; exactly `status N` otherwise |
+| FCM 2xx | `nil`, plus the message id (below) or `""` | nothing beyond the validated id |
 
 `oauth2.RetrieveError` formats the token endpoint's response body into its
 `Error()` string, so `Send` never returns or wraps it as-is — it extracts
 only `Response.StatusCode`. The sender holds no logger, so it logs nothing;
-[`log_allowlist.go`](../../../internal/relay/log_allowlist.go) is unchanged
-by this ticket.
+logging happens in the caller (below, and [Push wake dispatch](push-wake-dispatch.md)
+§ Error handling).
 
 ### Naming FCM's reason (#150)
 
@@ -107,6 +109,26 @@ reads `relay: fcm send failed: status 404 (NOT_FOUND, UNREGISTERED)`; with
 only one, only that one appears in the parentheses. No new log key —
 [`push_wake.go`](../../../internal/relay/push_wake.go)'s `PushWaker.send`
 still logs the whole error under the already-allowlisted `err` key.
+
+### Returning FCM's message id (#160)
+
+On a 2xx reply, `fcmMessageID` decodes the same drained buffer into
+`fcmSendReply`, a struct declaring only `name` — the field a successful
+reply carries as `projects/<project>/messages/<id>`. The id is returned
+only when `isFCMMessageID` accepts it: 1 to `fcmMaxMessageIDLen` (256)
+bytes of `[A-Za-z0-9/:%_-]`, a charset that excludes space, `=`, `"` and
+control bytes — the same log-injection concern `isFCMEnum` guards against
+for the error reason, since a hostile or misconfigured-proxy reply could
+otherwise plant forged `key=value` fields in a `slog` text line. A missing,
+malformed, or over-long `name` is silently `""`; `Send` never fails because
+of what a 2xx body contains, and extra fields alongside `name` are ignored.
+
+`tokenFingerprint(token string) string`, also in `push.go`, returns the
+first 8 hex characters of the device token's SHA-256 — stable per token,
+one-way, safe to log in the token's place. It exists for the caller: see
+[Push wake dispatch](push-wake-dispatch.md) § Error handling for the full
+logging contract (`push_wake_sent` / `push_wake_send_failed`, one line per
+admitted wake).
 
 ## Concurrency
 
