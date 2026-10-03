@@ -20,4 +20,13 @@ var allowedLogKeys = map[string]struct{}{
 	// WS close code (uint16) from a daemon close directive. Non-sensitive:
 	// a protocol status number, never user or key material.
 	"close_code": {},
+	// First 8 hex chars of the SHA-256 of a push device token: a truncated
+	// one-way hash of a high-entropy token, never the token itself.
+	"token_fp": {},
+	// FCM's message name from a 2xx send reply, accepted only as
+	// [A-Za-z0-9/:%_-]{1,256} by isFCMMessageID. Names a message at Google;
+	// carries no user content.
+	"fcm_message_id": {},
+	// Elapsed time of a push send.
+	"duration": {},
 }

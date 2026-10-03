@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -37,6 +39,9 @@ const (
 	fcmSendTimeout = 10 * time.Second
 	// fcmMaxDrainBytes caps how much of an FCM reply is read before close.
 	fcmMaxDrainBytes = 4 << 10
+	// fcmMaxMessageIDLen caps the message name Send returns. A real one,
+	// projects/<project>/messages/<id>, is about 70 bytes.
+	fcmMaxMessageIDLen = 256
 )
 
 var (
@@ -149,19 +154,21 @@ type fcmAndroid struct {
 	Priority string `json:"priority"`
 }
 
-// Send wakes the device holding deviceToken. Returned errors never contain
-// the device token, the access token, the credentials or reply text beyond
-// FCM's enum reason codes.
-func (s *FCMSender) Send(ctx context.Context, deviceToken string) error {
+// Send wakes the device holding deviceToken and returns FCM's message name
+// from the 2xx reply, or "" when it is missing or fails isFCMMessageID. A bad
+// name does not fail the send. Returned values never contain the device
+// token, the access token, the credentials or reply text beyond the
+// validated name and FCM's enum reason codes.
+func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error) {
 	tok, err := s.tokens.Token()
 	if err != nil {
 		// oauth2.RetrieveError formats the token endpoint's body into its
 		// Error(); keep only the status.
 		var rErr *oauth2.RetrieveError
 		if errors.As(err, &rErr) && rErr.Response != nil {
-			return fmt.Errorf("%w: status %d", ErrFCMTokenFetch, rErr.Response.StatusCode)
+			return "", fmt.Errorf("%w: status %d", ErrFCMTokenFetch, rErr.Response.StatusCode)
 		}
-		return ErrFCMTokenFetch
+		return "", ErrFCMTokenFetch
 	}
 
 	body, err := json.Marshal(fcmSendRequest{Message: fcmMessage{
@@ -169,14 +176,14 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) error {
 		Android: fcmAndroid{Priority: "HIGH"},
 	}})
 	if err != nil {
-		return fmt.Errorf("%w: encoding request: %w", ErrFCMSend, err)
+		return "", fmt.Errorf("%w: encoding request: %w", ErrFCMSend, err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, fcmSendTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.sendURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("%w: building request: %w", ErrFCMSend, err)
+		return "", fmt.Errorf("%w: building request: %w", ErrFCMSend, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -185,18 +192,58 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) error {
 	if err != nil {
 		// *url.Error carries only sendURL and the transport error; the
 		// device token travels in the body.
-		return fmt.Errorf("%w: %w", ErrFCMSend, err)
+		return "", fmt.Errorf("%w: %w", ErrFCMSend, err)
 	}
 	defer resp.Body.Close()
 	reply, _ := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		if reason := fcmErrorReason(reply); reason != "" {
-			return fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
+			return "", fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
 		}
-		return fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
+		return "", fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
 	}
-	return nil
+	return fcmMessageID(reply), nil
+}
+
+// fcmSendReply declares only the message name; any other field in a 2xx
+// reply is ignored.
+type fcmSendReply struct {
+	Name string `json:"name"`
+}
+
+// fcmMessageID returns the name field of a 2xx reply if it passes
+// isFCMMessageID, else "".
+func fcmMessageID(reply []byte) string {
+	var r fcmSendReply
+	if json.Unmarshal(reply, &r) != nil || !isFCMMessageID(r.Name) {
+		return ""
+	}
+	return r.Name
+}
+
+// isFCMMessageID reports whether s is 1-fcmMaxMessageIDLen bytes of
+// [A-Za-z0-9/:%_-]. The set excludes space, '=', '"' and control bytes, so a
+// logged id cannot forge log fields.
+func isFCMMessageID(s string) bool {
+	if s == "" || len(s) > fcmMaxMessageIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') &&
+			c != '/' && c != ':' && c != '%' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// tokenFingerprint returns the first 8 hex characters of the SHA-256 of a
+// device token: stable per token, one-way, and safe to log in its place.
+func tokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:4])
 }
 
 // fcmErrorType is the @type of the error detail that carries FCM's errorCode.

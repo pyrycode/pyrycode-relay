@@ -127,7 +127,7 @@ func TestFCMSender_SendRequestShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFCMSender: %v", err)
 	}
-	if err := s.Send(context.Background(), testFCMDeviceToken); err != nil {
+	if _, err := s.Send(context.Background(), testFCMDeviceToken); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -197,7 +197,7 @@ func TestFCMSender_ReusesAccessToken(t *testing.T) {
 		t.Fatalf("newFCMSender: %v", err)
 	}
 	for i := 0; i < 2; i++ {
-		if err := s.Send(context.Background(), testFCMDeviceToken); err != nil {
+		if _, err := s.Send(context.Background(), testFCMDeviceToken); err != nil {
 			t.Fatalf("Send #%d: %v", i+1, err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestFCMSender_NonSuccessReplyNamesOnlyStatus(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newFCMSender: %v", err)
 			}
-			err = s.Send(context.Background(), testFCMDeviceToken)
+			_, err = s.Send(context.Background(), testFCMDeviceToken)
 			if !errors.Is(err, ErrFCMSend) {
 				t.Fatalf("Send err = %v, want ErrFCMSend", err)
 			}
@@ -277,7 +277,7 @@ func TestFCMSender_NonSuccessReplyNamesFCMReason(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newFCMSender: %v", err)
 			}
-			err = s.Send(context.Background(), testFCMDeviceToken)
+			_, err = s.Send(context.Background(), testFCMDeviceToken)
 			if !errors.Is(err, ErrFCMSend) {
 				t.Fatalf("Send err = %v, want ErrFCMSend", err)
 			}
@@ -286,6 +286,92 @@ func TestFCMSender_NonSuccessReplyNamesFCMReason(t *testing.T) {
 			}
 			assertNoSecrets(t, err.Error())
 		})
+	}
+}
+
+// testFCMMessageID is shaped like a real FCM HTTP v1 message name.
+const testFCMMessageID = "projects/pyrycode-mobile/messages/0:1500415314455276%31bd1c9631bd1c96"
+
+func TestFCMSender_SuccessReplyMessageID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"real id", `{"name":"` + testFCMMessageID + `"}`, testFCMMessageID},
+		{"id beside extra fields", `{"name":"` + testFCMMessageID + `","note":"` + testFCMMarker + ` ` + testFCMDeviceToken + `"}`, testFCMMessageID},
+		{"id at the length cap", `{"name":"` + strings.Repeat("a", fcmMaxMessageIDLen) + `"}`, strings.Repeat("a", fcmMaxMessageIDLen)},
+		{"missing name", `{"note":"` + testFCMMarker + `"}`, ""},
+		{"empty body", "", ""},
+		{"not JSON", testFCMMarker + " " + testFCMDeviceToken, ""},
+		{"name not a string", `{"name":7}`, ""},
+		{"over the length cap", `{"name":"` + strings.Repeat("a", fcmMaxMessageIDLen+1) + `"}`, ""},
+		{"name with space", `{"name":"projects/x/messages/1 ` + testFCMMarker + `"}`, ""},
+		{"name echoing the token", `{"name":"` + testFCMMarker + `.` + testFCMDeviceToken + `"}`, ""},
+		{"name forging a log key", `{"name":"1 err=forged"}`, ""},
+		{"name with newline", `{"name":"1\nlevel=ERROR"}`, ""},
+		{"name with quote", `{"name":"1\"x"}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			oauth, _ := fakeOAuth(t, 0)
+			fcm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(fcm.Close)
+
+			s, err := newFCMSender(testServiceAccountJSON(t, oauth.URL), fcm.URL)
+			if err != nil {
+				t.Fatalf("newFCMSender: %v", err)
+			}
+			id, err := s.Send(context.Background(), testFCMDeviceToken)
+			if err != nil {
+				t.Fatalf("Send err = %v, want nil (a bad id is still a success)", err)
+			}
+			if id != tc.want {
+				t.Errorf("id = %q, want %q", id, tc.want)
+			}
+			assertNoSecrets(t, id)
+		})
+	}
+}
+
+func TestFCMSender_FailureReturnsNoID(t *testing.T) {
+	t.Parallel()
+	oauth, _ := fakeOAuth(t, 0)
+	fcm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"name":"`+testFCMMessageID+`"}`)
+	}))
+	t.Cleanup(fcm.Close)
+
+	s, err := newFCMSender(testServiceAccountJSON(t, oauth.URL), fcm.URL)
+	if err != nil {
+		t.Fatalf("newFCMSender: %v", err)
+	}
+	id, err := s.Send(context.Background(), testFCMDeviceToken)
+	if !errors.Is(err, ErrFCMSend) || id != "" {
+		t.Fatalf("Send = (%q, %v), want (\"\", ErrFCMSend)", id, err)
+	}
+}
+
+func TestTokenFingerprint(t *testing.T) {
+	t.Parallel()
+	fp := tokenFingerprint(testFCMDeviceToken)
+	if len(fp) != 8 || strings.Trim(fp, "0123456789abcdef") != "" {
+		t.Fatalf("fingerprint %q, want 8 lowercase hex chars", fp)
+	}
+	if again := tokenFingerprint(testFCMDeviceToken); again != fp {
+		t.Errorf("fingerprint not stable: %q then %q", fp, again)
+	}
+	if other := tokenFingerprint(testFCMDeviceToken + "x"); other == fp {
+		t.Errorf("different tokens share fingerprint %q", fp)
+	}
+	if strings.Contains(testFCMDeviceToken, fp) {
+		t.Errorf("fingerprint %q is a substring of the token", fp)
 	}
 }
 
@@ -298,7 +384,7 @@ func TestFCMSender_TokenFetchFailureCarriesNoBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFCMSender: %v", err)
 	}
-	err = s.Send(context.Background(), testFCMDeviceToken)
+	_, err = s.Send(context.Background(), testFCMDeviceToken)
 	if !errors.Is(err, ErrFCMTokenFetch) {
 		t.Fatalf("Send err = %v, want ErrFCMTokenFetch", err)
 	}
@@ -319,7 +405,7 @@ func TestFCMSender_CancelledContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = s.Send(ctx, testFCMDeviceToken)
+	_, err = s.Send(ctx, testFCMDeviceToken)
 	if !errors.Is(err, ErrFCMSend) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("Send err = %v, want ErrFCMSend wrapping context.Canceled", err)
 	}

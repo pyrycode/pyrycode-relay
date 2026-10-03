@@ -40,10 +40,11 @@ var (
 	ErrPushWakeInFlightCap = errors.New("relay: push_wake in-flight cap reached")
 )
 
-// pushSender is the send capability PushWaker needs. *FCMSender satisfies
-// it; tests substitute a fake.
+// pushSender is the send capability PushWaker needs. Send returns a
+// validated message id on success, or "". *FCMSender satisfies it; tests
+// substitute a fake.
 type pushSender interface {
-	Send(ctx context.Context, deviceToken string) error
+	Send(ctx context.Context, deviceToken string) (string, error)
 }
 
 // PushWaker admits wake requests from binaries and sends each one off the
@@ -130,17 +131,37 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	return nil
 }
 
-// send runs one wake. It exits when Send returns, which the sender's own
-// timeout and the waker's context (cancelled by Close) both bound.
+// send runs one wake and logs exactly one outcome line for it, keyed by a
+// fingerprint of the token, never the token. It exits when Send returns,
+// which the sender's own timeout and the waker's context (cancelled by
+// Close) both bound.
 func (w *PushWaker) send(serverID, token string) {
 	defer w.wg.Done()
 	defer func() { <-w.slots }()
-	if err := w.sender.Send(w.ctx, token); err != nil {
+	start := time.Now()
+	id, err := w.sender.Send(w.ctx, token)
+	duration := time.Since(start)
+	fp := tokenFingerprint(token)
+	switch {
+	case err != nil:
 		// FCMSender's errors carry at most an HTTP status and FCM's enum
 		// reason codes, never the token or free text.
 		w.logger.Warn("push_wake_send_failed",
 			"server_id", serverID,
+			"token_fp", fp,
+			"duration", duration,
 			"err", err)
+	case id != "":
+		w.logger.Info("push_wake_sent",
+			"server_id", serverID,
+			"token_fp", fp,
+			"duration", duration,
+			"fcm_message_id", id)
+	default:
+		w.logger.Info("push_wake_sent",
+			"server_id", serverID,
+			"token_fp", fp,
+			"duration", duration)
 	}
 }
 
