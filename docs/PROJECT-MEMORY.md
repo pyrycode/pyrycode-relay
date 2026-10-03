@@ -2,15 +2,15 @@
 
 Stateless WebSocket router between mobile clients and pyry binaries. Internet-exposed; adversarial input is the default assumption. Authoritative wire spec lives in `pyrycode/pyrycode/docs/protocol-mobile.md`.
 
-> **READ-ONLY FOR AGENTS (as of 2026-05-11).** All five pipeline agents have explicit "Never Update docs/PROJECT-MEMORY.md" rules. Per-ticket content (implementation, patterns, lessons) goes in [`docs/knowledge/codebase/<ticket>.md`](knowledge/codebase/). Humans maintain this file directly.
+> **READ-ONLY FOR AGENTS (as of 2026-05-11).** All five pipeline agents have explicit "Never Update docs/PROJECT-MEMORY.md" rules. Lessons fold into the feature doc for the area under [`docs/knowledge/features/`](knowledge/features/). The per-ticket notes under [`docs/knowledge/codebase/`](knowledge/codebase/) were frozen on 2026-10-03. Humans maintain this file directly.
 
 ## Where things live
 
-- `docs/knowledge/codebase/<N>.md` — **per-ticket implementation summary + patterns established + lessons learned.** One file per ticket. Directory listing IS the index.
-- `docs/knowledge/features/` — evergreen feature docs.
+- `docs/knowledge/codebase/<N>.md` — **frozen 2026-10-03.** Per-ticket notes up to relay #154, kept as history.
+- `docs/knowledge/features/` — evergreen feature docs. Lessons fold into the section of the doc they belong to.
 - `docs/knowledge/decisions/` — ADRs, numbered sequentially.
 - `docs/knowledge/INDEX.md` — one-line summaries. **Documentation phase is the sole writer.**
-- `docs/lessons.md` — **frozen 2026-05-11.** Historical reference. New lessons go in `docs/knowledge/codebase/<N>.md`.
+- `docs/lessons.md` — **frozen 2026-05-11.** Historical reference. New lessons go in the feature doc for the area.
 - `docs/specs/architecture/<ticket>-<slug>.md` — architect specs.
 - `docs/architecture.md` — system-level design overview.
 - `docs/threat-model.md` — operational threat model (deploy, supply chain, DoS, log hygiene, TLS).
@@ -18,7 +18,7 @@ Stateless WebSocket router between mobile clients and pyry binaries. Internet-ex
 
 ## Project-level conventions (human-maintained)
 
-Stable rules that span tickets. New entries land here only when genuinely cross-cutting; per-ticket detail goes in `codebase/<N>.md`.
+Stable rules that span tickets. New entries land here only when genuinely cross-cutting; per-ticket detail goes in the feature doc for the area.
 
 - **Sentinel errors + `errors.Is` branching at protocol boundaries.** New routing-layer code follows the `Err...` naming and wraps with `fmt.Errorf("…: %w", err, sentinel)`.
 - **Opacity by type for inner-frame payloads.** Carried as `json.RawMessage`. The relay never deserialises payloads; the type makes that hard to violate accidentally.
