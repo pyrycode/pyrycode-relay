@@ -36,6 +36,16 @@ locally at `../pyrycode/docs/protocol-mobile.md` when the sibling checkout
 exists. The relay is content-blind: the protocol version lives in each frame's
 `v` field, not in the `/v1/*` route paths.
 
+## Use codegraph for symbol lookups
+
+This repo is indexed for codegraph (`.codegraph/`, gitignored). Prefer `mcp__codegraph__codegraph_*` MCP tools over grep for symbol-level questions — where something is defined, what calls it, what breaks if it changes.
+
+- **Before changing or removing an exported function** — run `codegraph_callers` first to find every call site.
+- **"Where is X defined" / "what does X call"** — `codegraph_search`, `codegraph_node`, and `codegraph_callees` beat reading files end to end.
+- **For a broader "how does this area work"** — `codegraph_context` or `codegraph_impact` before a cross-cutting change.
+- Fall back to grep/Read for comments, string literals, and pending edits the index hasn't picked up yet.
+- In Claude Code these are deferred tools: load them once with `ToolSearch` (e.g. `select:mcp__codegraph__codegraph_search`) before first use. Codex sees the same `mcp__codegraph__<tool>` names directly.
+
 ## Rules
 
 - `docs/PROJECT-MEMORY.md` is **read-only for agents**. Humans maintain it
