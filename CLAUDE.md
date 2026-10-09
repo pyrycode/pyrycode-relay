@@ -36,15 +36,18 @@ locally at `../pyrycode/docs/protocol-mobile.md` when the sibling checkout
 exists. The relay is content-blind: the protocol version lives in each frame's
 `v` field, not in the `/v1/*` route paths.
 
-## Use codegraph for symbol lookups
+<!-- CODEGRAPH_START -->
+## CodeGraph
 
-This repo is indexed for codegraph (`.codegraph/`, gitignored). Prefer `mcp__codegraph__codegraph_*` MCP tools over grep for symbol-level questions — where something is defined, what calls it, what breaks if it changes.
+Adapted from the block CodeGraph 1.6.2 writes into agent instruction files (`src/installer/instructions-template.ts`, github.com/colbymchenry/codegraph).
 
-- **Before changing or removing an exported function** — run `codegraph_callers` first to find every call site.
-- **"Where is X defined" / "what does X call"** — `codegraph_search`, `codegraph_node`, and `codegraph_callees` beat reading files end to end.
-- **For a broader "how does this area work"** — `codegraph_context` or `codegraph_impact` before a cross-cutting change.
-- Fall back to grep/Read for comments, string literals, and pending edits the index hasn't picked up yet.
-- In Claude Code these are deferred tools: load them once with `ToolSearch` (e.g. `select:mcp__codegraph__codegraph_search`) before first use. Codex sees the same `mcp__codegraph__<tool>` names directly.
+This repository is indexed by CodeGraph (`.codegraph/` at the repo root, gitignored). Reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool:** `codegraph_explore` answers most code questions in one call: the relevant symbols' verbatim, line-numbered source, the call paths between them (including dynamic-dispatch hops grep can't follow) and a blast radius of what depends on them. Name a file or symbol in the query to read its current source. If it is listed but deferred, load it by name via tool search (`select:mcp__codegraph__codegraph_explore`).
+- **Shell (always works):** `codegraph explore "<symbol names or question>"` prints the same output. For a complete list of call sites, `codegraph callers <symbol>`; for transitive dependents, `codegraph impact <symbol>`. The shell reads the index without updating it.
+
+Trust codegraph's results; don't re-verify them with grep. Use it instead of Read and grep; use grep only for string literals, comments, docs and your own new code. A running codegraph server folds your edits into the index within about a second; if a response starts with a staleness banner or flags a file as changed on disk, Read the files it lists. If there is no `.codegraph/` directory, skip CodeGraph entirely.
+<!-- CODEGRAPH_END -->
 
 ## Rules
 
