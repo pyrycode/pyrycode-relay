@@ -97,3 +97,7 @@ Pending for documentation stage:
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-11
+
+## Revisions
+
+- 2026-10-11: Reading Go's `ServeTLS` confirmed setup errors can return before `Serve` takes listener ownership. Preserve `ListenAndServeTLS`'s deferred listener Close in the HTTPS callback as well as closing on PROXY setup failure. Add an omitted-flag test admitting exactly 32 keep-alive connections. Final recount remains below 800 lines, with no new exported types or changed consumer signatures.

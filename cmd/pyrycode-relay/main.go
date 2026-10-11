@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pyrycode/pyrycode-relay/internal/relay"
+	"golang.org/x/net/netutil"
 )
 
 // drainDeadline bounds how long Shutdown will wait for in-flight WS
@@ -58,6 +59,22 @@ const proxyHeaderTimeout = 5 * time.Second
 // Raise it with --max-connections on a bigger machine. See
 // docs/specs/architecture/114-global-connection-cap.md.
 const defaultMaxConnections = 20
+
+// defaultMaxListenerConnections bounds raw sockets independently on each
+// public listener, including PROXY/TLS/HTTP parsing and hijacked WebSockets.
+// Combined 256 MiB estimate, with both HTTPS and HTTP-01 full:
+//
+//   - 2 × 32 raw slots × ~128 KiB ≈ 8 MiB for 16 KiB headers + Go's 4 KiB
+//     slack, TLS/PROXY/bufio buffers and grown goroutine stacks;
+//   - 20 upgraded sessions × ~4.4 MiB ≈ 88 MiB (derivation above). Their
+//     sockets occupy the raw slots; they are not additional connections.
+//
+// Conservatively charging raw storage even for upgraded slots gives ~96 MiB
+// live connection state. GOGC=100 headroom doubles that to ~192 MiB; the
+// ~56 MiB runtime/autocert/kernel reserve above brings it to ~248 MiB.
+// This leaves admission headroom above 20 upgrades, but is a sizing estimate,
+// not an OOM guarantee: an operator must verify it on an isolated Fly app.
+const defaultMaxListenerConnections = 32
 
 // Version is overridden at build time via -ldflags.
 var Version = "dev"
@@ -103,6 +120,9 @@ func run(args []string, sigCtx context.Context) int {
 		maxConnections = fs.Int("max-connections", defaultMaxConnections,
 			"Global cap on live WebSocket connections across /v1/server and /v1/client. "+
 				"Upgrades beyond it get HTTP 503 before the handshake. Must be positive.")
+		maxListenerConnections = fs.Int("max-listener-connections", defaultMaxListenerConnections,
+			"Cap on accepted connections per public listener, including PROXY, TLS, HTTP and WebSockets. "+
+				"Additional connections wait until a socket closes. Must be positive; metrics are separate.")
 		showVersion = fs.Bool("version", false, "Print version and exit.")
 	)
 	_ = fs.Parse(args)
@@ -135,6 +155,13 @@ func run(args []string, sigCtx context.Context) int {
 			"fix", "use --insecure-listen alone (proxy-fronted plaintext mode), "+
 				"OR use --domain with optional --http-listen / --https-listen (autocert mode); "+
 				"the new flags configure the autocert listeners and have no effect in insecure mode")
+		return 2
+	}
+
+	if *maxListenerConnections <= 0 {
+		logger.Error("refusing to start: invalid --max-listener-connections",
+			"value", *maxListenerConnections,
+			"fix", "pass a positive connection count, or omit the flag for the default")
 		return 2
 	}
 
@@ -347,7 +374,14 @@ func run(args []string, sigCtx context.Context) int {
 			logger.Info("starting metrics listener", "listen", metricsSrv.Addr)
 		}
 		return runServers(sigCtx, logger, reg, servers, func(s *http.Server) error {
-			return s.ListenAndServe()
+			if s == metricsSrv {
+				return s.ListenAndServe()
+			}
+			ln, err := net.Listen("tcp", s.Addr)
+			if err != nil {
+				return fmt.Errorf("listening on %s: %w", s.Addr, err)
+			}
+			return s.Serve(netutil.LimitListener(ln, *maxListenerConnections))
 		})
 	}
 
@@ -424,24 +458,32 @@ func run(args []string, sigCtx context.Context) int {
 		logger.Info("starting metrics listener", "listen", metricsSrv.Addr)
 	}
 	return runServers(sigCtx, logger, reg, servers, func(s *http.Server) error {
+		if s == metricsSrv {
+			return s.ListenAndServe()
+		}
+		ln, err := net.Listen("tcp", s.Addr)
+		if err != nil {
+			return fmt.Errorf("listening on %s: %w", s.Addr, err)
+		}
+		// Admission precedes every parser. Separate wrappers give HTTPS and
+		// HTTP-01 independent capacity; socket Close owns slot release even
+		// after a WebSocket hijack.
+		ln = netutil.LimitListener(ln, *maxListenerConnections)
 		if s == httpsSrv {
-			if !*httpsProxyProtocol {
-				return s.ListenAndServeTLS("", "")
-			}
+			defer ln.Close() // ServeTLS can fail before Serve takes ownership.
 			// The PROXY header precedes the TLS ClientHello, so the wrapper
 			// sits under ServeTLS's tls.NewListener rather than on top.
-			ln, err := net.Listen("tcp", s.Addr)
-			if err != nil {
-				return err
+			if *httpsProxyProtocol {
+				pln, err := relay.NewProxyProtoListener(ln, proxyHeaderTimeout)
+				if err != nil {
+					ln.Close()
+					return err
+				}
+				ln = pln
 			}
-			pln, err := relay.NewProxyProtoListener(ln, proxyHeaderTimeout)
-			if err != nil {
-				ln.Close()
-				return err
-			}
-			return s.ServeTLS(pln, "", "")
+			return s.ServeTLS(ln, "", "")
 		}
-		return s.ListenAndServe()
+		return s.Serve(ln)
 	})
 }
 
