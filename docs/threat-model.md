@@ -120,27 +120,69 @@ server timeouts), and HTTP headers 5s (`ReadHeaderTimeout`). All public
 servers retain `ReadTimeout: 60s`, `WriteTimeout: 60s`, `IdleTimeout: 120s`;
 the loopback metrics server uses the same HTTP timeouts.
 
-After `websocket.Accept` hijacks the connection, post-upgrade slow peers are bounded by three complementary mechanisms: a per-message read deadline armed the moment a message's first data-frame header arrives (`internal/relay/ws_conn.go`'s `readMessageTimeout`, 30s — [WSConn adapter](knowledge/features/ws-conn-adapter.md), #111), the write timeout on `Send` (`writeTimeout`, 10s, #15), and the heartbeat ping/pong for idle liveness (#7). The read deadline never bounds the idle gap before a message starts — a peer may sit silent indefinitely between messages — only the time to receive one once it begins, so a peer that dribbles a started message one byte at a time while still answering pings is cut off within the deadline instead of pinning the connection forever. A per-IP token-bucket rate limit fronts the `/v1/server` and `/v1/client` upgrade paths (`cmd/pyrycode-relay/main.go` policy block, `internal/relay/ratelimit_middleware.go`): ~10 attempts/IP/minute steady-state, burst 20, eviction sweep every 5 minutes. Over-cap attempts receive `429 Too Many Requests` before `websocket.Accept` runs; the wrapped registry is never touched on a deny. The middleware extracts the source IP via `relay.ClientIP`, which reads `r.RemoteAddr`; `X-Forwarded-For` is honoured only when the operator opts in with `--trust-x-forwarded-for` (default `false`). In production, `RemoteAddr` on the HTTPS listener is no longer the raw socket peer: Fly's raw-TCP services hand the relay Fly's own edge-proxy address, so since [#110](knowledge/codebase/110.md) the `443` port runs `--https-proxy-protocol` ([PROXY protocol listener](knowledge/features/proxy-protocol-listener.md)), which requires and parses a Fly `proxy_proto` v2 header before the TLS handshake and rewrites `RemoteAddr` to the header's source — the per-IP key the rate limiter reads is the client's real address, not Fly's. `/healthz` bypasses upgrade-rate and upgraded-session limits, but still needs a raw listener slot. Bandwidth amplification is structurally absent: the relay forwards 1:1, so there is no amplification factor an attacker can lever. A conflicting `/v1/server` claim now probes the incumbent binary for liveness before displacing it ([`/v1/server` § conflict probe](knowledge/features/server-endpoint.md), #112); the probe costs one ping frame per upgrade attempt and holds one handler goroutine for at most `conflictProbeTimeout` (10s) — no worse than the pre-#112 upgraded-then-closed conflict, and no amplification (one claim, one ping). Since [#113](knowledge/codebase/113.md), delivering a routed frame to a phone no longer runs on the binary forwarder's read loop at all: each phone is registered behind a bounded [per-phone delivery queue](knowledge/features/phone-outbox.md), and the forwarder only enqueues — an operation that never blocks. A stalled phone can therefore no longer hold up the binary's `Read`, its sibling phones, or the binary's own pong processing; it is bounded first by the queue filling and then by `WSConn.Send`'s 10s write deadline, and is closed with `1011` either way. The queue was originally bound by frame count (16 deep); since [#154](knowledge/codebase/154.md) it is bound by bytes instead (`phoneOutboxBudget` = 4 MiB, charging each item's frame length plus a fixed per-item overhead, including the frame currently being written), because a daemon holding a dozen or more sessions can legitimately send well over 16 small frames back to back right after the handshake — a burst the frame-count bound mistook for a stalled phone and closed with `1011`. The 4 MiB-per-phone / 64 MiB-per-server-id worst case is unchanged. Since [#114](knowledge/codebase/114.md), a relay-wide [connection cap](knowledge/features/connection-cap.md) (`internal/relay/conncap.go`'s `ConnCap`, `--max-connections`, default 20) bounds upgraded-handler lifetimes across `/v1/server` and `/v1/client` combined — closing the OOM path a slow attacker could previously reach by staying under the rate limiter's refill rate. One `ConnCap` instance wraps both upgrade handlers, nested inside the rate limiter and the HTTP-429-only observers (`WrapServerRateLimitDeny(rateLimit(connCap.Wrap(...)))`), so a rate-limited attempt never takes a slot. A slot is taken right before `websocket.Accept` and released by `defer` when the handler returns; because both handlers stay inside `ServeHTTP` for the connection's whole life and return only after their own cleanup, that single acquire/release pair covers every close path. Over cap: an empty-body `503` and one `conn_cap_reached` Warn line, before the upgrade handler examines routing headers. `--max-connections` must be positive; the relay refuses to start otherwise.
+After `websocket.Accept` hijacks the connection, post-upgrade slow peers are bounded by three complementary mechanisms: a per-message read deadline armed the moment a message's first data-frame header arrives (`internal/relay/ws_conn.go`'s `readMessageTimeout`, 30s — [WSConn adapter](knowledge/features/ws-conn-adapter.md), #111), the write timeout on `Send` (`writeTimeout`, 10s, #15), and the heartbeat ping/pong for idle liveness (#7). The read deadline never bounds the idle gap before a message starts — a peer may sit silent indefinitely between messages — only the time to receive one once it begins, so a peer that dribbles a started message one byte at a time while still answering pings is cut off within the deadline instead of pinning the connection forever. A per-IP token-bucket rate limit fronts the `/v1/server` and `/v1/client` upgrade paths (`cmd/pyrycode-relay/main.go` policy block, `internal/relay/ratelimit_middleware.go`): ~10 attempts/IP/minute steady-state, burst 20, eviction sweep every 5 minutes. Over-cap attempts receive `429 Too Many Requests` before `websocket.Accept` runs; the wrapped registry is never touched on a deny. The middleware extracts the source IP via `relay.ClientIP`, which reads `r.RemoteAddr`; `X-Forwarded-For` is honoured only when the operator opts in with `--trust-x-forwarded-for` (default `false`). In production, `RemoteAddr` on the HTTPS listener is no longer the raw socket peer: Fly's raw-TCP services hand the relay Fly's own edge-proxy address, so since [#110](knowledge/codebase/110.md) the `443` port runs `--https-proxy-protocol` ([PROXY protocol listener](knowledge/features/proxy-protocol-listener.md)), which requires and parses a Fly `proxy_proto` v2 header before the TLS handshake and rewrites `RemoteAddr` to the header's source — the per-IP key the rate limiter reads is the client's real address, not Fly's. `/healthz` bypasses upgrade-rate and upgraded-session limits, but still needs a raw listener slot. Bandwidth amplification is structurally absent: the relay forwards 1:1, so there is no amplification factor an attacker can lever. A conflicting `/v1/server` claim now probes the incumbent binary for liveness before displacing it ([`/v1/server` § conflict probe](knowledge/features/server-endpoint.md), #112); the probe costs one ping frame per upgrade attempt and holds one handler goroutine for at most `conflictProbeTimeout` (10s) — no worse than the pre-#112 upgraded-then-closed conflict, and no amplification (one claim, one ping). Since [#113](knowledge/codebase/113.md), delivering a routed frame to a phone no longer runs on the binary forwarder's read loop at all: each phone is registered behind a bounded [per-phone delivery queue](knowledge/features/phone-outbox.md), and the forwarder only enqueues — an operation that never blocks. A stalled phone can therefore no longer hold up the binary's `Read`, its sibling phones, or the binary's own pong processing; it is bounded first by the queue filling and then by `WSConn.Send`'s 10s write deadline, and is closed with `1011` either way. The queue was originally bound by frame count (16 deep); since [#154](knowledge/codebase/154.md) it is bound by bytes instead (`phoneOutboxBudget` = 4 MiB, charging each item's frame length plus a fixed per-item overhead, including the frame currently being written), because a daemon holding a dozen or more sessions can legitimately send well over 16 small frames back to back right after the handshake — a burst the frame-count bound mistook for a stalled phone and closed with `1011`. The 4 MiB-per-phone / 64 MiB-per-server-id worst case is unchanged.
 
-**Residual risk:** Neither cap gives a per-source allowance. One source
-can fill a raw listener with pre-header connections without ever reaching
-the upgrade-rate limiter; it can also fill the upgraded cap in one burst
-(20). New admission can be locked out while established connections continue.
-Phase timeouts limit stalled PROXY/TLS/HTTP occupancy, but continuously
-replaced peers can keep the listener full. Accepted upgraded sessions that
-answer heartbeats can hold raw slots much longer than those timeouts.
-Upgrade-rate limiting starts only after HTTP headers, so it offers no
-protection for earlier phases. HTTPS and HTTP-01 capacity is independent,
-but a source can target both. The caps bound accepted sockets and upgraded
-state; they do not guarantee memory use under the estimated machine budget
-or cap Fly's edge resources and the kernel backlog. Fly's configured forwarding
-ceilings are a separate boundary and do not cover direct private-network
-connections to the listeners. Per-source allowances remain deferred in
+The relay-wide [connection cap](knowledge/features/connection-cap.md)
+(`internal/relay/conncap.go`'s `ConnCap`, `--max-connections`, default 20)
+bounds live upgraded handlers across both routes (#114). The per-source
+allowance (`SourceConnCap`, `--max-connections-per-source`, default 8) prevents
+one source from occupying that entire pool (#180). Eight accommodates a
+daemon, six phones and a desktop behind a NAT, leaving twelve global slots
+for other sources. Both endpoints share one source count using the exact
+`ClientIP` result and the same `--trust-x-forwarded-for` setting as rate
+limiting; PROXY HTTPS supplies the declared source through `RemoteAddr`.
+
+Admission order is HTTP-429 metrics observer → rate limiter → source
+allowance → global cap → endpoint. Empty-source and rate-limited attempts
+reserve neither capacity. Source saturation returns HTTP 503 with only a
+newline and one `source_conn_cap_reached` Warn carrying
+`strconv.Quote(source)` under `remote`, without taking a global slot. Global
+saturation returns the same public response with a `conn_cap_reached` Warn
+and releases its temporary source reservation. Both refuse before
+`websocket.Accept` and before endpoint routing-header checks; neither 503
+increments the 429 counters. Reservations last until handler cleanup returns,
+including rejected handshakes, close handshakes, heartbeat timeout,
+grace-expiry teardown and shutdown. The last source release deletes its
+entry. Startup requires positive raw/global caps and `0 < source < global`,
+including omitted defaults, or exits 2 before listeners or workers start.
+
+**Residual risk:** One source can still fill a raw listener with pre-header
+connections without ever reaching the upgraded source gate. Phase timeouts
+limit stalled PROXY/TLS/HTTP occupancy, but continuously replaced peers can
+keep the listener full. Accepted upgraded sessions that answer heartbeats
+can hold raw slots much longer than those timeouts. HTTPS and HTTP-01
+capacity is independent, but a source can target both. Many sources can
+still exhaust the global upgraded pool, including one operator's daemons
+and phones on different addresses. New admission can be locked out while
+established connections continue.
+
+The caps bound accepted sockets and upgraded state; they do not guarantee
+memory use under the estimated machine budget or cap Fly's edge resources
+and the kernel backlog. Fly's configured forwarding ceilings are a separate
+boundary and do not cover direct private-network connections to the
+listeners. Per-source raw allowances remain deferred in
 [`security-followups.md`](security-followups.md).
 
-The single-instance limiter is per-process — a future multi-instance deployment behind L4 load balancing would need shared state to converge on a global limit. `X-Forwarded-For` is binary trust (all-or-nothing) — a CIDR-aware trusted-proxy chain is not implemented. The PROXY header is trusted from *any* upstream that reaches the HTTPS listener (`ConnPolicy: REQUIRE`, not scoped to a source allowlist) — a peer on the Fly app's private 6PN network that reaches internal port 8443 directly, bypassing Fly's public edge, can forge its own source address and choose its rate-limit bucket. That is an org-internal attacker, not an internet one; see [`security-followups.md`](security-followups.md). The per-phone delivery queue's 64 MiB-per-server-id worst case is now also bounded by the global connection cap: 16 phones on one server-id already consume 16 of the default 20 global slots, so a hostile operator running several non-reading-phone-heavy daemons is throttled by the same cap as any other connection flood, not exempt from it. What remains is the same per-source gap as above — nothing stops one operator's several daemons, each on a different server-id, from being the ones that fill those slots.
+Source limits are per-process; a future multi-instance deployment behind
+L4 load balancing would need shared state. XFF trust is all-or-nothing:
+when enabled without a trusted proxy setting it correctly, clients can spoof
+their source and bypass both source limits. A CIDR-aware trusted-proxy chain is not
+implemented. The PROXY header is trusted from any upstream reaching the
+HTTPS listener (`ConnPolicy: REQUIRE`, no source allowlist). A peer on Fly's
+private 6PN network reaching internal port 8443 directly can forge its source
+and choose both its rate bucket and upgraded allowance; see
+[`security-followups.md`](security-followups.md). The per-phone queue budget
+remains bounded by the global cap: 16 phones on one server-id use 16 of the
+20 global slots, and require multiple source addresses under the default
+source allowance. Several daemons on different server-ids still compete for
+the same global pool, regardless of operator ownership.
 
-**Future hardening:** Per-source concurrent allowances layered on the raw and upgraded caps; a CIDR-allowlisted trusted-proxy chain for `X-Forwarded-For`; reverse-proxy fronting for L4 protections; shared rate-limit state for multi-instance deployments. Trigger: first observed single-IP connection flood, first multi-instance deployment, or first paying user.
+**Future hardening:** Per-source allowances on raw listener sockets, with
+source attribution before HTTP and trusted PROXY handling; a CIDR-allowlisted
+trusted-proxy chain for XFF; reverse-proxy fronting for L4 protections; shared
+source-limit state for multi-instance deployments. Trigger: observed
+single-source raw listener lockout, first multi-instance deployment, or first
+paying user.
 
 ## Log hygiene — what must not be logged
 

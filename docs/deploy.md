@@ -176,15 +176,29 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    for the limits and residual exposure. Apply the change by deploying
    from clean `main` after merge using the flow below.
 
-6. **Raw capacity is 32 accepted sockets per public listener.**
+6. **Defaults on the 256 MB machine: 8 upgraded handlers per source,
+   20 globally, 32 accepted sockets per public listener.**
    `--max-listener-connections` defaults to 32 independently for HTTPS and
    HTTP-01 (or the alternative insecure listener). It wraps TCP acceptance
    before PROXY/TLS/HTTP parsing and retains slots through keep-alive and
    WebSocket hijacking until socket close. At capacity, peers wait outside
    acceptance; successful TCP dial does not mean admission. `/healthz`
    consumes raw slots; loopback metrics remains separate. The existing
-   `--max-connections` default of 20 still governs upgraded sessions.
-   Neither default requires an argv change, and both must be positive.
+   `--max-connections` default of 20 governs upgraded sessions, while
+   `--max-connections-per-source` defaults to 8 shared across both upgrade
+   endpoints. Eight allows a daemon, six phones and a desktop behind one
+   NAT; all clients using that source share the allowance. The source gate
+   runs after HTTP headers, so one source can still saturate raw slots.
+   None of these defaults requires an argv change.
+
+   All three values must be positive; the effective source allowance must
+   also be strictly below the global cap (`0 < source < global`). Invalid
+   configuration exits 2 before listeners or workers start, including an
+   omitted source default of 8 when the global cap is reduced to 8 or below.
+   Explicitly lower the source allowance in that case, for example
+   `--max-connections=4 --max-connections-per-source=2`. A global cap of 1
+   admits no valid positive source allowance. Raw capacity is independent
+   of this coupled validation rule.
 
    Both raw-TCP services (8080/external 80 and 8443/external 443) also set
    `[services.concurrency]` with `type = "connections"` and `hard_limit = 32`
@@ -202,8 +216,8 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    are already within the raw slots. About 96 MiB live state × 2 for
    `GOGC=100`, plus 56 MiB runtime/autocert/kernel reserve, totals ~248 MiB.
    This conservatively overlaps some transport storage and is an estimate,
-   not a memory guarantee. Raising either cap changes the budget. Complete
-   the isolated non-production check in [Verify a deploy](#verify-a-deploy)
+   not a memory guarantee. Raising the global or raw cap changes the budget.
+   Complete the isolated non-production check in [Verify a deploy](#verify-a-deploy)
    before production deployment; merging does not perform that check.
 
 ## Steady-state flow
@@ -264,14 +278,27 @@ Observability:
 
 ## Verify a deploy
 
-Before deploying raw listener admission or Fly forwarding ceilings to
-production, the operator must verify the combined memory estimate and
-saturation/recovery behavior on an **isolated non-production Fly app**,
+Before deploying the per-source upgraded allowance, raw listener admission
+or Fly forwarding ceilings to production, the operator must verify the
+combined memory estimate and saturation/recovery behavior on an
+**isolated non-production Fly app**,
 using the intended image, 256 MB machine size,
 `GOGC=100` and production listener/PROXY wiring. Keep its domain, cache,
 credentials and test clients separate from production. The pipeline's local
 socket tests do not substitute for this operational check.
 
+- With raw and global capacity available, hold eight upgraded sessions
+  from one source across `/v1/server` and `/v1/client`. Confirm a ninth
+  attempt on either route receives HTTP 503 with a newline-only body and
+  one `source_conn_cap_reached` Warn carrying the quoted source. From a
+  different source, verify an upgrade still succeeds. Close a held phone
+  session, allow its handler cleanup to finish, then verify the first source can
+  reconnect and route a frame. Keep attempts within the rate-limit budget
+  so 429 does not mask source admission; verify the 503s leave rate-denial
+  counters unchanged. Check `/healthz` and loopback metrics while source
+  capacity is full but raw capacity is available. Record the image, source
+  addresses, effective source/global/raw limits and refusal/admission/recovery
+  evidence. This check must pass before production deployment.
 - Confirm the deployed config has `type = "connections"` and
   `hard_limit = 32` on both services, matching the image's independent
   `--max-listener-connections` default of 32. For each service, establish
