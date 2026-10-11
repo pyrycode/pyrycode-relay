@@ -137,57 +137,30 @@ jobs:
         with:
           go-version: '1.26.x'
       # Tracks: golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      # Mirror of ci.yml's `security` job pin — must move in lockstep
-      # with that file when Renovate bumps the tag. Same rationale
-      # for a semver tag vs commit SHA documented in #41's spec
-      # (Go module checksum-DB makes a tag effectively immutable for
-      # `go install`).
+      # A semver tag rather than a commit SHA: the Go module checksum DB
+      # makes a tag effectively immutable for `go install` (#41's spec).
       - name: install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      # `-json` differs from ci.yml's plain `govulncheck ./...`: the
-      # cron path machine-parses the output to render an issue body.
-      # `set -o pipefail` documents intent and protects future
-      # refactors that pipe through `tee` for log visibility.
+      # `-json` exits 0 whatever it finds, so this step fails only when
+      # govulncheck itself fails (package load error, DB download
+      # failure). The gate step below is skipped then, no artifact is
+      # written, and `file-issue` files its generic scanner-failure issue.
       - name: govulncheck
         run: |
           set -o pipefail
           govulncheck -json ./... > govulncheck.json
-      - name: render issue from govulncheck output
-        if: failure()
+      # cmd/vulngate applies text-mode govulncheck's exit-3 rule: only a
+      # finding whose trace reaches a called function (symbol level)
+      # counts; imported- or required-only advisories do not. On such a
+      # finding it writes issue-body.md and issue-title.txt and exits
+      # non-zero. Malformed or truncated JSON also exits non-zero but
+      # writes nothing, so it lands as the generic scanner-failure issue.
+      - name: gate on called vulnerable functions
         run: |
-          set -euo pipefail
-          # govulncheck -json emits newline-delimited records; pick
-          # out the OSV.id from the "osv" record kind.
-          primary_id=$(jq -rs '
-            [ .[] | select(.osv?.id?) | .osv.id ] | .[0] // empty
-          ' govulncheck.json)
-          primary_mod=$(jq -rs '
-            [ .[] | select(.osv?.affected?) | .osv.affected[0].package.name ]
-            | .[0] // "unknown"
-          ' govulncheck.json)
-          if [ -z "$primary_id" ]; then
-            echo "no parseable vulns in govulncheck.json — skipping issue render"
-            exit 0
-          fi
-          printf 'security-scan regression: %s in Go module %s\n' \
-            "$primary_id" "$primary_mod" > issue-title.txt
-          {
-            printf '## Periodic security-scan regression\n\n'
-            printf '**Scanner:** govulncheck (Go modules)\n'
-            printf '**Primary finding:** `%s` in `%s`\n' "$primary_id" "$primary_mod"
-            printf '**Workflow run:** %s/%s/actions/runs/%s\n\n' \
-              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
-            printf '### All findings\n\n```\n'
-            jq -rs '
-              .[] | select(.osv?.id?)
-              | "\(.osv.id)\t\(.osv.affected[0].package.name // "unknown")"
-            ' govulncheck.json | sort -u | head -100
-            printf '```\n\n### Triage\n'
-            printf -- '- Run `govulncheck ./...` locally against the named module to see call-site traces.\n'
-            printf -- '- Bump the offending dependency.\n'
-            printf -- '- Verify the next `security-scan` workflow run is green.\n'
-            printf -- '- Close this issue once the next run passes.\n'
-          } > issue-body.md
+          go run ./cmd/vulngate \
+            -in govulncheck.json \
+            -out . \
+            -run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
       - name: upload issue artifact
         if: failure() && hashFiles('issue-title.txt') != ''
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0

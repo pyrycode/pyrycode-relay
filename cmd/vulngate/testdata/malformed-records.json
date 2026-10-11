@@ -1,0 +1,18 @@
+[
+  {"name":"null record","record":null},
+  {"name":"empty record","record":{}},
+  {"name":"null config","record":{"config":null}},
+  {"name":"null osv","record":{"osv":null}},
+  {"name":"null finding","record":{"finding":null}},
+  {"name":"two known kinds","record":{"osv":{"id":"GO-2021-0265"},"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p","function":"F"}]}}},
+  {"name":"duplicate kind","record":{"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p","function":"F"}]},"finding":{"osv":"GO-2021-0265","trace":[{"module":"m"}]}}},
+  {"name":"known and ignored kinds","record":{"progress":{},"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p","function":"F"}]}}},
+  {"name":"null first frame","record":{"finding":{"osv":"GO-2021-0265","trace":[null]}}},
+  {"name":"null later frame","record":{"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p","function":"F"},null]}}},
+  {"name":"function without package","record":{"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","function":"F"}]}}},
+  {"name":"version without module","record":{"finding":{"osv":"GO-2021-0265","trace":[{"version":"v1.0.0"}]}}},
+  {"name":"package without module","record":{"finding":{"osv":"GO-2021-0265","trace":[{"package":"p"}]}}},
+  {"name":"malformed later frame","record":{"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p","function":"F"},{"module":"m","function":"Caller"}]}}},
+  {"name":"malformed imported trace","record":{"finding":{"osv":"GO-2021-0265","trace":[{"module":"m","package":"p"},{"version":"v1.0.0"}]}}},
+  {"name":"osv without id","record":{"osv":{}}}
+]
