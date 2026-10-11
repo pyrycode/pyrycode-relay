@@ -539,8 +539,8 @@ func TestRun_MaxConnectionsNonPositiveRefusesStart(t *testing.T) {
 	}
 }
 
-// TestRun_ConnCapGatesUpgradesNotHealthz boots run with a cap of one. A
-// live binary holds the only slot: both upgrade routes answer 503, and
+// TestRun_ConnCapGatesUpgradesNotHealthz fills two global slots from
+// distinct sources: both upgrade routes answer 503 for a third source, and
 // /healthz still answers 200.
 func TestRun_ConnCapGatesUpgradesNotHealthz(t *testing.T) {
 	addr, err := freePort()
@@ -554,15 +554,47 @@ func TestRun_ConnCapGatesUpgradesNotHealthz(t *testing.T) {
 		exit <- run([]string{
 			"--insecure-listen", addr,
 			"--metrics-listen", "",
-			"--max-connections", "1",
+			"--max-connections", "2",
+			"--max-connections-per-source", "1",
+			"--trust-x-forwarded-for",
 		}, sigCtx)
 	}()
 	if err := waitForDial(addr, 3*time.Second); err != nil {
 		t.Fatalf("relay did not accept connections: %v", err)
 	}
 
-	bin := dialServer(t, addr, "s-cap")
-	defer bin.Close(websocket.StatusNormalClosure, "")
+	for i := 0; i < 2; i++ {
+		hdr := http.Header{"X-Pyrycode-Server": []string{fmt.Sprintf("s-cap-%d", i)}, "X-Pyrycode-Version": []string{"0.0.0"}, "User-Agent": []string{"relay-cap-test"}, "X-Forwarded-For": []string{fmt.Sprintf("192.0.2.%d", i+1)}}
+		ctx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		bin, _, err := websocket.Dial(ctx, "ws://"+addr+"/v1/server", &websocket.DialOptions{HTTPHeader: hdr})
+		stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bin.CloseNow()
+		_ = readPump(bin)
+		if i == 0 {
+			// With one global slot still free, the explicit source allowance
+			// refuses both routes while another source reaches the header gate.
+			for _, path := range []string{"/v1/server", "/v1/client"} {
+				for source, want := range map[string]int{"192.0.2.1": 503, "192.0.2.3": 400} {
+					req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					req.Header.Set("X-Forwarded-For", source)
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp.Body.Close()
+					if resp.StatusCode != want {
+						t.Fatalf("source %s %s: status=%d want=%d", source, path, resp.StatusCode, want)
+					}
+				}
+			}
+		}
+	}
 
 	for path, want := range map[string]int{
 		"/v1/client": http.StatusServiceUnavailable,

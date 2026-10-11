@@ -60,6 +60,12 @@ const proxyHeaderTimeout = 5 * time.Second
 // docs/specs/architecture/114-global-connection-cap.md.
 const defaultMaxConnections = 20
 
+// defaultMaxConnectionsPerSource allows a daemon, six phones and a desktop
+// behind one NAT, leaving twelve of the twenty global slots for other sources.
+// Lowering the global cap to eight or below also requires lowering this flag;
+// a global cap of one permits no positive source allowance.
+const defaultMaxConnectionsPerSource = 8
+
 // defaultMaxListenerConnections bounds raw sockets independently on each
 // public listener, including PROXY/TLS/HTTP parsing and hijacked WebSockets.
 // Combined 256 MiB estimate, with both HTTPS and HTTP-01 full:
@@ -109,9 +115,9 @@ func run(args []string, sigCtx context.Context) int {
 				"forwards external 80 to a high internal port.")
 		metricsListen = fs.String("metrics-listen", "127.0.0.1:9090", "Listen address for the /metrics endpoint. Must be a loopback IP literal (e.g. 127.0.0.1:9090, [::1]:9090). Empty disables.")
 		trustXFF      = fs.Bool("trust-x-forwarded-for", false,
-			"Trust the X-Forwarded-For header as the source IP for per-IP rate limiting. "+
+			"Trust the X-Forwarded-For header as the source IP for per-IP rate limiting and live connection allowances. "+
 				"WARNING: enabling this without a trusted reverse proxy in front of the relay "+
-				"allows clients to spoof their source IP and bypass per-IP rate limits.")
+				"allows clients to spoof their source IP and bypass both source-based limits.")
 		httpsProxyProtocol = fs.Bool("https-proxy-protocol", false,
 			"Require a PROXY protocol v2 header before the TLS handshake on every "+
 				"--https-listen connection and use its source address as the client IP. "+
@@ -120,6 +126,9 @@ func run(args []string, sigCtx context.Context) int {
 		maxConnections = fs.Int("max-connections", defaultMaxConnections,
 			"Global cap on live WebSocket connections across /v1/server and /v1/client. "+
 				"Upgrades beyond it get HTTP 503 before the handshake. Must be positive.")
+		maxConnectionsPerSource = fs.Int("max-connections-per-source", defaultMaxConnectionsPerSource,
+			"Shared live WebSocket allowance per source across /v1/server and /v1/client. "+
+				"Excess upgrades get HTTP 503. Must be positive and below --max-connections.")
 		maxListenerConnections = fs.Int("max-listener-connections", defaultMaxListenerConnections,
 			"Cap on accepted connections per public listener, including PROXY, TLS, HTTP and WebSockets. "+
 				"Additional connections wait until a socket closes. Must be positive; metrics are separate.")
@@ -171,6 +180,14 @@ func run(args []string, sigCtx context.Context) int {
 			"err", err,
 			"value", *maxConnections,
 			"fix", "pass a positive connection count, or omit the flag for the default")
+		return 2
+	}
+
+	sourceCap, err := relay.NewSourceConnCap(*maxConnectionsPerSource, logger, *trustXFF)
+	if err != nil || *maxConnectionsPerSource >= *maxConnections {
+		logger.Error("refusing to start: invalid --max-connections-per-source",
+			"value", *maxConnectionsPerSource,
+			"fix", "pass a positive source allowance below --max-connections; reducing the global cap may require reducing the source allowance")
 		return 2
 	}
 
@@ -313,13 +330,13 @@ func run(args []string, sigCtx context.Context) int {
 	// middleware so it observes the middleware's HTTP 429 (the only
 	// HTTP-429 source in either pipe — header-gate writes 400, success
 	// is 101, WS application close codes travel inside the upgrade).
-	// connCap sits INSIDE the rate limiter: a rate-limited attempt never
-	// takes a slot, and its 503 never reaches the 429 observers. One
-	// connCap wraps both endpoints so binaries and phones share the cap.
-	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(connCap.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics)))))
+	// Source admission precedes global admission inside rate limiting.
+	// Rate denials reserve neither capacity; source denials take no global
+	// slot. Both caps are shared across endpoints and return 503, not 429.
+	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))))
 	// maxPhones=16 caps phones per server-id; over-cap registrations are
 	// rejected with WS close 4429. Per #30 architect spec.
-	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(connCap.Wrap(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics)))))
+	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))))
 
 	if *insecureListen != "" {
 		logger.Info("starting", "version", Version, "mode", "insecure", "listen", *insecureListen)

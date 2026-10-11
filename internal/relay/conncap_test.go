@@ -109,9 +109,18 @@ func startCapped(t *testing.T, max int, grace time.Duration) (*Registry, *ConnCa
 	if err != nil {
 		t.Fatalf("NewConnCap: %v", err)
 	}
+	source, err := NewSourceConnCap(max, discardLogger(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !pollUntil(time.Now().Add(3*time.Second), func() bool { return sourceEntries(source) == 0 }) {
+			t.Error("source entries survived cleanup")
+		}
+	})
 	mux := http.NewServeMux()
-	mux.Handle("/v1/server", cc.Wrap(ServerHandler(reg, discardLogger(), grace, 256*1024, nil)))
-	mux.Handle("/v1/client", cc.Wrap(ClientHandler(reg, discardLogger(), 256*1024, 0, nil)))
+	mux.Handle("/v1/server", source.Wrap(cc.Wrap(ServerHandler(reg, discardLogger(), grace, 256*1024, nil))))
+	mux.Handle("/v1/client", source.Wrap(cc.Wrap(ClientHandler(reg, discardLogger(), 256*1024, 0, nil))))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return reg, cc, "ws" + strings.TrimPrefix(srv.URL, "http")
