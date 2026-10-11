@@ -6,7 +6,7 @@ The relay's production host is a single [Fly.io](https://fly.io) machine in one 
 
 - **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and a single-machine hard cap.
 - **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `rolling` strategy, which waits for the `internal_port = 8080` service's TCP check before finishing — a relay that refuses to boot fails the deploy rather than leaving production down ([#118](../codebase/118.md)). No GHA workflow auto-deploys.
-- **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment); no GitHub repo secret is involved anymore.
+- **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment). The separate daily scan uses the GitHub repository secret `FLY_READONLY_TOKEN`; provisioning and rotation are in [the bootstrap runbook](../../deploy.md#daily-security-scan-credential).
 
 ## Why this shape
 
@@ -79,15 +79,35 @@ The current manifest pins `internal_port = 80` / `internal_port = 443`, matching
 
 Deploys run from an operator's local checkout of clean `main`, not from CI. The deploy credential (`FLY_API_TOKEN`, or a `flyctl auth login` session) lives only in the operator's local environment — it never touches GitHub Actions. PR code, including code from forks, has no path to a deploy credential because no workflow holds one.
 
+GitHub Actions holds a separate `FLY_READONLY_TOKEN` repository secret for
+`security-scan.yml`'s `deployed-image-scan` job (#176). Fly's standard read-only
+token has [org-scoped read access](https://docs.fly.io/security/tokens/#org-scoped-tokens)
+to the owning organization and its resources, including other apps; it is not
+app-scoped even though the helper queries only `pyrycode-relay`. It cannot deploy
+or mutate Fly resources. Authentication failures must be resolved with the
+read-only token, never by substituting a deploy or personal token.
+
+The deployed job runs only for `schedule` or `workflow_dispatch` on
+`refs/heads/main` and checks out `main`. Only discovery and download receive the
+secret as a step environment variable; fixtures, Trivy, rendering and issue
+filing do not. Discovery makes a fixed Machines API GET without redirects and
+logs only the validated digest reference and UTC observation time. Download
+passes the token to Docker login through password stdin with registry username
+`x`; Docker subprocess environments exclude it and their output is suppressed.
+A private temporary Docker config is removed on successful and failed
+downloads before Trivy can run against the saved archive. No token is placed in
+logs, outputs or artifacts. Scanner jobs keep `contents: read`; only the
+separate `file-issue` consumer has `issues: write`.
+
 The pre-merge correctness gates that the old CI `deploy` job depended on still run, just decoupled from the deploy step:
 
 1. **Dispatcher pipeline.** Tickets land via the PO → architect → developer → code-review → docs stages, each running `make check` (`go vet` + `go test -race`). Runner/release-adjacent work lands via operator-direct PR.
 2. **Final pre-deploy gate.** The operator runs `make check` from the clean checkout before `flyctl deploy --remote-only` — the local equivalent of the old `needs: [test, security, image-scan]` chain.
-3. **Daily security scan.** [`security-scan.yml`](../../../.github/workflows/security-scan.yml) keeps `govulncheck` + image-scan firing against `main` on a cron, so disclosed CVEs against unchanged deps still surface within ≤24h.
+3. **Daily security scan.** [`security-scan.yml`](../../../.github/workflows/security-scan.yml) scans `main` with `govulncheck` + `image-scan`, and independently scans the immutable digest observed on started Fly Machines. The repository result describes a prospective build; the deployed-image result describes the image at its UTC observation time. See [CI image scanning](docker-image.md#ci-image-scanning).
 
 ### Historical note — the removed CI `deploy` job
 
-Before 2026-05-24 this wiring lived in `.github/workflows/ci.yml`'s `deploy` job, which ran `flyctl deploy --remote-only` on push to `main`. Its privilege model kept `FLY_API_TOKEN` away from untrusted code via a branch gate (`github.ref == 'refs/heads/main'`), a `needs: [test, security, image-scan]` chain, and job-level `permissions: contents: read` with the token flowing only as `env:` on the deploy step; `superfly/flyctl-actions/setup-flyctl` was SHA-pinned with a `# Tracks:` comment. That entire workflow was removed across the org (commit [`0b987e2`](https://github.com/pyrycode/pyrycode-relay/commit/0b987e2)); the GHA-token privilege model is moot now that the token never enters CI. Only [`security-scan.yml`](../../../.github/workflows/security-scan.yml) remains in `.github/workflows/`.
+Before 2026-05-24 this wiring lived in `.github/workflows/ci.yml`'s `deploy` job, which ran `flyctl deploy --remote-only` on push to `main`. Its privilege model kept `FLY_API_TOKEN` away from untrusted code via a branch gate (`github.ref == 'refs/heads/main'`), a `needs: [test, security, image-scan]` chain, and job-level `permissions: contents: read` with the token flowing only as `env:` on the deploy step; `superfly/flyctl-actions/setup-flyctl` was SHA-pinned with a `# Tracks:` comment. That entire workflow was removed across the org (commit [`0b987e2`](https://github.com/pyrycode/pyrycode-relay/commit/0b987e2)); the deploy token no longer enters CI. The read-only scan credential above does not restore deploy privileges. Only [`security-scan.yml`](../../../.github/workflows/security-scan.yml) remains in `.github/workflows/`.
 
 ### Why `--remote-only`
 

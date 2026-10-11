@@ -15,7 +15,38 @@ Each threat below records four fields:
 
 **v1 mitigation:** Operator-owned. SSH key authentication only (no passwords); restricted admin set; OS auto-updates via unattended-upgrades or equivalent. Host-level intrusion detection is out of scope for v1.
 
+Production runs on Fly.io with operator-only deploy privileges. The deploy
+credential stays in the operator's local environment; GitHub Actions holds only
+the separate `FLY_READONLY_TOKEN` repository secret for deployed-image discovery
+and download (#176). Fly's standard read-only token has
+[org-scoped read access](https://docs.fly.io/security/tokens/#org-scoped-tokens),
+including the owning organization's other apps and resources, even though the
+helper queries only `pyrycode-relay`. It cannot deploy or mutate Fly resources;
+a deploy or personal token must never be substituted for it.
+
+The `deployed-image-scan` job is restricted to `schedule` or
+`workflow_dispatch` on `refs/heads/main`, with a checkout of `main`. Only its
+discovery/download steps receive the secret. Discovery uses a fixed Machines
+API GET without redirects and publishes only the validated digest and UTC
+observation time. Download uses password stdin for Docker login, excludes the
+token from subprocess environments and suppresses subprocess output. Its private
+temporary registry config is removed on success and failure before Trivy scans
+the saved archive. The token is never printed or put in outputs/artifacts;
+Trivy, rendering and the separate issue-filing job receive no Fly credential.
+Scanner jobs retain `contents: read`; `issues: write` belongs only to
+`file-issue`. Explicit expiry, rotation and the initial live access check are
+operator-owned in [the bootstrap runbook](deploy.md#daily-security-scan-credential).
+
 **Residual risk:** If the VPS is rooted, every byte through the relay is exposed: TLS terminates here, so plaintext frames are recoverable from process memory. This is the operator-side framing of the protocol spec's "relay operator MITM" threat — same plaintext exposure, different actor.
+
+A compromised CI discovery/download step could expose the read-only credential
+and its organization-wide read access. Event, branch and step restrictions limit
+where the workflow supplies it; they do not narrow the token's Fly scope.
+Production can lag `main` until the operator deploys: repository scan results
+cannot establish that a patch shipped. The
+[deployed-image result](knowledge/features/docker-image.md#deployed-image-scanning)
+describes the digest at its observation time, and may be stale after a later
+deploy.
 
 **Future hardening:** A documented deploy runbook; a per-operator SSH-key inventory; `fail2ban` (or equivalent) on the SSH port; a host-based IDS once user count justifies the operational cost.
 

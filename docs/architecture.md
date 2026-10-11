@@ -89,6 +89,16 @@ The single-machine cap is platform-enforced via `min_machines_running = 1`, `aut
 
 Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). Deploys are operator-direct from clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](deploy.md).
 
+The daily/manual `security-scan` workflow independently observes started Fly
+Machines, pulls their single distinct immutable image digest and scans a saved
+archive (#176). This CI-to-Fly read boundary uses an org-scoped read-only
+credential confined to discovery/download; deploy privileges remain with the
+operator. Temporary registry credentials are removed before Trivy runs, and
+only a separate issue-filing job has `issues: write`. Repository scans describe
+what `main` would ship; the deployed result describes its digest at its UTC
+observation time. See [CI image scanning](knowledge/features/docker-image.md#ci-image-scanning)
+and [deploy privileges](knowledge/features/fly-deploy.md#deploy-privilege-model--operator-direct).
+
 ## Threat model
 
 Wire-protocol threats live in the protocol spec's [Security model](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#security-model). Operational threats specific to the relay binary as a deployed process — deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error-leakage — live in [`docs/threat-model.md`](./threat-model.md).

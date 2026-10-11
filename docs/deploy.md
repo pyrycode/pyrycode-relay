@@ -8,10 +8,12 @@ production until somebody runs `flyctl deploy` by hand. See
 
 > **This has bitten us.** The 2026-08-03 CVE patch (#122) merged and then sat
 > undeployed while the live machine kept serving a 2026-07-03 build, because the
-> daily security scan went green and read as "handled". That scan builds a fresh
-> image from `main` and inspects **that**, so it reports what *would* ship and
-> never what is serving. A green scan is not evidence that production is patched.
-> After any merge you care about, verify the **running** artifact per
+> daily security scan went green and read as "handled". The repository scans
+> report what `main` *would* ship. The separate `deployed-image-scan` result now
+> reports the immutable digest observed on started Fly Machines, with its UTC
+> observation time in the discovery log and any finding body. Check that result
+> after the deploy: a green repository result or an older deployed observation
+> cannot establish that production has the patch. Verify the running artifact per
 > [*Verify a deploy*](#verify-a-deploy).
 
 See [`docs/architecture.md` § *Hosting*](architecture.md#hosting) for the
@@ -46,8 +48,46 @@ Done once per Fly app — typically only the production app.
    autocert retries.
 
 The operator authenticates `flyctl` locally (`flyctl auth login`); the
-deploy token lives only in the operator's local environment. No GitHub
-repo secret is involved — PR code has no path to a deploy credential.
+deploy token lives only in the operator's local environment. GitHub
+Actions uses a separate read-only scan credential; it holds no deploy
+credential.
+
+### Daily security scan credential
+
+Provision this for an existing production app as well as a new bootstrap.
+Create a dedicated read-only token with an explicit expiry:
+
+```sh
+flyctl tokens create readonly --org <owning-org> --name relay-security-scan --expiry <duration>
+```
+
+Replace the placeholders with the app's owning organization and a finite
+duration, for example `720h` (30 days); record the expiry and rotate before it.
+See Fly's [token creation reference](https://docs.fly.io/flyctl/cmd/fly_tokens_create_readonly).
+This token reads the organization and its resources, including other apps,
+as documented in [org-scoped tokens](https://docs.fly.io/security/tokens/#org-scoped-tokens).
+It cannot deploy or mutate resources. Do not substitute a deploy or personal
+token if authentication fails.
+
+Store the token as the **GitHub repository Actions secret** `FLY_READONLY_TOKEN`
+in `pyrycode/pyrycode-relay`, rather than as a Fly runtime secret. The deployed
+scan receives it only during discovery/download on scheduled or manually
+dispatched runs on `main`; Trivy scans an archive after temporary registry
+credentials have been removed. The [privilege model](knowledge/features/fly-deploy.md#deploy-privilege-model--operator-direct)
+records the isolation details.
+
+Run `security-scan` with `workflow_dispatch` selecting **main** after adding
+the secret. Confirm `deployed-image-scan` can discover the started Machine,
+download its digest and complete Trivy scanning; read the logged digest and UTC
+observation time. This initial live access check is operator follow-up; offline
+fixture checks do not establish real Machines or registry access. Until
+provisioning, the job intentionally fails and files or deduplicates
+`security-scan: scanner failed with no parseable findings`.
+
+To rotate, create another read-only token with an explicit expiry, replace
+`FLY_READONLY_TOKEN`, and repeat the manual run on `main`. Once access is
+confirmed, revoke the old token in the owning organization's Tokens page (or
+with `flyctl tokens revoke <token ID>`). Keep the expiry reminder current.
 
 ## Secrets
 
@@ -138,8 +178,9 @@ Pre-merge correctness is handled by the dispatcher pipeline (PO →
 architect → developer → code-review → docs stages, each running
 `make check` = `go vet + go test -race`); the daily
 [`security-scan.yml`](../.github/workflows/security-scan.yml) workflow
-keeps the `govulncheck` + image-scan guards firing against `main`. No
-GHA workflow auto-deploys on push.
+keeps `govulncheck` + `image-scan` firing against `main` and independently
+scans the digest observed on started Fly Machines. No GHA workflow
+auto-deploys on push.
 
 1. Land changes on `main` (dispatcher pipeline for tickets;
    operator-direct PR for runner/release-adjacent or other
@@ -185,8 +226,8 @@ Observability:
 
 ## Verify a deploy
 
-Answering "is the fix actually live?" means asking the **running** machine, not
-the repo and not CI. Two independent readings, and they should agree:
+Answering "is the fix actually live?" requires identifying the running artifact.
+Start with two independent readings, which should agree:
 
 1. `flyctl status -a pyrycode-relay` — the `LAST UPDATED` column is when the
    running machine was last replaced. If it predates your merge, the fix is not
@@ -203,6 +244,21 @@ same health payload carries the release tag, set by `--build-arg VERSION=…` at
 deploy time. It reads `dev` when a deploy left the build arg out, as every
 deploy before 2026-09-24 did, so `dev` says the stamp is missing, not which
 build is running.
+
+After deploying, manually dispatch
+[`security-scan`](../.github/workflows/security-scan.yml) on **main** and inspect
+the **`deployed-image-scan` job**, alongside the repository results. Its
+`discover started image` log records
+`registry.fly.io/pyrycode-relay@sha256:…` and the UTC observation time; compare
+the digest with the deployed artifact and ensure the observation follows your
+deploy. Any deployed finding body repeats those values and links the run.
+Successful discovery alone is insufficient: the download and scan must also
+complete. A passing deployed job means no fixable HIGH/CRITICAL finding under
+the configured policy for that observed digest, not that it is free of all
+vulnerabilities. The daily 06:00 UTC run provides the same result, but a run
+before a later deploy describes only its earlier observation. See
+[CI image scanning](knowledge/features/docker-image.md#ci-image-scanning) for
+the distinction between Go-binary version matches and source call-path evidence.
 
 Two flyctl gotchas on the operator MacBook, both of which look like something
 worse than they are:
