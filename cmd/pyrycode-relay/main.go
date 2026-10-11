@@ -309,6 +309,7 @@ func run(args []string, sigCtx context.Context) int {
 		srv := &http.Server{
 			Addr:              *insecureListen,
 			Handler:           mux,
+			MaxHeaderBytes:    16 * 1024,
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       60 * time.Second,
 			WriteTimeout:      60 * time.Second,
@@ -360,6 +361,7 @@ func run(args []string, sigCtx context.Context) int {
 		Addr:              *httpsListen,
 		Handler:           relay.EnforceHost(*domain, mux),
 		TLSConfig:         relay.TLSConfig(mgr),
+		MaxHeaderBytes:    16 * 1024,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -372,6 +374,7 @@ func run(args []string, sigCtx context.Context) int {
 		// would 302 GET/HEAD to HTTPS; the AC requires explicit 404 for
 		// non-challenge traffic.
 		Handler:           mgr.HTTPHandler(http.NotFoundHandler()),
+		MaxHeaderBytes:    16 * 1024,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
