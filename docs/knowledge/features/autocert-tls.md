@@ -84,8 +84,8 @@ The allowance covers the request line and header keys and values, before any
 handler runs. It does not limit request bodies or WebSocket frames. Go's
 HTTP/1.1 parser permits buffer slack, so 16 KiB is the configured allowance
 rather than an exact wire-size rejection boundary. This reduces per-request
-memory exposure during header parsing; it does not cap the number of connections
-in that phase (see [connection cap](connection-cap.md#what-is-not-counted)).
+memory exposure during header parsing; concurrent accepted sockets are bounded
+separately by [raw listener admission](connection-cap.md#what-is-not-counted).
 
 Both `httpsSrv` and `httpSrv` mirror the insecure path's timeouts:
 
@@ -122,16 +122,31 @@ upgrades remain covered by the command package's end-to-end tests.
 
 Cipher selection is delegated to Go's secure-default suites for TLS 1.2; TLS 1.3 doesn't expose suite selection.
 
-## Concurrency
+## Concurrency model
 
-Two goroutines, no shared mutable state:
+`runServers` starts one serving goroutine per server. Both public paths open
+`net.Listen` and apply independent `netutil.LimitListener` wrappers with
+`--max-listener-connections` (default 32) before any parsing:
 
-1. Main — `httpsSrv.ListenAndServeTLS("", "")`. The empty cert/key paths defer to `TLSConfig.GetCertificate`, which `manager.TLSConfig()` populates. This is the documented autocert pattern.
-2. Background — `httpSrv.ListenAndServe()` for ACME http-01.
+1. HTTPS — raw admission → optional PROXY v2 listener → `ServeTLS("", "")`'s
+   TLS wrapper → HTTP handlers. Empty cert/key paths use `TLSConfig.GetCertificate`.
+2. HTTP-01 — raw admission → `Serve` with `mgr.HTTPHandler(http.NotFoundHandler())`.
 
-Either listener failing → first error wins via #31's buffered `listenerErr` channel; `relay.Shutdown` drains both listeners (and the metrics listener) together; `run` returns exit 1. On SIGTERM/SIGINT both listeners drain via the same path and `run` returns exit 0.
+HTTP-01 saturation leaves HTTPS capacity available. A freed HTTP-01 slot
+can serve a cached challenge with its authorization body or return the
+existing non-challenge `404`; it never redirects. Slots last until socket
+close, including keep-alive and WebSocket hijacking. The loopback metrics
+server is separate and uncapped by these public limits. See
+[connection caps](connection-cap.md#concurrency-model).
 
-The `*autocert.Manager` is constructed once and used read-only; its internal locking is autocert's contract.
+The HTTPS callback defers listener close even before calling `ServeTLS`,
+because TLS setup can fail before `Serve` owns cleanup. Either listener
+failing triggers the existing first-error drain of all servers and registered
+WebSockets (exit 1); SIGTERM/SIGINT uses the same drain with exit 0.
+Closing a saturated listener wakes its capacity-blocked accept.
+
+The `*autocert.Manager` is constructed once and shared by HTTPS and HTTP-01;
+its internal locking is autocert's contract.
 
 ## Operational notes
 
