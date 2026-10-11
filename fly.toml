@@ -58,6 +58,11 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   auto_start_machines = false
   min_machines_running = 1
 
+  # Match --max-listener-connections (default: 32) for this listener.
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 32
+
   [[services.ports]]
     port = 80
     # handlers omitted on purpose: an unset list is pass-through. An
@@ -85,6 +90,11 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   auto_stop_machines = "off"
   auto_start_machines = false
   min_machines_running = 1
+
+  # Match --max-listener-connections (default: 32) for this listener.
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 32
 
   [[services.ports]]
     port = 443
