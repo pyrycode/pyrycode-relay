@@ -393,3 +393,42 @@ func TestNewPushWakerFromEnv(t *testing.T) {
 		t.Fatalf("bad key: err = %v, want ErrFCMCredentials", err)
 	}
 }
+
+func TestPushWaker_CloseCancelsAuthentication(t *testing.T) {
+	t.Parallel()
+	h := newHeldOAuth(t)
+	sender, requests := newHeldSender(t, h)
+	logger, logs := captureLogger()
+	w := newPushWaker(sender, time.Hour, 6, 6, logger)
+	t.Cleanup(w.Close)
+	for i := 0; i < 6; i++ {
+		if err := w.Request("s1", wakeJSON("fcm", testFCMDeviceToken)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := awaitFCMWaiters(t, sender, 6)
+	awaitRefreshSignal(t, h.started)
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() { w.Close(); close(closed) }()
+	awaitRefreshSignal(t, closed)
+	if time.Since(start) >= 2*time.Second {
+		t.Fatal("push cleanup exceeded two-second budget")
+	}
+	select {
+	case <-r.done:
+	default:
+		t.Fatal("Close left authentication work running")
+	}
+	awaitRefreshSignal(t, h.cancelled)
+	if err := w.Request("s1", wakeJSON("fcm", testFCMDeviceToken)); !errors.Is(err, ErrPushOff) {
+		t.Fatalf("after-close Request = %v", err)
+	}
+	if h.hits.Load() != 1 || len(requests()) != 0 {
+		t.Fatal("close started further authentication/FCM requests")
+	}
+	if lines := outcomeLines(logs.String()); len(lines) != 6 {
+		t.Fatalf("outcomes=%d, want 6", len(lines))
+	}
+	assertNoSecrets(t, logs.String())
+}
