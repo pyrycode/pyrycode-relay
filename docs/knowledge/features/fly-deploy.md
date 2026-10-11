@@ -20,6 +20,25 @@ TLS terminates **in the relay** via autocert (#9, shipped). Fly is a raw-TCP sub
 
 ADR-0002's `:80` 404 fallback (explicit failure on non-ACME `:80` requests, rather than a 302 → `:443`) means `:80` carries non-trivial application logic. The TCP-passthrough manifest preserves that — Fly inserts no MITM-shaped middleware.
 
+### Connection forwarding ceilings
+
+Both raw-TCP services (8080/external 80 and 8443/external 443) set
+`[services.concurrency]` with `type = "connections"` and `hard_limit = 32`
+(#183); `soft_limit` is left unset. Each matches the binary's independent
+`--max-listener-connections` default of 32, which production argv leaves
+intact. Keep the manifest ceilings aligned when changing that setting.
+See [connection caps](connection-cap.md) for the separate raw admission
+boundary before PROXY/TLS/HTTP parsing.
+
+Fly's [hard-limit policy](https://docs.fly.io/reference/configuration#servicesconcurrency)
+stops forwarding new traffic to a saturated Machine; it does not promise
+immediate client drops. Offline TOML checks establish the settings and
+preserved host wiring, while a successful TCP dial or absent application
+response cannot establish where forwarding stopped. The operator must
+observe forwarding at saturation and recovery on both services in an
+[isolated Fly app before production deployment](../../deploy.md#verify-a-deploy).
+The existing passthrough, PROXY v2 and health-check configuration is unchanged.
+
 ### Single-machine hard cap
 
 The relay's connection registry is **in-process** (`internal/relay/registry.go`); two machines hold two disjoint registries and silently drop phones routed to the "wrong" replica. This is a correctness constraint, not a cost optimisation — `docs/architecture.md § Single-instance constraint (v1)` is canonical.
@@ -71,9 +90,15 @@ Two non-obvious `fly.toml` requirements were captured after the 2026-05-24 first
 - **`[env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` is required on Fly.** Fly's substrate exposes `FLY_APP_NAME`, which the #65 self-check reads as a multi-instance-capable platform. Without this env var asserted in the manifest, the relay refuses to boot. The `[env]` block sits immediately under the manifest's single-machine-cap header comment with an inline rationale that names the self-check by issue number, so a future reader doesn't mistake the assertion for dead config. This is the deploy-time half of the [Single-instance startup self-check](single-instance-check.md) belt-and-suspenders pair — the binary-side gate plus the manifest-side assertion together close the "operator deployed to Fly and never read `architecture.md`" failure mode.
 - **`processes = ["app"]` on each `[[services]]` block.** Fly's schema requires every service to name its process whenever `[processes]` is defined, and `[processes]` is always defined here (argv lives in `[processes]` because distroless has no shell to expand env vars into argv — see *Argv, not shell* above). Adding a third `[[services]]` block in a future ticket means adding `processes = ["app"]` as the first line; `flyctl config validate` is the structural backstop but PR-time correctness is cheaper than a failed `flyctl deploy`.
 
-### Listen-port pinning is provisional
+### Internal listen ports
 
-The current manifest pins `internal_port = 80` / `internal_port = 443`, matching autocert's hardcoded defaults from the pre-#96 era. [Ticket #96](https://github.com/pyrycode/pyrycode-relay/issues/96) — [Autocert TLS (configurable HTTP-01 and TLS listener addresses)](autocert-tls.md) — has now shipped the binary-side capability for high-port substrates (`--http-listen` / `--https-listen` flags, defaults preserve the low-port binding exactly). Landing the canonical high-port Fly recipe (`internal_port = 8080` / `internal_port = 8443` + `--http-listen=:8080 --https-listen=:8443` in `[processes]`, with external `port = 80` / `port = 443` untouched on the `[[services.ports]]` blocks) is a deferred doc-only follow-up that owns the operator-side verification dance against a real Fly deploy. The #97 forward pointer in [`docs/deploy.md` § *fly.toml gotchas*](../../deploy.md#flytoml-gotchas) is the institutional-memory seam that keeps the follow-up findable.
+The manifest sets `internal_port = 8080` / `internal_port = 8443` and passes
+`--http-listen=:8080 --https-listen=:8443` in `[processes]`, with external
+`port = 80` / `port = 443` unchanged. These overrides let the nonroot binary
+bind high ports while ACME and clients reach the standard public ports.
+The [autocert listener flags](autocert-tls.md) retain defaults of `:80` /
+`:443` for other substrates; the [deployment gotchas](../../deploy.md#flytoml-gotchas)
+record the Fly wiring requirements.
 
 ## Deploy privilege model — operator-direct
 

@@ -37,7 +37,15 @@ Each item below already exists as a "Future hardening" line in `threat-model.md`
 
 These would harden the deployment without changing relay source code. Listed so a future operator knows what's on the table.
 
-- **Fly Machines `services.concurrency`.** Tunable concurrency cap per service in `fly.toml`; Fly drops excess connections at the edge before they reach the relay. Fly also provides built-in anycast DDoS absorption (no config needed). Operator-side, no code change. Trigger: any abuse pattern; cheap to tune.
+- **Fly Machines `services.concurrency` — CONFIGURED (#183).** Both raw-TCP
+  services (8080/external 80 and 8443/external 443) set `type = "connections"`
+  and `hard_limit = 32`, matching `--max-listener-connections`' default of 32
+  independently per listener. Fly's [forwarding policy](https://docs.fly.io/reference/configuration#servicesconcurrency)
+  stops sending new traffic to a Machine at or above the service limit;
+  it does not guarantee immediate client drops. Isolated saturation and
+  recovery verification remains operator-owned before production deployment;
+  see [Verify a deploy](deploy.md#verify-a-deploy). Revisit the limits when
+  listener capacity or machine sizing changes.
 - **Cloudflare Spectrum (or similar TCP-passthrough CDN).** Could front the relay without breaking autocert — TLS still terminates in the binary, Spectrum passes TCP through. Brings WAF, IP reputation, larger DDoS absorption. Trade: operational dependency on Cloudflare. Free tier covers small scale. Trigger: abuse patterns warrant the dependency; not recommended for v1 because it conflicts with the relay's "minimal external surface" design principle.
 - **External reverse proxy (nginx, Caddy, etc.).** Out of scope for this codebase — the relay IS the proxy in the conceptual stack. Mentioned only to rule it out.
 

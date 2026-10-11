@@ -102,6 +102,17 @@ Intended uses:
 
 Production deploys to a single **Fly.io** machine in one region. TLS terminates in the relay binary (autocert, #9) — Fly runs the substrate in raw-TCP passthrough mode on `:80` and `:443`, with a dedicated IPv4 so Let's Encrypt's HTTP-01 challenge resolves deterministically. The autocert cache lives on a Fly volume at `/var/lib/relay/autocert`.
 
+Both raw-TCP services (8080/external 80 and 8443/external 443) configure
+`services.concurrency` with `type = "connections"` and `hard_limit = 32`
+(#183), matching the independent raw listener default. Fly's
+[forwarding ceiling](https://docs.fly.io/reference/configuration#servicesconcurrency)
+stops new traffic to a Machine at or above the service limit; it does not
+guarantee immediate client drops. Relay admission still bounds accepted
+sockets before parsing, including traffic that bypasses Fly's public edge.
+The operator must [verify forwarding at saturation and recovery on an isolated app](deploy.md#verify-a-deploy)
+before production deployment. Port 80 passthrough, 443 PROXY v2 and the 8080
+TCP health check retain their existing wiring.
+
 The single-machine cap is platform-enforced via `min_machines_running = 1`, `auto_start_machines = false`, and `auto_stop_machines = "off"` in `fly.toml`, and binary-enforced via the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65). Multi-instance scaling is out of scope for v1 — see § *Single-instance constraint* above.
 
 Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). Deploys are operator-direct from clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](deploy.md).

@@ -186,6 +186,16 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    `--max-connections` default of 20 still governs upgraded sessions.
    Neither default requires an argv change, and both must be positive.
 
+   Both raw-TCP services (8080/external 80 and 8443/external 443) also set
+   `[services.concurrency]` with `type = "connections"` and `hard_limit = 32`
+   (#183), matching the raw listener default; `soft_limit` is left unset.
+   Fly [stops forwarding new traffic](https://docs.fly.io/reference/configuration#servicesconcurrency)
+   to a Machine at or above the service limit, without guaranteeing
+   immediate client drops. Keep both service limits aligned when changing
+   `--max-listener-connections` or its default, and repeat the isolated
+   forwarding check below. TCP passthrough, 443 PROXY v2 and the 8080 TCP
+   health check remain in place.
+
    The combined 256 MB sizing estimate is 2 × 32 raw slots × ~128 KiB
    (16 KiB headers + 4 KiB Go slack, TLS/PROXY/bufio buffers and stacks) =
    8 MiB, plus 20 × ~4.4 MiB upgraded state = 88 MiB. The upgraded sockets
@@ -254,13 +264,27 @@ Observability:
 
 ## Verify a deploy
 
-Before deploying raw listener admission to production, the operator must
-verify the combined memory estimate and saturation behavior on an **isolated
-non-production Fly app**, using the intended image, 256 MB machine size,
+Before deploying raw listener admission or Fly forwarding ceilings to
+production, the operator must verify the combined memory estimate and
+saturation/recovery behavior on an **isolated non-production Fly app**,
+using the intended image, 256 MB machine size,
 `GOGC=100` and production listener/PROXY wiring. Keep its domain, cache,
 credentials and test clients separate from production. The pipeline's local
 socket tests do not substitute for this operational check.
 
+- Confirm the deployed config has `type = "connections"` and
+  `hard_limit = 32` on both services, matching the image's independent
+  `--max-listener-connections` default of 32. For each service, establish
+  32 forwarded connections and keep them open long enough to observe
+  saturation; account for phase and idle timeouts. Use Fly connection
+  observations together with machine-side socket or traffic observations
+  to verify additional attempts are not forwarded to the full service.
+  Lack of an HTTP/TLS response alone cannot distinguish Fly withholding
+  forwarding from the relay waiting to accept a queued socket. Close a
+  held connection and verify forwarding resumes and a new peer receives
+  service. Record both saturation and recovery evidence for each service;
+  do not require an immediate client drop or infer forwarding from a
+  successful TCP dial. This check must pass before production deployment.
 - Fill both public listeners to the configured raw cap, including stalled
   pre-header peers, keep-alive sockets and the 20 upgraded sessions within
   those raw slots. Exercise the upgraded worst case with bounded phone
