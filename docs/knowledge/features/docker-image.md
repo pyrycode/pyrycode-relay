@@ -80,6 +80,14 @@ Image scanning lives in `.github/workflows/security-scan.yml` as the `image-scan
 
 On a red cron run, a third `file-issue` job (added in #73, scoped to `issues: write` at the job level only) parses the scanners' JSON output, dedups against open `security-sensitive` issues by deterministic title (`security-scan regression: <CVE-or-vuln-id> in <component>`), and opens a labelled GitHub issue per failing scanner via `gh issue create --body-file …`. The scanner jobs hand pre-rendered title+body files to the filer via `actions/upload-artifact@v5` so the privileged consumer never executes scanner code. The labelled issue lifts the red Actions row from a passive signal to an owner-shaped object in the repo's triage queue.
 
+## Responding to a scan regression
+
+A red `security-scan` finding against stdlib is cleared by refreshing the build-stage digest (Trivy reads the stdlib version from the *builder's* toolchain, not from `go.mod`'s `go` directive), and a finding against a module by `go get <module>@<version>` + `go mod tidy` — the same two-edit shape in #103, #122, #126 and #165.
+
+When a module bump's target version is itself in question, query OSV (`api.osv.dev/v1/querybatch`) over the resolved dependency set rather than assuming either extreme is right. Taking the latest release can be wrong (#126: the stated minimum left a sibling module one minor behind, carrying its own unfixed-at-the-time CVE — the current release happened to clear it too) and taking the minimum that clears the named CVE can also be wrong, for the opposite reason: MVS can still drag a sibling forward (#165: `x/net`'s minimum fix pulled nothing else, while the *latest* `x/net` would have moved `x/crypto`, `x/sys` and `x/text` with no advisory asking for it). Resolve the actual question — does the resolved set clear the named CVEs with no fixed advisory left over — rather than defaulting to "latest" or "stated minimum" on habit.
+
+On a builder host with no Docker or Trivy, the substitute proof established in #126 and reused in #165: resolve the new base-image digest's `GOLANG_VERSION` via the registry API, build the Dockerfile's build line under that exact toolchain (`GOTOOLCHAIN=go<version>`), read the embedded module/stdlib set with `go version -m`, and run that set through OSV's `querybatch` — with a control query against the pre-change versions, to confirm the method would have reproduced the scan's original findings. The post-merge `security-scan` `workflow_dispatch` on `main` remains the real gate.
+
 ## Cross-links
 
 - [Ticket #32 codebase notes](../codebase/32.md) — what landed in this ticket.
