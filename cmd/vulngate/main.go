@@ -20,6 +20,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -47,13 +48,54 @@ const (
 	maxVulns   = 100
 )
 
-// message is one record of the govulncheck v1 JSON stream. Exactly one field
-// is set; progress, SBOM and unknown record kinds decode to all-nil and are
-// ignored.
+// message is one record of the govulncheck v1 JSON stream. Its object must
+// contain exactly one kind; progress, SBOM and unknown kinds are ignored.
 type message struct {
 	Config  *config  `json:"config"`
 	OSV     *osv     `json:"osv"`
 	Finding *finding `json:"finding"`
+}
+
+func (m *message) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	start, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("decoding record object: %w", err)
+	}
+	if start != json.Delim('{') {
+		return errors.New("record must be an object")
+	}
+	key, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("decoding record kind: %w", err)
+	}
+	kind, ok := key.(string)
+	if !ok {
+		return errors.New("record must be an object with exactly one kind")
+	}
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("decoding %s record: %w", kind, err)
+	}
+	// Count keys before dispatch, including duplicates that a map would hide.
+	if dec.More() {
+		return errors.New("record must contain exactly one kind")
+	}
+	var target any
+	switch kind {
+	case "config":
+		target = &m.Config
+	case "osv":
+		target = &m.OSV
+	case "finding":
+		target = &m.Finding
+	default:
+		return nil // progress, SBOM or a future record kind
+	}
+	if string(raw) == "null" {
+		return fmt.Errorf("%s record must not be null", kind)
+	}
+	return json.Unmarshal(raw, target)
 }
 
 type config struct {
@@ -67,9 +109,9 @@ type osv struct {
 }
 
 type finding struct {
-	OSV          string  `json:"osv"`
-	FixedVersion string  `json:"fixed_version"`
-	Trace        []frame `json:"trace"`
+	OSV          string   `json:"osv"`
+	FixedVersion string   `json:"fixed_version"`
+	Trace        []*frame `json:"trace"`
 }
 
 type frame struct {
@@ -78,6 +120,26 @@ type frame struct {
 	Package  string `json:"package"`
 	Function string `json:"function"`
 	Receiver string `json:"receiver"`
+}
+
+// validate checks every frame before relevance is decided, following
+// govulncheck v1.1.4's validateFindings field dependencies.
+func (fd *finding) validate() error {
+	if fd.OSV == "" || len(fd.Trace) == 0 {
+		return errors.New("finding without osv id or trace")
+	}
+	for i, f := range fd.Trace {
+		if f == nil {
+			return fmt.Errorf("trace frame %d must not be null", i)
+		}
+		if (f.Version != "" || f.Package != "") && f.Module == "" {
+			return fmt.Errorf("trace frame %d: version or package without module", i)
+		}
+		if f.Function != "" && f.Package == "" {
+			return fmt.Errorf("trace frame %d: function without package", i)
+		}
+	}
+	return nil
 }
 
 // vuln is one advisory whose vulnerable code the scanned module calls,
@@ -175,11 +237,14 @@ func parse(r io.Reader) ([]vuln, error) {
 		case !seenConfig:
 			return nil, errors.New("stream does not start with a config record")
 		case m.OSV != nil:
+			if m.OSV.ID == "" {
+				return nil, fmt.Errorf("record %d: osv without id", i)
+			}
 			summaries[m.OSV.ID] = m.OSV.Summary
 		case m.Finding != nil:
 			fd := m.Finding
-			if fd.OSV == "" || len(fd.Trace) == 0 {
-				return nil, fmt.Errorf("record %d: finding without osv id or trace", i)
+			if err := fd.validate(); err != nil {
+				return nil, fmt.Errorf("record %d: %w", i, err)
 			}
 			top := fd.Trace[0]
 			if top.Function == "" {
@@ -194,9 +259,6 @@ func parse(r io.Reader) ([]vuln, error) {
 				if s != "" && !safeToken(s) {
 					return nil, fmt.Errorf("record %d: unsafe string %q", i, s)
 				}
-			}
-			if top.Module == "" {
-				return nil, fmt.Errorf("record %d: symbol-level finding without module", i)
 			}
 			v := byID[fd.OSV]
 			if v == nil {

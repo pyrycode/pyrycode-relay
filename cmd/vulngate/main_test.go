@@ -137,6 +137,74 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestMalformedRecords(t *testing.T) {
+	var cases []struct {
+		Name   string
+		Record json.RawMessage
+	}
+	if err := json.NewDecoder(openFixture(t, "malformed-records.json")).Decode(&cases); err != nil {
+		t.Fatal(err)
+	}
+	called, err := os.ReadFile("testdata/called.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixes := map[string]string{
+		"after config": `{"config":{"protocol_version":"v1.0.0","scan_level":"symbol"}}`,
+		"after called": string(called),
+	}
+	for _, tt := range cases {
+		for name, prefix := range prefixes {
+			t.Run(tt.Name+"/"+name, func(t *testing.T) {
+				input := prefix + "\n" + string(tt.Record)
+				if got, err := parse(strings.NewReader(input)); err == nil || len(got) != 0 {
+					t.Errorf("parse = %v, %v; want no findings and an error", got, err)
+				}
+				in := filepath.Join(t.TempDir(), "govulncheck.json")
+				if err := os.WriteFile(in, []byte(input), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				out := t.TempDir()
+				var stderr bytes.Buffer
+				if code := run([]string{"-in", in, "-out", out}, io.Discard, &stderr); code != exitError {
+					t.Errorf("exit = %d, want %d; stderr: %s", code, exitError, stderr.String())
+				}
+				files, err := os.ReadDir(out)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(files) != 0 {
+					t.Errorf("output contains %v, want no artifact files", files)
+				}
+			})
+		}
+	}
+}
+
+func TestParseIgnoredRecords(t *testing.T) {
+	for _, fixture := range []string{"clean.json", "called.json"} {
+		t.Run(fixture, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("testdata", fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := parse(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := string(raw) + `
+{"progress":{"message":"done"}}
+{"SBOM":{"modules":[]}}
+{"future-record":{"data":"ignored"}}
+`
+			got, err := parse(strings.NewReader(input))
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Errorf("parse = %v, %v; want %v, nil", got, err, want)
+			}
+		})
+	}
+}
+
 func TestRunRendersCalledFindings(t *testing.T) {
 	out := t.TempDir()
 	code := run([]string{"-in", "testdata/called.json", "-out", out, "-run-url", "https://example/run/7"}, io.Discard, io.Discard)

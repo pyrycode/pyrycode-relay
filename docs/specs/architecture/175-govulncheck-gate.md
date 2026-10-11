@@ -100,8 +100,17 @@ Pending for the documentation stage:
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-11
 
+### Rework security review (2026-10-11)
+
+**Verdict:** PASS after addressing verifier finding 1.
+
+- [Trust boundaries] Resolved MUST FIX — decoding directly into pointer fields confused explicit null with absence and let a multi-kind record hide a called finding. `message.UnmarshalJSON` now checks the object and its single key before dispatch, rejects duplicate keys and null `config`/`osv`/`finding` values, and still ignores standalone progress, SBOM and unknown kinds. `finding.validate` rejects null trace frames and applies v1.1.4's `validateFindings` field dependencies to every frame before relevance is decided. OSV records require an id. `TestMalformedRecords` proves all 16 malformed fixtures fail with no artifact, both after config and after valid called findings; `TestParseIgnoredRecords` preserves forward compatibility.
+- [File operations] No findings — parsing completes before either artifact file is written; a malformed late record discards previously accumulated findings and leaves the output directory empty. The remaining security-review categories and workflow permissions are unchanged.
+
 ## Revisions
 
 - 2026-10-11 (build): run against real `govulncheck@v1.1.4 -json ./...` output for this repo (709 finding records, 19 called stdlib advisories under local go1.26.2) showed one advisory can list 70+ called symbols. `render` now caps each line at 5 symbols (`(+N more)`) and the list at 100 advisories, keeping the body far under GitHub's issue-body limit; `TestRenderCapsSymbols` asserts it.
 - 2026-10-11 (build): `go run` reports any non-zero child exit as its own exit 1, so in the workflow exit 3 and exit 1 are indistinguishable. Nothing depends on the difference: the upload guard keys on `issue-title.txt` existing, which only the findings path writes. `run` still returns 3, and the tests assert the distinction.
 - 2026-10-11 (build): the planned `TestUnsafeToken` landed as the `quote in id` and `newline in mod` cases of `TestParseMalformedFinding`.
+- 2026-10-11 (rework, verifier finding 1): record validation now precedes dispatch in `message.UnmarshalJSON`: each record is an object with exactly one kind, including no repeated keys, and processed kinds cannot be null. Trace entries are pointers so null frames remain distinguishable; `finding.validate` checks the entire trace, including imported-only traces and caller frames, against the pinned v1.1.4 field dependencies before testing `Trace[0].Function`. Any malformed record invalidates the whole stream even after a called finding, returning exit 1 with no artifact. Progress, SBOM and future standalone kinds remain ignored. Tests were written and observed failing before these fixes; `TestMalformedRecords` covers parser errors, CLI exit status and absent files in 32 cases, and `TestParseIgnoredRecords` covers clean and relevant streams.
+- 2026-10-11 (rework): resolved the offline execution question: `GOPROXY=off go run ./cmd/vulngate` on `clean.json` succeeds without module downloads and returns the clean result.
