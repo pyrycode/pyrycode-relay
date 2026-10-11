@@ -85,3 +85,7 @@ Operator must provision that read-only secret and run workflow_dispatch on main 
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-11
+
+## Revisions
+
+- 2026-10-11: the partial-write fixture showed title existence must indicate a complete write, so `render` writes a temporary title then renames it after the body succeeds. Accept spaces in Trivy fixed-version lists while rejecting control characters; legitimate reports can list fixes from multiple release lines. The scanner job runs the offline fixtures before either credential-bearing step.

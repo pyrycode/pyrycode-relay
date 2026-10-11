@@ -8,7 +8,8 @@ name: security-scan
 # next time someone bumps the affected dep. A failing scanner job
 # produces a red row in the Actions list AND triggers `file-issue`
 # below, which opens a labelled GitHub issue so the regression has an
-# owner (see #73).
+# owner (see #73). The deployed-image job also scans the immutable
+# digest observed on started Fly Machines, independently of main.
 on:
   schedule:
     # 06:00 UTC daily. Off-peak for US/EU/JP and keeps the
@@ -125,6 +126,58 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  deployed-image-scan:
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+      - name: verify deployed scanner fixtures
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/workflows -p 'test_security_scan.py' -v
+      - name: discover started image
+        env:
+          # Org-scoped read-only token; never use a deploy/personal token.
+          FLY_READONLY_TOKEN: ${{ secrets.FLY_READONLY_TOKEN }}
+        run: python3 .github/workflows/security_scan.py discover deployment.json
+      - name: download immutable image archive
+        env:
+          FLY_READONLY_TOKEN: ${{ secrets.FLY_READONLY_TOKEN }}
+        # The helper removes its temporary Docker config on success/failure
+        # before this step exits. No credential is available to Trivy.
+        run: python3 .github/workflows/security_scan.py download deployment.json deployed-image.tar
+      # Tracks: aquasecurity/trivy-action@v0.36.0
+      - name: trivy deployed image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          input: deployed-image.tar
+          format: json
+          output: deployed-trivy.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          # Execution errors fail this step and skip rendering, even if
+          # partial JSON exists. The next gate fails completed findings.
+          exit-code: '0'
+      - name: render deployed findings
+        run: |
+          python3 .github/workflows/security_scan.py render \
+            deployed-trivy.json deployment.json . \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+      - name: upload issue artifact
+        if: failure() && hashFiles('issue-title.txt') != ''
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: regression-deployed-image-scan
+          path: |
+            issue-title.txt
+            issue-body.md
+          retention-days: 7
+          if-no-files-found: error
+
   govulncheck:
     runs-on: ubuntu-latest
     permissions:
@@ -173,7 +226,7 @@ jobs:
           if-no-files-found: ignore
 
   file-issue:
-    needs: [image-scan, govulncheck]
+    needs: [image-scan, govulncheck, deployed-image-scan]
     if: failure()
     runs-on: ubuntu-latest
     # `issues: write` is granted at the JOB level — per AC #3 on #73
@@ -188,8 +241,7 @@ jobs:
       - name: download regression artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          # Matches both `regression-image-scan` and
-          # `regression-govulncheck`. Missing artifacts (e.g. one
+          # Matches all three scanner artifacts. Missing artifacts (e.g. one
           # scanner failed for a non-CVE reason and produced no
           # artifact) are silently absent.
           pattern: regression-*
@@ -199,6 +251,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          DEPLOYED_RESULT: ${{ needs.deployed-image-scan.result }}
         run: |
           set -euo pipefail
           # Locate rendered issues by their title file rather than by
@@ -209,13 +262,20 @@ jobs:
           # so every red run since 2026-06-06 filed nothing. `find`
           # keyed on the file we wrote ourselves is layout-proof.
           filed_or_suppressed=0
+          deployed_artifact=0
           while IFS= read -r title_file; do
             dir=$(dirname "$title_file")
             title=$(cat "$title_file")
             body_file="$dir/issue-body.md"
+            # Use the deterministic title marker, not extraction layout.
+            case "$title" in
+              'security-scan regression: '*" in deployed-image package "*) deployed_artifact=1 ;;
+            esac
             # Dedup: search open security-sensitive issues for one
             # whose title matches the full deterministic string we
-            # are about to file. `in:title` avoids matching unrelated
+            # are about to file. Compare actual titles exactly: search hits
+            # alone can include a different/repository-image title.
+            # `in:title` avoids matching unrelated
             # issues whose body happens to mention the CVE id. State
             # filter is `open` so a regression of a previously-closed
             # CVE files a fresh issue.
@@ -224,8 +284,8 @@ jobs:
               --state open \
               --label security-sensitive \
               --search "in:title \"$title\"" \
-              --json number \
-              --jq 'length')
+              --json title \
+              --limit 1000 | jq --arg title "$title" '[.[] | select(.title == $title)] | length')
             if [ "$existing" -gt 0 ]; then
               echo "duplicate suppressed for: $title"
               filed_or_suppressed=1
@@ -251,15 +311,17 @@ jobs:
           # 2026-06-06..2026-08-03 window went unnoticed. Same
           # open-state title dedup as above, so this files once per
           # incident, not once per day.
-          if [ "$filed_or_suppressed" -eq 0 ]; then
+          # A deployed scanner infrastructure failure must also be visible
+          # beside other scanners' findings; leave their fallback unchanged.
+          if [ "$filed_or_suppressed" -eq 0 ] || { [ "$DEPLOYED_RESULT" = failure ] && [ "$deployed_artifact" -eq 0 ]; }; then
             title="security-scan: scanner failed with no parseable findings"
             existing=$(gh issue list \
               --repo "$REPO" \
               --state open \
               --label security-sensitive \
               --search "in:title \"$title\"" \
-              --json number \
-              --jq 'length')
+              --json title \
+              --limit 1000 | jq --arg title "$title" '[.[] | select(.title == $title)] | length')
             if [ "$existing" -gt 0 ]; then
               echo "duplicate suppressed for: $title"
             else
