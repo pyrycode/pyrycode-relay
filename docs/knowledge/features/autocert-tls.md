@@ -78,6 +78,15 @@ Per-file mode (`0o600`) is autocert's contract, not enforced here. The directory
 
 ## Server timeouts
 
+All three public servers (insecure, autocert HTTPS and HTTP-01) set
+`MaxHeaderBytes: 16 * 1024` in `run` (#181), replacing Go's 1 MiB default.
+The allowance covers the request line and header keys and values, before any
+handler runs. It does not limit request bodies or WebSocket frames. Go's
+HTTP/1.1 parser permits buffer slack, so 16 KiB is the configured allowance
+rather than an exact wire-size rejection boundary. This reduces per-request
+memory exposure during header parsing; it does not cap the number of connections
+in that phase (see [connection cap](connection-cap.md#what-is-not-counted)).
+
 Both `httpsSrv` and `httpSrv` mirror the insecure path's timeouts:
 
 | Setting | Value |
@@ -88,6 +97,21 @@ Both `httpsSrv` and `httpSrv` mirror the insecure path's timeouts:
 | `IdleTimeout` | 120s |
 
 `ReadHeaderTimeout` bounds slow-loris on the pre-upgrade window on both ports and keeps `gosec` G114 quiet. Tightened from 10s to 5s in #35; post-upgrade slow peers are covered by the per-message read deadline on `WSConn.Read` ([`readMessageTimeout`](ws-conn-adapter.md), 30s, #111), the write timeout on `Send` (#15), and heartbeat (#7).
+
+## Testing HTTP limits
+
+`cmd/pyrycode-relay/http_headers_test.go` reads the three public `http.Server`
+literals in `run` and uses their actual header allowances on in-process servers.
+A test that only copies the intended value could pass while a production
+listener still uses Go's default. The wiring check also pins all four timeouts.
+Use a clearly oversized 64 KiB header value to assert HTTP/1.1 returns `431`
+without invoking the handler, including over TLS; an exact-cutoff assertion
+would depend on Go's buffer slack. A small request must still reach the handler.
+
+HTTP-01 coverage seeds a synthetic challenge in a temporary autocert cache,
+then checks the exact challenge body and the non-challenge `404` response.
+This exercises the handler without external ACME issuance. Real WebSocket
+upgrades remain covered by the command package's end-to-end tests.
 
 ## TLS version
 
