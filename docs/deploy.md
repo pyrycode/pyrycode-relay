@@ -111,10 +111,8 @@ with `flyctl tokens revoke <token ID>`). Keep the expiry reminder current.
 
 ## fly.toml gotchas
 
-Non-obvious requirements that surface as `flyctl deploy` failures or
-boot-time errors. Both are encoded in the checked-in `fly.toml`; the
-notes here exist so an operator editing the manifest (first bootstrap,
-re-cutover, porting to a new app) doesn't trip them again.
+Manifest requirements and resource limits to account for when editing the
+deployment (first bootstrap, re-cutover, or porting to a new app).
 
 1. **`[env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` is required.** Fly's
    substrate exposes `FLY_APP_NAME`, which the #65 self-check reads as
@@ -167,6 +165,16 @@ re-cutover, porting to a new app) doesn't trip them again.
    ([#110](knowledge/codebase/110.md)) for why the relay needs this at
    all — Fly's TCP passthrough hands the relay its own edge-proxy address
    as the socket peer, not the client's.
+5. **Public HTTP headers have a 16 KiB allowance on the 256 MB machine.**
+   The binary sets `MaxHeaderBytes: 16 * 1024` on the insecure, autocert
+   HTTPS and HTTP-01 servers (#181); this is fixed in `run`, with no
+   `fly.toml` setting or flag. It reduces each incomplete request's header
+   allowance from Go's 1 MiB default. The allowance includes the request
+   line and headers, with Go's buffer slack; it does not cap concurrent
+   pre-upgrade connections. The 5s header timeout remains in place. See
+   [DoS resistance](threat-model.md#dos-resistance--connection-floods-slow-loris-fork-bomb-retry)
+   for the limits and residual exposure. Apply the change by deploying
+   from clean `main` after merge using the flow below.
 
 ## Steady-state flow
 

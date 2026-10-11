@@ -30,7 +30,14 @@ One `*ConnCap` instance wraps both `ServerHandler` and `ClientHandler`, so binar
 
 ### What is not counted
 
-Connections still in the TLS or HTTP-header phase are not counted — `ReadHeaderTimeout` (5s) and the per-IP rate limiter bound that window instead. A connection only takes a slot once its handler starts running, immediately before `websocket.Accept`.
+Connections still in the TLS or HTTP-header phase are not counted. The public
+servers retain `ReadHeaderTimeout` (5s) and set `MaxHeaderBytes: 16 * 1024`
+for the request line and headers, with Go's buffer slack (#181; see
+[HTTP limits](autocert-tls.md#server-timeouts)). These bound time and
+per-request parsing exposure, not the number of connections in that phase.
+The per-IP rate limiter runs only after headers have been parsed. A connection
+only takes a slot once its handler starts running, immediately before
+`websocket.Accept`.
 
 ## Wiring
 
@@ -74,7 +81,7 @@ No new goroutines. The slot channel is the only shared state; buffered-channel s
 ## Out of scope
 
 - **Per-IP concurrent connection cap.** This cap is relay-wide, not per source. The rate limiter's burst (20) equals the default global cap (20), so a single IP can still fill the entire cap in one burst and lock out new upgrades relay-wide while its own connections keep working. Established connections are unaffected, and the relay no longer risks OOM — but the lockout itself is a residual risk. Deferred in [`security-followups.md`](../../security-followups.md) "Per-IP concurrent connection cap".
-- **TLS/header-phase connections.** Not counted against the cap; bounded only by `ReadHeaderTimeout` (5s) and the rate limiter.
+- **TLS/header-phase connections.** Not counted against the cap; the public header allowance and timeouts bound individual requests, not concurrent connection count (see [What is not counted](#what-is-not-counted)).
 - **Kernel socket buffers.** Outside the Go heap, covered only by the derivation's ~56 MiB reserve; a stalled phone's autotuned send buffer can exceed that share. An operator can lower `--max-connections` if this is observed.
 
 ## Related
