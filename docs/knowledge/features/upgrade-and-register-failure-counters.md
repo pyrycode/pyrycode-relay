@@ -45,6 +45,7 @@ Three of the five per-endpoint terminal sites (header-reject, success, rate-limi
 The rate-limit middleware (#47) short-circuits before the upgrade handler runs, so the handler cannot observe its deny. Adding a callback parameter to `NewRateLimitMiddleware` would cascade across **11 call sites** (1 prod + 10 tests) — at the edit-fan-out red line. Instead, `WrapServerRateLimitDeny` / `WrapClientRateLimitDeny` stack a thin `statusObserverResponseWriter` OUTSIDE the rate-limit middleware and inspect the status code after the inner pipe returns. HTTP 429 in either pipe **is** the rate-limit deny signal:
 
 - Header-gate rejects write 400.
+- Source and global connection-cap refusals write 503, leaving these counters unchanged.
 - Successful upgrades write 101 (regardless of subsequent WS application close codes).
 - WS close codes 4404 / 4409 / 4429 travel **inside** the upgraded WebSocket, not as HTTP status.
 - The rate-limit middleware is structurally the only HTTP-429 source on either pipe.
@@ -83,10 +84,10 @@ upgradeMetrics := relay.NewUpgradeMetrics(metricsReg)
 
 mux.Handle("/v1/server",
     upgradeMetrics.WrapServerRateLimitDeny(
-        rateLimit(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))
+        rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))))
 mux.Handle("/v1/client",
     upgradeMetrics.WrapClientRateLimitDeny(
-        rateLimit(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))
+        rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))))
 ```
 
 ## `statusObserverResponseWriter` — Hijack forwarding is load-bearing
@@ -123,6 +124,7 @@ All three label spaces (`endpoint`, `outcome`, `kind`) are hard-coded string con
 - [Connection-count gauges](connection-count-gauges.md) — pull-based sibling collector (#61).
 - [Frame-forwarded and grace-expiry counters](frame-and-grace-counters.md) — push-shaped sibling using hooks-on-`Registry` instead of a handler parameter (#58); same pre-bind pattern, different seam.
 - [Per-IP rate-limit middleware](rate-limit-middleware.md) — the deny path observed by `WrapXxxRateLimitDeny` (#47).
+- [Connection caps](connection-cap.md) — source/global admission returns 503, preserving the observer's 429-only contract.
 - [`/v1/server` WS upgrade](server-endpoint.md) — host of the server-side increments (#26, #57).
 - [`/v1/client` WS upgrade](client-endpoint.md) — host of the client-side increments, including the `4429` phones-at-cap branch from #30.
 - [ADR-0008: Prometheus client adoption](../decisions/0008-prometheus-client-adoption.md) — scope-of-use rules; closed-label cardinality budget; `DefaultRegisterer` ban.

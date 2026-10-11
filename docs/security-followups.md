@@ -21,11 +21,28 @@ Recommendation per option: **observe first**. Wait for logs/metrics to show actu
 
 Each item below already exists as a "Future hardening" line in `threat-model.md`. Restated here with a single-sentence trigger + rough scope so the next session can pick from the menu.
 
-- **Per-IP concurrent connection cap.** The [global connection cap](knowledge/features/connection-cap.md) (#114) bounds total live connections relay-wide, but not per source: the rate limiter's burst (20) equals the default global cap (20), so a single IP can still fill the entire cap in one burst and lock out new upgrades for everyone else, while its own connections keep working. Established connections are unaffected and the relay no longer OOMs from this path — the global cap already turned the crash-loop risk into a lockout risk — but this per-IP cap is still the remedy for the lockout itself. Trigger: first observed single-IP connection flood. Scope: M (~50 LOC + per-IP state in `ratelimit.go`'s bucket map + test matrix).
-- **Slowloris connection-count cap — SHIPPED (#114).** A relay-wide [connection cap](knowledge/features/connection-cap.md) (`--max-connections`, default 20) now bounds how many live connections, slow or not, can be held open at once across `/v1/server` and `/v1/client` combined — a new upgrade over the cap gets `503` before `websocket.Accept`. This closes the FD/RAM exhaustion path this item used to describe: previously, a flood of connections each held for up to ~30s (one message deadline) was not bounded, since many slow peers under the per-IP upgrade rate limit could still exhaust FDs/RAM concurrently. What remains is concurrency *per source* — see the "Per-IP concurrent connection cap" item above.
+- **Per-IP concurrent connection cap — upgraded-session allowance SHIPPED (#180).**
+  The [connection caps](knowledge/features/connection-cap.md) now include
+  `--max-connections-per-source` (default 8), shared across both upgrade
+  routes, inside rate limiting and before the global cap (default 20).
+  It uses the exact `ClientIP` identity and trust setting, returns 503 at
+  the allowance and retains counts through handler cleanup. One source
+  cannot fill every upgraded slot under `0 < source < global`.
+  **Still deferred: per-source raw listener allowances.** The upgraded gate
+  runs after HTTP headers and does not protect raw slots from one source
+  filling a listener during PROXY/TLS/header phases. Many sources can also
+  fill the global upgraded pool. Trigger for raw-source hardening: observed
+  single-source raw listener lockout. Scope: M (source attribution before
+  HTTP, trusted PROXY handling and socket-lifetime accounting).
+- **Slowloris connection-count cap — SHIPPED (#114, #182).** The relay-wide
+  upgraded cap (`--max-connections`, default 20) bounds live handlers across
+  both upgrade routes; the independent raw cap (`--max-listener-connections`,
+  default 32 per public listener) also covers pre-upgrade parsing and
+  keep-alive sockets. Remaining per-source raw protection is the deferred
+  part of "Per-IP concurrent connection cap" above.
 - **Multi-instance shared rate-limit state.** Current limiter is in-process; multi-instance deploy would let an attacker rate-limit-bypass via the load balancer. Trigger: first multi-instance deployment (currently forbidden by `#65`). Scope: L (needs Redis/NATS/sticky-LB choice + plumbing).
 - **CIDR-aware trusted-proxy chain for `X-Forwarded-For`.** Today `--trust-x-forwarded-for` is binary all-or-nothing. A real reverse-proxy chain needs per-CIDR trust. Trigger: deployment behind a multi-tier proxy. Scope: M.
-- **Restrict the PROXY protocol listener to trusted upstreams.** Since [#110](knowledge/codebase/110.md), `--https-proxy-protocol` ([feature doc](knowledge/features/proxy-protocol-listener.md)) honours a PROXY v2 header from *any* TCP peer that reaches the HTTPS listener (`ConnPolicy: REQUIRE`, no source allowlist) — the wrapper validates header *shape*, not *sender*. On Fly, a peer on the app's private 6PN network that reaches internal port 8443 directly, bypassing Fly's public edge, can forge its own source address and pick its rate-limit bucket. Fly does not publish stable proxy IP ranges to allowlist against today, so a source restriction would need either a Fly-provided mechanism or a private-network-only bind for the internal port. Trigger: Fly publishes stable edge-proxy ranges, or evidence of an org-internal actor exploiting this surfaces. Scope: S–M depending on whether Fly provides ranges (S, allowlist check in `ConnPolicy`) or not (M, needs a different mechanism).
+- **Restrict the PROXY protocol listener to trusted upstreams.** Since [#110](knowledge/codebase/110.md), `--https-proxy-protocol` ([feature doc](knowledge/features/proxy-protocol-listener.md)) honours a PROXY v2 header from *any* TCP peer that reaches the HTTPS listener (`ConnPolicy: REQUIRE`, no source allowlist) — the wrapper validates header *shape*, not *sender*. On Fly, a peer on the app's private 6PN network that reaches internal port 8443 directly, bypassing Fly's public edge, can forge its own source address and pick its rate-limit bucket and upgraded source allowance. Fly does not publish stable proxy IP ranges to allowlist against today, so a source restriction would need either a Fly-provided mechanism or a private-network-only bind for the internal port. Trigger: Fly publishes stable edge-proxy ranges, or evidence of an org-internal actor exploiting this surfaces. Scope: S–M depending on whether Fly provides ranges (S, allowlist check in `ConnPolicy`) or not (M, needs a different mechanism).
 - **Geo-blocking.** Not in threat model; requires external IP-geolocation source. Trigger: compliance requirement or abuse pattern from a specific region. Scope: M (vendor dep + middleware).
 - **SBOM generation in CI.** Supply-chain hardening. Trigger: first user or audit requirement. Scope: S (add a `cyclonedx-gomod` step to `security-scan.yml`).
 - **External pen-test.** No external audit has been performed. Trigger: pre-production deployment with non-trivial user data, or regulatory requirement. Scope: external engagement.

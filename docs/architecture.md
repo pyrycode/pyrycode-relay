@@ -41,13 +41,24 @@ on HTTP-01 or the alternative insecure listener. HTTPS and HTTP-01 have
 independent capacity. At capacity, peers wait outside relay acceptance;
 slots last until socket close, including keep-alive and WebSocket hijacking.
 
-The separate relay-wide `--max-connections` cap (default 20) still gates
-`/v1/server` and `/v1/client` upgrades with `503`. Upgraded sockets occupy
-raw slots too. `/healthz` consumes raw capacity; loopback metrics is outside
-both caps. Closing listeners wakes blocked acceptance, and the existing
-shutdown path drains registered WebSockets with `1001`.
-See [connection caps](knowledge/features/connection-cap.md) for sizing,
-configuration and the remaining per-source saturation risk.
+After HTTP headers, `/v1/server` and `/v1/client` share admission in this
+order: metrics observer → per-source attempt-rate limiter →
+`SourceConnCap` (`--max-connections-per-source`, default 8) → relay-wide
+`ConnCap` (`--max-connections`, default 20) → endpoint. Both source limits
+use the exact `ClientIP` result and the same XFF trust setting; PROXY HTTPS
+supplies the declared source through `RemoteAddr`. Rate denials return 429
+without reservations; either upgraded cap returns 503 before acceptance.
+Reservations last through handler cleanup, and the last source release
+deletes its count entry. Startup requires `0 < source < global`, including
+when the source default was omitted.
+
+Upgraded sockets occupy raw slots too. `/healthz` bypasses upgraded limits
+but consumes raw capacity; loopback metrics is outside all connection caps.
+Closing listeners wakes blocked acceptance, and the existing shutdown path
+drains registered WebSockets with `1001`. One source can still saturate raw
+capacity before reaching the source gate; many sources can fill the global
+upgraded pool. See [connection caps](knowledge/features/connection-cap.md)
+for sizing, configuration and source-trust limits.
 
 ## Outbound calls to Google (FCM push wake)
 
