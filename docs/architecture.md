@@ -32,6 +32,23 @@ The wire protocol lives in [`pyrycode/pyrycode/docs/protocol-mobile.md`](https:/
   asks for one.
 - Operate on multiple users / tenants in v1. One operator, many users' server-ids.
 
+## Public listener admission
+
+Every public path admits at most `--max-listener-connections` accepted
+sockets (default 32) before parsing: raw TCP → `netutil.LimitListener` →
+optional PROXY v2 → TLS → HTTP on HTTPS; raw TCP → `LimitListener` → HTTP
+on HTTP-01 or the alternative insecure listener. HTTPS and HTTP-01 have
+independent capacity. At capacity, peers wait outside relay acceptance;
+slots last until socket close, including keep-alive and WebSocket hijacking.
+
+The separate relay-wide `--max-connections` cap (default 20) still gates
+`/v1/server` and `/v1/client` upgrades with `503`. Upgraded sockets occupy
+raw slots too. `/healthz` consumes raw capacity; loopback metrics is outside
+both caps. Closing listeners wakes blocked acceptance, and the existing
+shutdown path drains registered WebSockets with `1001`.
+See [connection caps](knowledge/features/connection-cap.md) for sizing,
+configuration and the remaining per-source saturation risk.
+
 ## Outbound calls to Google (FCM push wake)
 
 Unlike everything else in [*What this binary does*](#what-this-binary-does),

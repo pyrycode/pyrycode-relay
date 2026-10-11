@@ -51,7 +51,8 @@ written** and no handler ever runs. There is no fallback to the socket peer
 address at any point in this path. Because the header read happens lazily in
 the connection's own goroutine (not inside `Accept`), a stalled header holds
 one goroutine and one file descriptor for at most `headerTimeout` and never
-blocks other connections from being accepted.
+blocks acceptance while raw capacity remains. It occupies one raw slot until
+the connection closes; enough stalled peers can fill the listener.
 
 ## Wiring (`cmd/pyrycode-relay/main.go`)
 
@@ -68,12 +69,17 @@ blocks other connections from being accepted.
   `--https-listen` alongside `--insecure-listen` — exit code 2. The new flag
   configures the autocert HTTPS listener specifically and would silently
   no-op in insecure mode.
-- **The `listen` closure for `httpsSrv`**: flag off keeps
-  `s.ListenAndServeTLS("", "")` verbatim (byte-identical to pre-#110
-  behaviour). Flag on: `net.Listen("tcp", s.Addr)` →
-  `relay.NewProxyProtoListener(ln, proxyHeaderTimeout)` → `s.ServeTLS(pln,
-  "", "")`. The wrapper has to sit under `ServeTLS`'s `tls.NewListener`,
-  not on top of it, because the PROXY header precedes the TLS `ClientHello`.
+- **The `listen` closure for `httpsSrv`**: `net.Listen("tcp", s.Addr)` →
+  `netutil.LimitListener(ln, maxListenerConnections)` → optional
+  `relay.NewProxyProtoListener(ln, proxyHeaderTimeout)` → `s.ServeTLS(ln,
+  "", "")`. Raw admission precedes both PROXY parsing and `ServeTLS`'s
+  `tls.NewListener`; the PROXY header precedes the TLS `ClientHello`.
+  `--max-listener-connections` defaults to 32 per public listener, including
+  HTTPS when PROXY is disabled. HTTP-01 has its own independent limiter and
+  uses `Serve` directly; it consumes no HTTPS capacity. The metrics listener
+  remains separate. A slot follows socket `Close` through all wrappers,
+  keep-alive and WebSocket hijacking ([connection caps](connection-cap.md)).
+  HTTPS retains deferred listener cleanup for `ServeTLS` setup errors.
   `CheckListenerPorts` ([listener port allowlist](listener-port-allowlist.md))
   is unaffected — the bound port doesn't change, only what wraps the raw
   listener.

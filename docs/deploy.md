@@ -170,11 +170,31 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    HTTPS and HTTP-01 servers (#181); this is fixed in `run`, with no
    `fly.toml` setting or flag. It reduces each incomplete request's header
    allowance from Go's 1 MiB default. The allowance includes the request
-   line and headers, with Go's buffer slack; it does not cap concurrent
-   pre-upgrade connections. The 5s header timeout remains in place. See
+   line and headers, with Go's buffer slack; concurrent accepted sockets
+   are bounded separately below. The 5s header timeout remains in place. See
    [DoS resistance](threat-model.md#dos-resistance--connection-floods-slow-loris-fork-bomb-retry)
    for the limits and residual exposure. Apply the change by deploying
    from clean `main` after merge using the flow below.
+
+6. **Raw capacity is 32 accepted sockets per public listener.**
+   `--max-listener-connections` defaults to 32 independently for HTTPS and
+   HTTP-01 (or the alternative insecure listener). It wraps TCP acceptance
+   before PROXY/TLS/HTTP parsing and retains slots through keep-alive and
+   WebSocket hijacking until socket close. At capacity, peers wait outside
+   acceptance; successful TCP dial does not mean admission. `/healthz`
+   consumes raw slots; loopback metrics remains separate. The existing
+   `--max-connections` default of 20 still governs upgraded sessions.
+   Neither default requires an argv change, and both must be positive.
+
+   The combined 256 MB sizing estimate is 2 × 32 raw slots × ~128 KiB
+   (16 KiB headers + 4 KiB Go slack, TLS/PROXY/bufio buffers and stacks) =
+   8 MiB, plus 20 × ~4.4 MiB upgraded state = 88 MiB. The upgraded sockets
+   are already within the raw slots. About 96 MiB live state × 2 for
+   `GOGC=100`, plus 56 MiB runtime/autocert/kernel reserve, totals ~248 MiB.
+   This conservatively overlaps some transport storage and is an estimate,
+   not a memory guarantee. Raising either cap changes the budget. Complete
+   the isolated non-production check in [Verify a deploy](#verify-a-deploy)
+   before production deployment; merging does not perform that check.
 
 ## Steady-state flow
 
@@ -233,6 +253,35 @@ Observability:
   Actions log no longer exists for deploys).
 
 ## Verify a deploy
+
+Before deploying raw listener admission to production, the operator must
+verify the combined memory estimate and saturation behavior on an **isolated
+non-production Fly app**, using the intended image, 256 MB machine size,
+`GOGC=100` and production listener/PROXY wiring. Keep its domain, cache,
+credentials and test clients separate from production. The pipeline's local
+socket tests do not substitute for this operational check.
+
+- Fill both public listeners to the configured raw cap, including stalled
+  pre-header peers, keep-alive sockets and the 20 upgraded sessions within
+  those raw slots. Exercise the upgraded worst case with bounded phone
+  queues ([budget derivation](knowledge/features/connection-cap.md#default-derivation)).
+  Observe machine memory and Go heap/GC behavior over sustained saturation
+  and churn; check for OOM kills, restarts and adequate headroom.
+- Check that additional peers receive no HTTP/TLS service before a slot
+  frees, then recover after close or phase timeout. TCP dial success alone
+  proves neither admission nor available memory. Check HTTP-01 saturation
+  leaves HTTPS upgrades and loopback metrics accessible, and that a freed
+  HTTP-01 slot serves a cached challenge or the non-challenge `404`.
+  `/healthz` may wait when its public listener is full.
+- Stop the isolated relay at saturation with a queued peer and verify the
+  listeners close, registered WebSockets receive `1001`, and shutdown stays
+  within the 10s drain budget. Record the image, caps, load and memory
+  observations. Adjust caps or machine size and repeat if headroom is
+  insufficient; proceed to production only after the check passes.
+
+This verification and deployment are operator-owned and were not performed
+by the ticket pipeline. After production deployment, identify the running
+artifact as follows.
 
 Answering "is the fix actually live?" requires identifying the running artifact.
 Start with two independent readings, which should agree:
