@@ -102,6 +102,14 @@ during setup before `Serve` takes ownership, so replacing `ListenAndServeTLS`
 without preserving its cleanup would leak the listener. PROXY setup failure
 also closes the newly opened listener.
 
+On Fly, both raw-TCP services configure `type = "connections"` and
+`hard_limit = 32`, matching this flag's default independently for
+8080/external 80 and 8443/external 443 (#183). Fly's
+[forwarding ceiling](https://docs.fly.io/reference/configuration#servicesconcurrency)
+stops new traffic to a saturated Machine; the relay cap separately bounds
+accepted sockets, including connections that bypass the public edge.
+Keep the manifest ceilings aligned when changing the raw listener setting.
+
 ### Default derivation
 
 `defaultMaxConnections = 20`, sized for the 256 MB Fly machine, charging every connection at the phone worst case (a binary costs less — it has no outbox):
@@ -165,6 +173,13 @@ the new owner's slot. Saturated signal and listener-failure tests check
 a cancelled signal context: an unrelated configuration refusal also returns
 2 and could mask a missing cap validator.
 
+Offline config assertions and local socket tests cannot prove Fly's live
+forwarding policy. An absent HTTP/TLS response can mean either Fly withheld
+forwarding or the relay has not accepted a queued peer; TCP dial success
+proves neither. The operator must observe forwarding at saturation and
+recovery for each service on an isolated Fly app before production deployment,
+as described in [Verify a deploy](../../deploy.md#verify-a-deploy).
+
 ## Out of scope
 
 - **Per-source concurrent allowances.** One IP can fill either raw listener
@@ -172,9 +187,10 @@ a cancelled signal context: an unrelated configuration refusal also returns
   one rate-limit burst. Established connections continue, but new admission
   can be locked out. Deferred in [`security-followups.md`](../../security-followups.md)
   under "Per-IP concurrent connection cap".
-- **Fly edge ceilings and queued TCP peers.** The raw cap bounds relay
-  acceptance, not the substrate or kernel backlog. Edge concurrency policy
-  remains operator-owned, separate work.
+- **Edge resources and queued TCP peers.** The configured Fly ceilings
+  stop new forwarding, without guaranteeing immediate client drops or
+  bounding edge resources and the kernel backlog. Raw admission remains
+  the separate process boundary.
 - **Kernel socket buffers.** Outside the Go heap and covered only by the
   estimate's reserve; autotuned buffers can exceed it. Lower either cap if
   isolated operational validation requires it.

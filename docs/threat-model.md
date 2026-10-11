@@ -92,7 +92,15 @@ per-request pre-upgrade memory exposure; the separate raw listener cap below
 bounds concurrent accepted sockets, including those parsing headers.
 Routing-header semantics remain defined by the [protocol's Authentication section](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#authentication).
 
-**v1 mitigation:** Raw admission uses `netutil.LimitListener` in `run`
+**v1 mitigation:** Both raw-TCP services in `fly.toml` configure Fly
+forwarding ceilings (`type = "connections"`, `hard_limit = 32`), independently
+for 8080/external 80 and 8443/external 443 (#183). These match the public
+listener default below. Fly [stops forwarding new traffic](https://docs.fly.io/reference/configuration#servicesconcurrency)
+to a Machine at or above the service limit; immediate client drops are not
+guaranteed. Saturation and recovery must be verified by the operator on an
+[isolated Fly app before production deployment](deploy.md#verify-a-deploy).
+
+Raw admission uses `netutil.LimitListener` in `run`
 ([connection caps](knowledge/features/connection-cap.md)), independently on
 HTTPS, HTTP-01 and the alternative insecure listener.
 `--max-listener-connections` defaults to 32 per public listener; non-positive
@@ -125,12 +133,14 @@ Upgrade-rate limiting starts only after HTTP headers, so it offers no
 protection for earlier phases. HTTPS and HTTP-01 capacity is independent,
 but a source can target both. The caps bound accepted sockets and upgraded
 state; they do not guarantee memory use under the estimated machine budget
-or cap Fly's edge and the kernel backlog. Per-source allowances and edge
-ceilings remain separate work in [`security-followups.md`](security-followups.md).
+or cap Fly's edge resources and the kernel backlog. Fly's configured forwarding
+ceilings are a separate boundary and do not cover direct private-network
+connections to the listeners. Per-source allowances remain deferred in
+[`security-followups.md`](security-followups.md).
 
 The single-instance limiter is per-process — a future multi-instance deployment behind L4 load balancing would need shared state to converge on a global limit. `X-Forwarded-For` is binary trust (all-or-nothing) — a CIDR-aware trusted-proxy chain is not implemented. The PROXY header is trusted from *any* upstream that reaches the HTTPS listener (`ConnPolicy: REQUIRE`, not scoped to a source allowlist) — a peer on the Fly app's private 6PN network that reaches internal port 8443 directly, bypassing Fly's public edge, can forge its own source address and choose its rate-limit bucket. That is an org-internal attacker, not an internet one; see [`security-followups.md`](security-followups.md). The per-phone delivery queue's 64 MiB-per-server-id worst case is now also bounded by the global connection cap: 16 phones on one server-id already consume 16 of the default 20 global slots, so a hostile operator running several non-reading-phone-heavy daemons is throttled by the same cap as any other connection flood, not exempt from it. What remains is the same per-source gap as above — nothing stops one operator's several daemons, each on a different server-id, from being the ones that fill those slots.
 
-**Future hardening:** Per-source concurrent allowances layered on the raw and upgraded caps; operator-owned Fly edge ceilings; a CIDR-allowlisted trusted-proxy chain for `X-Forwarded-For`; reverse-proxy fronting for L4 protections; shared rate-limit state for multi-instance deployments. Trigger: first observed single-IP connection flood, first multi-instance deployment, or first paying user.
+**Future hardening:** Per-source concurrent allowances layered on the raw and upgraded caps; a CIDR-allowlisted trusted-proxy chain for `X-Forwarded-For`; reverse-proxy fronting for L4 protections; shared rate-limit state for multi-instance deployments. Trigger: first observed single-IP connection flood, first multi-instance deployment, or first paying user.
 
 ## Log hygiene — what must not be logged
 
