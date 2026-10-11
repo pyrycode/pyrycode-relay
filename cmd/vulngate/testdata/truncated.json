@@ -1,0 +1,75 @@
+{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck",
+    "scanner_version": "v1.1.4",
+    "scan_level": "symbol",
+    "scan_mode": "source"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2021-0265",
+    "summary": "Denial of service   in\n`gjson`",
+    "affected": [
+      {
+        "package": {
+          "name": "github.com/tidwall/gjson",
+          "ecosystem": "Go"
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0265",
+    "fixed_version": "v1.9.3",
+    "trace": [
+      {
+        "module": "github.com/tidwall/gjson",
+        "version": "v1.6.5"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0265",
+    "fixed_version": "v1.9.3",
+    "trace": [
+      {
+        "module": "github.com/tidwall/gjson",
+        "version": "v1.6.5",
+        "package": "github.com/tidwall/gjson"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2021-0265",
+    "fixed_version": "v1.9.3",
+    "trace": [
+      {
+        "module": "github.com/tidwall/gjson",
+        "version": "v1.6.5",
+        "package": "github.com/tidwall/gjson",
+        "function": "Get",
+        "receiver": "Result",
+        "position": {
+          "filename": "gjson.go",
+          "offset": 5744,
+          "line": 296,
+          "column": 17
+        }
+      },
+      {
+        "module": "golang.org/vuln",
+        "package": "golang.org/vuln",
+        "function": "main",
+        "position": {
+          "filename": "vuln.go",
+          "offset": 204,
+          "line": 14,
+          "col

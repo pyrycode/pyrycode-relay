@@ -1,0 +1,26 @@
+{
+  "progress": {
+    "message": "Scanning your code and 120 packages across 17 dependent modules for known vulnerabilities..."
+  }
+}
+{
+  "osv": {
+    "schema_version": "1.3.1",
+    "id": "GO-2025-3487",
+    "summary": "Potential denial of service in golang.org/x/crypto",
+    "details": "SSH servers which implement file transfer protocols are vulnerable.",
+    "affected": [
+      {
+        "package": {
+          "name": "golang.org/x/crypto",
+          "ecosystem": "Go"
+        }
+      }
+    ]
+  }
+}
+{
+  "progress": {
+    "message": "No vulnerabilities found."
+  }
+}

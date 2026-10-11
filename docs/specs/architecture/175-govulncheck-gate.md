@@ -99,3 +99,9 @@ Pending for the documentation stage:
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-11
+
+## Revisions
+
+- 2026-10-11 (build): run against real `govulncheck@v1.1.4 -json ./...` output for this repo (709 finding records, 19 called stdlib advisories under local go1.26.2) showed one advisory can list 70+ called symbols. `render` now caps each line at 5 symbols (`(+N more)`) and the list at 100 advisories, keeping the body far under GitHub's issue-body limit; `TestRenderCapsSymbols` asserts it.
+- 2026-10-11 (build): `go run` reports any non-zero child exit as its own exit 1, so in the workflow exit 3 and exit 1 are indistinguishable. Nothing depends on the difference: the upload guard keys on `issue-title.txt` existing, which only the findings path writes. `run` still returns 3, and the tests assert the distinction.
+- 2026-10-11 (build): the planned `TestUnsafeToken` landed as the `quote in id` and `newline in mod` cases of `TestParseMalformedFinding`.
