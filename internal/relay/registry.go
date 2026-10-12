@@ -13,6 +13,10 @@ import (
 // registry has no knowledge of WebSockets and the WS upgrade handlers do
 // the translation.
 var (
+	// ErrRegistryDraining is returned by every admission method after shutdown
+	// begins. The caller owns closing its rejected connection with WS 1001.
+	ErrRegistryDraining = errors.New("relay: registry draining")
+
 	// ErrServerIDConflict is returned by ClaimServer when serverID is
 	// already held by another binary. Maps to WS close code 4409.
 	ErrServerIDConflict = errors.New("relay: server-id already claimed")
@@ -56,6 +60,8 @@ type Conn interface {
 
 // Registry maps server-ids to a single binary connection (1:1) and to a list
 // of phone connections (1:N). All methods are safe to call concurrently.
+// Once Shutdown begins, ClaimServer, TakeoverServer and RegisterPhoneCapped
+// permanently reject admission with ErrRegistryDraining before other checks.
 //
 // The registry holds Conn handles by reference and never inspects their
 // internal state. It does not call Send or Close on a Conn while holding its
@@ -66,6 +72,8 @@ type Registry struct {
 	binaries map[string]Conn
 	phones   map[string][]Conn
 	timers   map[string]*graceEntry
+	// draining is permanent for this registry lifetime and guarded by mu.
+	draining bool
 
 	// onPhoneForwarded is invoked by StartPhoneForwarder after each
 	// successful binary.Send. Nil = no-op. Set once at boot via
@@ -163,6 +171,10 @@ const reclaimCloseReason = "binary reclaimed server-id"
 // against the live binary. See ADR-0006 (amended for #127).
 func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 	r.mu.Lock()
+	if r.draining {
+		r.mu.Unlock()
+		return ErrRegistryDraining
+	}
 	if _, gracing := r.timers[serverID]; !gracing {
 		defer r.mu.Unlock()
 		if _, ok := r.binaries[serverID]; ok {
@@ -196,6 +208,10 @@ func (r *Registry) ClaimServer(serverID string, conn Conn) error {
 // incumbent; the caller owns that, as it owns the close code.
 func (r *Registry) TakeoverServer(serverID string, incumbent, conn Conn) error {
 	r.mu.Lock()
+	if r.draining {
+		r.mu.Unlock()
+		return ErrRegistryDraining
+	}
 	if cur, held := r.binaries[serverID]; held && cur != incumbent {
 		r.mu.Unlock()
 		return ErrServerIDConflict
@@ -377,6 +393,9 @@ func (r *Registry) RegisterPhone(serverID string, conn Conn) error {
 func (r *Registry) RegisterPhoneCapped(serverID string, conn Conn, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.draining {
+		return ErrRegistryDraining
+	}
 	if _, ok := r.binaries[serverID]; !ok {
 		return ErrNoServer
 	}
@@ -461,12 +480,22 @@ func (r *Registry) PhonesFor(serverID string) []Conn {
 	return out
 }
 
+// beginDrain atomically closes admission and snapshots the connections for
+// Shutdown. A handler upgrading concurrently either registers before this
+// boundary or receives ErrRegistryDraining and closes its own socket. No I/O
+// occurs under mu, and a drained registry cannot be reopened.
+func (r *Registry) beginDrain() []Conn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.draining = true
+	return r.snapshotLocked()
+}
+
 // Snapshot returns a freshly-allocated slice of every Conn currently
 // registered as a binary or a phone. The caller may iterate, append, or
 // otherwise mutate the slice without affecting the registry's internal
 // state or holding any registry lock. Returns nil when no conns are
-// registered. Used by the graceful-shutdown path (#31) to fan close
-// frames out without exposing internal maps.
+// registered. Shutdown uses beginDrain to stop admission and snapshot atomically.
 //
 // Order is unspecified (map-iteration order); callers don't care. The
 // Conn handles inside the slice are the same references the registry
@@ -474,6 +503,11 @@ func (r *Registry) PhonesFor(serverID string) []Conn {
 func (r *Registry) Snapshot() []Conn {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.snapshotLocked()
+}
+
+// snapshotLocked requires at least the read lock.
+func (r *Registry) snapshotLocked() []Conn {
 	total := len(r.binaries)
 	for _, s := range r.phones {
 		total += len(s)

@@ -87,3 +87,9 @@ Pending documentation stage: `docs/knowledge/features/graceful-shutdown.md` § C
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-12
+
+## Revisions
+
+- 2026-10-12: The test upgrade barrier pauses immediately after the underlying `http.Hijacker.Hijack` succeeds; net/http has already flushed the 101 response. This is simpler than wrapping socket writes and still holds `websocket.Accept` before registry admission. The admitted-peer test also blocks a separate close on a channel to prove real peers receive 1001 independently of a stalled close.
+
+- 2026-10-12: `make check` exposed `TestSourceConnCap_FailureAndTeardown/shutdown` in `internal/relay/source_conncap_test.go`, which reused the source reservation by expecting a fresh claim in the same registry after shutdown. Update that case to assert successful upgrade followed by 1001, no fresh claim, and reservation cleanup; other teardown cases still assert fresh admission. This test now covers reuse of a source identity against a permanently drained registry.

@@ -19,11 +19,12 @@ type gracefulCloser interface {
 	CloseWithCode(code websocket.StatusCode, reason string)
 }
 
-// Shutdown initiates a graceful drain. It concurrently invokes
-// http.Server.Shutdown on each server (which closes their listeners
-// and waits for non-hijacked handlers), snapshots every WS conn from
-// reg, and emits a 1001 StatusGoingAway close frame on each. It
-// returns once both fan-outs complete or ctx expires.
+// Shutdown permanently stops registry admission and atomically snapshots its
+// connections. It then concurrently invokes http.Server.Shutdown on each
+// server (closing listeners and waiting for non-hijacked handlers) and emits
+// a 1001 StatusGoingAway close on each snapshotted connection. Already-upgraded
+// handlers arriving after the boundary close their own rejected sockets;
+// Shutdown does not join them. It returns when both fan-outs finish or ctx expires.
 //
 // On ctx expiry it force-closes each server via http.Server.Close
 // before returning ctx.Err(); the helper does not wait for the
@@ -40,6 +41,8 @@ type gracefulCloser interface {
 // Safe to call exactly once per process. Concurrent or repeat
 // invocations are undefined.
 func Shutdown(ctx context.Context, logger *slog.Logger, reg *Registry, servers ...*http.Server) error {
+	// Close registry admission before HTTP shutdown can race upgraded handlers.
+	conns := reg.beginDrain()
 	var wg sync.WaitGroup
 
 	for _, srv := range servers {
@@ -53,7 +56,6 @@ func Shutdown(ctx context.Context, logger *slog.Logger, reg *Registry, servers .
 		}()
 	}
 
-	conns := reg.Snapshot()
 	for _, c := range conns {
 		c := c
 		wg.Add(1)

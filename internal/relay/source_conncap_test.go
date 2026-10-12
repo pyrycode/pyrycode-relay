@@ -288,7 +288,18 @@ func TestSourceConnCap_FailureAndTeardown(t *testing.T) {
 			}
 			// Reuse the same source after every exit, not merely inspect the map.
 			fresh := mustDial(t, base+"/v1/server", validHeaders("fresh"))
-			awaitBinary(t, reg, "fresh")
+			if mode == "shutdown" {
+				// The source reservation is reusable, but shutdown permanently
+				// closes registry admission for this process lifetime.
+				if readClose(t, fresh) != 1001 {
+					t.Fatal("want shutdown rejection")
+				}
+				if _, held := reg.BinaryFor("fresh"); held {
+					t.Fatal("draining registry admitted fresh binary")
+				}
+			} else {
+				awaitBinary(t, reg, "fresh")
+			}
 			fresh.CloseNow()
 			if !pollUntil(time.Now().Add(3*time.Second), func() bool { return sourceEntries(c) == 0 }) {
 				t.Fatal("reconnect retained source")

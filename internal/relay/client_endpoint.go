@@ -71,6 +71,10 @@ func ClientHandler(reg *Registry, logger *slog.Logger, maxFrameBytes int64, maxP
 		phone := newPhoneOutbox(wsconn, serverID, phoneOutboxBudget, reg.onBinaryForwarded, logger)
 
 		if err := reg.RegisterPhoneCapped(serverID, phone, maxPhones); err != nil {
+			if errors.Is(err, ErrRegistryDraining) {
+				wsconn.CloseWithCode(websocket.StatusGoingAway, "shutting down")
+				return
+			}
 			if errors.Is(err, ErrNoServer) {
 				// Stillborn WSConn — close directly on the underlying
 				// *websocket.Conn so the 4404 application code reaches the
