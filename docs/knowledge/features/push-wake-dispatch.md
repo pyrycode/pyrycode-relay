@@ -86,7 +86,7 @@ comment:
 | Constant | Value | Scope | What it bounds |
 |---|---|---|---|
 | `pushWakeRefillEvery` / `pushWakeBurst` | 10s / 6 | per server-id (`IPRateLimiter` keyed on server-id, not IP) | How fast one binary can push wakes at Google. Wakes are human-paced (a finished turn, a waiting permission prompt) for a handful of paired devices — a burst of 6 covers both events for three devices back to back; sustained one-per-10s is far above that. |
-| `pushWakeMaxInFlight` | 32 | relay-wide (buffered `chan struct{}`) | Concurrent goroutines and outbound sockets across *every* binary, regardless of how many server-ids they claim. Each send holds a goroutine for at most two `fcmSendTimeout`-bounded HTTP calls (token fetch + FCM POST). |
+| `pushWakeMaxInFlight` | 32 | relay-wide (buffered `chan struct{}`) | Concurrent sends and outbound sockets across *every* binary, regardless of how many server-ids they claim. Each send has one `fcmSendTimeout` (10s) budget from call entry through token waiting, authentication and the FCM POST, with an earlier caller deadline taking precedence; the last token waiter also joins cancelled refresh cleanup. |
 | `pushWakeEvictionInterval` | 5 minutes | the per-server-id limiter | Same bounded-memory idle-bucket sweep as the upgrade-path `IPRateLimiter` — keeps memory bounded as server-ids come and go. |
 
 The per-server-id rate reuses [`IPRateLimiter`](rate-limit-middleware.md)
@@ -146,9 +146,12 @@ incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
   `Send` returns. `classifyPushWake(err)` maps the result by error identity,
   never by matching text: `nil` → `sent` (with or without a message id in
   the reply); `errors.Is(err, ErrFCMUnregistered)` → `unregistered`;
-  `errors.Is(err, ErrFCMTokenFetch)` → `token_fetch_failed`; anything else
-  (another FCM error, a transport failure, or cancellation by `Close`) →
-  `send_failed`.
+  `errors.Is(err, ErrFCMTokenFetch)` → `token_fetch_failed`, including
+  cancellation or expiry while waiting for authentication; anything else
+  (another FCM error, a transport failure, or cancellation at send entry,
+  after token lookup or during FCM delivery) → `send_failed`. Cancellation
+  by `Close` follows the phase where it is observed, rather than always
+  counting as `send_failed`.
 
 [`ErrFCMUnregistered`](fcm-push-sender.md) is the sentinel `FCMSender.Send`
 now also wraps, alongside the existing `ErrFCMSend`, when FCM's reply's
@@ -169,8 +172,12 @@ zero.
 
 - One goroutine per admitted wake, capped at `pushWakeMaxInFlight` by the
   buffered `slots` channel. Each goroutine exits when `Send` returns —
-  bounded by `fcmSendTimeout` per HTTP call in production, and by `w.ctx`
-  cancellation on `Close`. It logs its one outcome line before `wg.Done`
+  using one whole-send `fcmSendTimeout` budget in production, and honouring
+  `w.ctx` cancellation on `Close`. Token waiting consumes delivery time;
+  authentication does not grant the FCM POST a fresh budget. Shared refresh
+  work runs separately, with cancellation owned by its active waiters (see
+  [FCM sender concurrency](fcm-push-sender.md#concurrency)). Each send logs
+  its one outcome line before `wg.Done`
   (deferred first, so it runs last) — `Close` returning therefore means
   every admitted wake's outcome line has already been written (#160).
 - `w.mu` makes admission (the `closed` check, `limiter.Allow`, the slot
@@ -180,9 +187,21 @@ zero.
   blocking `Send` call.
 - `Close` is idempotent: set `closed` under `w.mu`, cancel `w.ctx`,
   `wg.Wait()` for every in-flight send to return, then `limiter.Close()`.
+  With `FCMSender`, the last waiter cancels and joins unfinished token
+  refresh work before its send returns, so the wait group joins cancellable
+  authentication as well as FCM delivery.
   Hijacked WebSocket connections outlive `http.Server.Shutdown`, so a
   forwarder can still call `Request` after `Close` — it gets `ErrPushOff`
   rather than a panic or a send racing shutdown.
+
+`TestPushWaker_CloseCancelsAuthentication` uses a real sender and six admitted
+wakes sharing a held-open local authentication request. Its two-second
+push-cleanup budget starts at entry to `Close`: it checks joined refresh
+completion, endpoint cancellation, six outcome lines, no further
+authentication/FCM requests and `ErrPushOff` after close. This is a regression
+test budget, not a total process-shutdown deadline. `runServers` separately
+allows `drainDeadline` (10s) for HTTP/WebSocket draining; the deferred waker
+close runs after that drain.
 
 ## Wiring (`main.go`)
 
@@ -257,8 +276,8 @@ another FCM error, a failed token fetch); a fake sender covers
 cancellation-by-`Close` (→ `send_failed`), rate-limit and in-flight-cap
 drops, and that a malformed object or a push-off `Request` counts nothing.
 **A real-`FCMSender` case cannot scrape right after `PushWaker.Close`**:
-`Close` cancels the in-flight send, so every case would classify as
-`send_failed` regardless of what FCM actually returned — a version of the
+`Close` cancels the in-flight send, potentially recording `token_fetch_failed`
+or `send_failed` instead of the intended endpoint outcome — a version of the
 test that scraped only after `Close` would have passed while classifying
 nothing correctly. It instead polls for the send's one outcome log line
 (recorded before the line is logged, so the poll and the counter agree) and

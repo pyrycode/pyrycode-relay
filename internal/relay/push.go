@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/jwt"
 )
 
@@ -34,8 +33,8 @@ const (
 	// fcmDefaultTokenURL is used when the key carries no token_uri, matching
 	// golang.org/x/oauth2/google's JWTTokenURL.
 	fcmDefaultTokenURL = "https://oauth2.googleapis.com/token"
-	// fcmSendTimeout bounds each HTTP call a send makes: the access-token
-	// fetch and the FCM POST.
+	// fcmSendTimeout bounds the whole send, including token waiting,
+	// authentication and the FCM POST.
 	fcmSendTimeout = 10 * time.Second
 	// fcmMaxDrainBytes caps how much of an FCM reply is read before close.
 	fcmMaxDrainBytes = 4 << 10
@@ -71,7 +70,7 @@ func (e fcmUnregisteredError) Unwrap() []error { return []error{e.err, ErrFCMUnr
 // Android app. It holds no logger and is safe for concurrent use.
 type FCMSender struct {
 	client  *http.Client
-	tokens  oauth2.TokenSource
+	tokens  *fcmTokenCache
 	sendURL string
 }
 
@@ -94,12 +93,9 @@ func newFCMSender(credentialsJSON []byte, baseURL string) (*FCMSender, error) {
 			return http.ErrUseLastResponse
 		},
 	}
-	// jwt.Config.TokenSource caches the token until shortly before expiry
-	// and fetches it with the client stored under oauth2.HTTPClient.
-	tokenCtx := context.WithValue(context.Background(), oauth2.HTTPClient, client)
 	return &FCMSender{
 		client:  client,
-		tokens:  cfg.TokenSource(tokenCtx),
+		tokens:  &fcmTokenCache{cfg: cfg, client: client},
 		sendURL: baseURL + "/v1/projects/" + fcmProjectID + "/messages:send",
 	}, nil
 }
@@ -170,15 +166,17 @@ type fcmAndroid struct {
 // token, the access token, the credentials or reply text beyond the
 // validated name and FCM's enum reason codes.
 func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error) {
-	tok, err := s.tokens.Token()
+	ctx, cancel := context.WithTimeout(ctx, fcmSendTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrFCMSend, err)
+	}
+	tok, err := s.tokens.token(ctx)
 	if err != nil {
-		// oauth2.RetrieveError formats the token endpoint's body into its
-		// Error(); keep only the status.
-		var rErr *oauth2.RetrieveError
-		if errors.As(err, &rErr) && rErr.Response != nil {
-			return "", fmt.Errorf("%w: status %d", ErrFCMTokenFetch, rErr.Response.StatusCode)
-		}
-		return "", ErrFCMTokenFetch
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrFCMSend, err)
 	}
 
 	body, err := json.Marshal(fcmSendRequest{Message: fcmMessage{
@@ -189,8 +187,6 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error
 		return "", fmt.Errorf("%w: encoding request: %w", ErrFCMSend, err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, fcmSendTimeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.sendURL, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("%w: building request: %w", ErrFCMSend, err)

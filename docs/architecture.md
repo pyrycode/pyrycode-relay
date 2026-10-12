@@ -65,8 +65,9 @@ for sizing, configuration and source-trust limits.
 Unlike everything else in [*What this binary does*](#what-this-binary-does),
 this one path makes outbound calls instead of only routing inbound ones. When
 a binary sends a `push_wake` routing envelope (`{"push_wake":{"platform":"fcm","token":"…"}}`,
-no `conn_id`), the relay makes two outbound HTTPS calls to Google: an OAuth
-token request to `https://oauth2.googleapis.com/token` (cached across sends;
+no `conn_id`), the relay uses two outbound HTTPS endpoints at Google: an OAuth
+token request to `https://oauth2.googleapis.com/token` when its cached token
+is no longer valid (or the key's `token_uri` when supplied;
 see [FCM push sender](knowledge/features/fcm-push-sender.md)), and an FCM
 send to `https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send`.
 The wake carries no payload — no `notification`, no `data` field — so a
@@ -76,6 +77,14 @@ for the dispatch path (async off the binary read loop, per-server-id rate
 limit, relay-wide in-flight cap) and
 [`docs/threat-model.md` § Outbound network calls](threat-model.md#outbound-network-calls--fcm-push-wake)
 for the abuse accounting.
+
+Each send uses one 10s deadline from entry through token waiting,
+authentication and delivery, respecting earlier caller deadlines. Concurrent
+token waiters share a refresh's success or sanitised failure. The last
+departing waiter cancels and joins unfinished authentication, so
+`PushWaker.Close` waits for refresh cleanup through its send wait group.
+Push cleanup runs after `runServers`' separate 10s HTTP/WebSocket drain;
+see [push concurrency](knowledge/features/push-wake-dispatch.md#concurrency-model).
 
 ## Single-instance constraint (v1)
 

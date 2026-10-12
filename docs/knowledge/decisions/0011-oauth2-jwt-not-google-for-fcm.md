@@ -38,10 +38,11 @@ of calling `google.JWTConfigFromJSON`.
   `go.mod` (because `google` imports it, for GCE-metadata-server credential
   discovery — irrelevant off-GCE) but is never compiled into the relay
   binary, because nothing on this path imports `google`.
-- **No functionality lost.** Token caching and `token_uri` handling come from
-  `jwt.Config.TokenSource` (wrapped in `oauth2.ReuseTokenSource`, caching
-  until `Expiry - 10s`), not from `google`. The ticket's caching and
-  `token_uri` requirements are satisfied identically either way.
+- **No functionality lost.** `jwt.Config.TokenSource` supports token caching
+  and `token_uri` without `google`. Since #169, the relay's `fcmTokenCache`
+  owns caching with `oauth2.Token.Valid`'s pre-expiry margin and creates a JWT
+  source per refresh, sharing failures and managing cancellation as well as
+  success. See [sender concurrency](../features/fcm-push-sender.md#concurrency).
 - **Full control of the credential-error text.** AC 4 requires that a
   malformed service-account key fail with fixed, value-free error text (both
   from `NewFCMSender` and from the `envContracts` validator). Doing the
