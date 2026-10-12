@@ -55,16 +55,26 @@ with no `notification` and no `data` field — the app's
 session reaches Google. `fcmProjectID` (`pyrycode-mobile`) is a named
 constant.
 
-The OAuth access token comes from `jwt.Config.TokenSource`, wrapped by
-`golang.org/x/oauth2` in `oauth2.ReuseTokenSource`: fetched once and cached
-until shortly before expiry, so two sends in a row make one token request.
+The OAuth access token comes from `jwt.Config.TokenSource`, created per
+refresh attempt. The sender's `fcmTokenCache` (`push_refresh.go`) caches a
+successful token in memory while `oauth2.Token.Valid()` accepts it, including
+the library's pre-expiry margin; the next send refreshes an invalid token.
+Concurrent sends waiting on one attempt share its token or sanitised failure.
+A failed attempt sends nothing to FCM and its waiters do not retry in turn;
+a later send can start a new attempt.
 The token fetch uses the key's own `token_uri` when present, else
 `fcmDefaultTokenURL` (`https://oauth2.googleapis.com/token`, matching
 `google.JWTTokenURL`).
 
-Both HTTP calls (the token fetch and the FCM POST) are bounded by the shared
-`http.Client{Timeout: fcmSendTimeout}` (10s); the FCM POST additionally
-honours the caller's `ctx` via `context.WithTimeout`. The client refuses
+`Send` starts one `context.WithTimeout(ctx, fcmSendTimeout)` budget (10s) at
+call entry, respecting an earlier caller deadline. Token waiting,
+authentication and the FCM POST consume that same budget: time spent
+obtaining a token leaves less time for delivery. An already-cancelled caller
+starts neither authentication nor delivery, even with a cached token, and
+`Send` rechecks cancellation after token lookup. Each refresh has its own
+10s context so one caller's deadline cannot cancel work another waiter needs
+(see [Concurrency](#concurrency)). The HTTP client retains its 10s timeout
+as well. The client refuses
 redirects (`CheckRedirect` → `http.ErrUseLastResponse`) so a 3xx becomes a
 non-2xx error instead of replaying the bearer token and device token to a
 second URL. An FCM reply is read into memory up to `fcmMaxDrainBytes` (4 KiB,
@@ -78,13 +88,20 @@ reason on a non-2xx reply, or for the message id on a 2xx (both below).
 | Bad credentials (env check or `NewFCMSender`) | `ErrFCMCredentials` | nothing from the value |
 | Token endpoint non-2xx | `ErrFCMTokenFetch: status N` | HTTP status only |
 | Token transport/decode failure | `ErrFCMTokenFetch` | nothing |
-| FCM transport failure / cancelled ctx | `ErrFCMSend: <url.Error>` | the constant send URL + net error — the device token is in the body, never the URL |
+| Cancellation/deadline while waiting for a token | `ErrFCMTokenFetch` wrapping `context.Canceled` or `context.DeadlineExceeded` | safe context sentinel only |
+| Caller already done at entry, or cancellation detected after token lookup | `ErrFCMSend` wrapping the context error | safe context sentinel only; no FCM request |
+| FCM transport failure / cancellation during delivery | `ErrFCMSend: <url.Error>` | the constant send URL + net error — the device token is in the body, never the URL |
 | FCM non-2xx (incl. 3xx, since redirects are refused) | `ErrFCMSend: status N (REASON[, CODE])`, also matching `ErrFCMUnregistered` when `errorCode` is `UNREGISTERED` | HTTP status plus FCM's enum-shaped `error.status` and/or FcmError `errorCode`, when present — see below; exactly `status N` otherwise |
 | FCM 2xx | `nil`, plus the message id (below) or `""` | nothing beyond the validated id |
 
 `oauth2.RetrieveError` formats the token endpoint's response body into its
-`Error()` string, so `Send` never returns or wraps it as-is — it extracts
-only `Response.StatusCode`. The sender holds no logger, so it logs nothing;
+`Error()` string, so `fcmTokenCache.fetch` never publishes or wraps it as-is
+— it extracts only `Response.StatusCode`. Other token-fetch errors, which
+can include a credential-bearing URL, become the bare `ErrFCMTokenFetch`.
+Sanitisation happens once before the attempt's result is shared with its
+waiters. Cancellation classification follows the phase, including shutdown:
+token waiting is `ErrFCMTokenFetch`; entry and delivery are `ErrFCMSend`.
+The sender holds no logger, so it logs nothing;
 logging happens in the caller (below, and [Push wake dispatch](push-wake-dispatch.md)
 § Error handling).
 
@@ -147,10 +164,48 @@ admitted wake).
 
 ## Concurrency
 
-No goroutines. `Send` is safe for concurrent use — `ReuseTokenSource`
-serialises refreshes under its own mutex, held for at most
-`fcmSendTimeout`; `*http.Client` is concurrency-safe. No shutdown hook is
-needed.
+`Send` is safe for concurrent use. `fcmTokenCache` protects the cached token,
+current attempt and waiter counts with one mutex, never held across HTTP I/O
+or channel waits. One goroutine fetches each refresh and publishes an
+immutable token/error result before closing its `done` channel. The JWT
+source's reuse mutex alone would share success but make failed waiters fetch
+again serially; the relay cache shares the failed attempt too.
+
+An attempt owns an independent context capped at `fcmSendTimeout`, rather
+than the starter's context. Cancelling or timing out any one send, including
+the starter, returns promptly while other waiters keep authentication alive.
+When the last waiter leaves an unfinished attempt, it detaches the attempt,
+cancels it and waits for `done` before returning from `Send`. This keeps
+authentication cleanup inside the send lifetime, so
+[`PushWaker.Close`](push-wake-dispatch.md#concurrency-model) joins it through
+its existing send wait group; the sender needs no separate public close API.
+
+A new send can start a replacement after detachment. Completion only updates
+the cache or clears the current attempt when that attempt's pointer still
+matches, preventing abandoned work from overwriting a newer token or losing
+the replacement. Old waiters retain their own attempt's result even if a
+later send starts another attempt.
+
+The pinned JWT source uses its context to select the HTTP client, but calls
+`http.Client.PostForm` without attaching that context to the request.
+`fcmRefreshTransport` therefore clones each authentication request with the
+refresh context before delegating to the original/default transport. A
+cancellable token-source context alone would leave network work running
+after send cancellation. The copied client preserves redirect refusal and
+the HTTP timeout; refresh completion, its deadline or last-waiter cancellation
+ends the refresh work.
+
+## Testing
+
+`push_refresh_test.go` uses controlled local OAuth and FCM endpoints to cover
+shared success/failure, a later retry, repeated cache expiry, independent
+starter/other-waiter cancellation and expiry, all-waiter cleanup and reuse,
+whole-send and earlier caller deadlines, and pre-cancelled callers with cold
+and warm caches. Shared-attempt tests inspect the waiter count under the
+cache mutex before releasing or cancelling authentication; starting six send
+goroutines alone does not prove they joined the same attempt. Cleanup checks
+assert both endpoint cancellation and attempt completion, since prompt send
+returns alone could hide authentication left running.
 
 ## Dependency
 
