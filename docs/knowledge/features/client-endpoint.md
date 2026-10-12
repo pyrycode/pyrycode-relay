@@ -38,7 +38,8 @@ The relay does not validate the token — the binary does. The token is read int
 
 | Code | Meaning |
 |---|---|
-| `1000` (`StatusNormalClosure`) | clean close on shutdown / unregister / binary-grace expiry. |
+| `1000` (`StatusNormalClosure`) | ordinary cleanup on unregister / binary-grace expiry. |
+| `1001` (`StatusGoingAway`) | shutdown fan-out for admitted phones, or handler-owned close when registry admission returns `ErrRegistryDraining`. Reason: `"shutting down"`. |
 | `4404` | no binary currently holds the requested `serverID`. Reason: `"no server with that id"`. |
 | `4429` | per-server-id phone cap reached (#30). Reason: `"too many phones for server-id"`. |
 
@@ -112,12 +113,13 @@ The literal `16` lives at the wiring site, mirroring `30*time.Second` on the `Se
 3. `websocket.Accept` with `OriginPatterns: []string{"*"}`. On error, the library has already written a 4xx; return silently.
 4. Construct `connID = "client-" + serverID + "-" + randHex8()` (8 hex chars from `crypto/rand`).
 5. Wrap with `NewWSConn(c, connID)`.
-6. `reg.RegisterPhoneCapped(serverID, wsconn, maxPhones)`:
+6. Wrap `wsconn` in a `phoneOutbox`, then call `reg.RegisterPhoneCapped(serverID, phone, maxPhones)`:
+   - On `ErrRegistryDraining` → `wsconn.CloseWithCode(StatusGoingAway, "shutting down")`, return before starting the outbox writer, heartbeat, forwarder or success cleanup.
    - On `ErrNoServer` → close the underlying `*websocket.Conn` with code `4404` and reason `"no server with that id"`, log `phone_register_no_server`, return.
    - On `ErrPhonesAtCap` → close the underlying `*websocket.Conn` with code `4429` and reason `"too many phones for server-id"`, log `phone_register_at_cap`, return.
    - On any other error → `wsconn.Close()`, return (defensive; not currently reachable).
 
-   Branch order is `ErrNoServer` first, then `ErrPhonesAtCap` — mirrors the registry's internal check order so an empty slot yields `4404`, not `4429`, even when the cap would otherwise apply.
+   Branch order is `ErrRegistryDraining`, `ErrNoServer`, then `ErrPhonesAtCap`. A late upgraded phone receives 1001 even if its binary is missing or its phone slice is full.
 7. Log `phone_registered`.
 8. Snapshot `bin, _ := reg.BinaryFor(serverID)` — the only binary that may later hear about this phone's close (#152).
 9. `defer { reg.UnregisterPhone(serverID, connID); wsconn.Close(); log phone_unregistered }`. Registered **after** the successful `RegisterPhone` so a no-server path never tries to unregister a slot we never owned.
@@ -162,6 +164,16 @@ Header gate failures (`400`) are not logged — same hygiene rationale as `/v1/s
 | `defer` (unregister/close/log) | request goroutine | `wsconn.closeOnce` | runs only on the success path; idempotent |
 
 The handler takes no lock of its own. `WSConn.Close`'s `closeOnce` is a `sync.Once`, not a held lock. `UnregisterPhone` is a no-op on unknown `(serverID, connID)`. **No lock-order risk; no goroutine-leak path.** The close-notice send reuses `reg.BinaryFor` and `Conn.Send`'s existing concurrency guarantees — no new lock, no new goroutine (#152).
+
+Upgrade success precedes registry admission. If
+[shutdown's admission boundary](graceful-shutdown.md#concurrency-model) wins
+the registry mutex first, the handler closes its own upgraded socket with
+1001 outside the lock, without installing the phone or starting success-path
+goroutines and cleanup. This close is library-bounded and outside shutdown's
+wait group; a handler paused beyond shutdown completion takes the same path
+after resuming. Admitted phones close through the concurrent drain fan-out.
+With a reader active, native ping/pong confirms that this endpoint has reached
+its post-admission read loop; a successful dial alone does not.
 
 ### Phone close on binary-grace expiry
 
@@ -219,6 +231,12 @@ The phone observes the close on its socket as `StatusNormalClosure` — by delib
 Verdict from the security review: **PASS**. Reuses `/v1/server`'s audited shape (validate-pre-upgrade, defer-after-success, application-close-codes-on-underlying-conn), narrows the token's lifetime to a single presence-check, excludes the token from every log path by explicit field-set enumeration. The phone/binary lifecycle interactions with #20's grace machinery are walked end-to-end and idempotent on every path.
 
 ## Testing
+
+`TestShutdown_LateUpgradeGoingAway` in `shutdown_admission_test.go` pauses
+the successful upgrade before phone admission, completes shutdown, then
+resumes the handler. Normal, missing-server and at-cap states must all receive
+wire 1001 without installing a phone or changing registry identities;
+see [shutdown testing](graceful-shutdown.md#testing).
 
 `internal/relay/client_endpoint_test.go`, `package relay`. Same harness as `server_endpoint_test.go`: `httptest.NewServer(ClientHandler(reg, logger, 0))` with `websocket.Dial` clients, `slog.NewTextHandler(io.Discard, nil)` for logs. Tests that do not exercise the cap pass `0` (the no-cap contract); the cap-integration test uses a dedicated `startClientWithCap(t, maxPhones)` helper.
 

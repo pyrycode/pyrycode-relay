@@ -60,6 +60,14 @@ capacity before reaching the source gate; many sources can fill the global
 upgraded pool. See [connection caps](knowledge/features/connection-cap.md)
 for sizing, configuration and source-trust limits.
 
+Shutdown establishes a permanent registry admission boundary before launching
+HTTP shutdown: one mutex operation stops claims, reclaims, takeovers and phone
+registration and snapshots admitted handles for concurrent 1001 closes.
+Already-upgraded handlers arriving after that boundary close themselves with
+1001 without registering. HTTP shutdown cannot drain hijacked WebSockets;
+the relay's drain stays context-bounded and does not join handler goroutines.
+See [graceful shutdown](knowledge/features/graceful-shutdown.md).
+
 ## Outbound calls to Google (FCM push wake)
 
 Unlike everything else in [*What this binary does*](#what-this-binary-does),

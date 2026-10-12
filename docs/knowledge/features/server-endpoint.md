@@ -30,7 +30,8 @@ User-Agent: <binary UA>
 
 | Code | Meaning |
 |---|---|
-| `1000` (`StatusNormalClosure`) | clean close on shutdown / release. |
+| `1000` (`StatusNormalClosure`) | ordinary handler cleanup via `WSConn.Close()`. |
+| `1001` (`StatusGoingAway`) | shutdown fan-out for admitted connections, or handler-owned close when registry admission returns `ErrRegistryDraining`. Reason: `"shutting down"`. |
 | `4409` | `serverID` already claimed by another binary **and the incumbent answered the conflict liveness probe** (#112). Reason: `"server-id already claimed"`. |
 | `1011` (`StatusInternalError`) | sent to an incumbent that did **not** answer the probe and was taken over (#112). Reason: `"heartbeat timeout"` — the same code and reason the heartbeat itself would eventually send; the probe just gets there sooner. |
 
@@ -59,9 +60,10 @@ The `30*time.Second` literal lives at the wiring site, not as a package-level co
 3. Construct `connID = "server-" + serverID + "-" + randHex8()` (8 hex chars from `crypto/rand`).
 4. Wrap with `NewWSConn(c, connID)`.
 5. `reg.ClaimServer(serverID, wsconn)`:
+   - On `ErrRegistryDraining` from the claim or takeover → `wsconn.CloseWithCode(StatusGoingAway, "shutting down")`, return without success cleanup, heartbeat or forwarder startup. Draining takes precedence over conflicts and grace reclaim.
    - On `ErrServerIDConflict` → call `takeoverUnresponsive(r.Context(), reg, serverID, wsconn, conflictProbeTimeout)` (#112), which pings the incumbent (`BinaryFor` + the conn's `Ping`, outside any registry lock):
      - Incumbent answers, or isn't pingable (test fakes only) → `ErrServerIDConflict` again: close the underlying `*websocket.Conn` with code `4409`, log `server_id_conflict`, return. Unchanged from before #112.
-     - Incumbent doesn't answer within `conflictProbeTimeout`, and the request context is still live → `reg.TakeoverServer(serverID, incumbent, wsconn)` hands the slot to the new claim with grace-reclaim semantics (incumbent's phones evicted with `4404`), then `go closeWithCode(incumbent, 1011, "heartbeat timeout")` in the background (a close handshake with a dead peer blocks, so it must not hold up the new claim). Log `server_id_takeover`, fall through to the accept path below.
+     - Incumbent doesn't answer within `conflictProbeTimeout`, and the request context is still live → call `reg.TakeoverServer(serverID, incumbent, wsconn)`. Only on success does it hand over the slot with grace-reclaim semantics (phones evicted with `4404`); then close the incumbent with `1011 "heartbeat timeout"` in a background goroutine and log `server_id_takeover`. A failed probe begun before draining cannot install a replacement after the boundary; `ErrRegistryDraining` takes the 1001 path above.
      - The probe is cut short by the request context ending (server shutdown) → propagate that error; `wsconn.Close()`, return without logging, same as any other shutdown-time teardown.
    - On any other error → `wsconn.Close()`, return (defensive).
 6. Log `server_claimed`.
@@ -98,7 +100,20 @@ The conflict and takeover paths **deliberately omit** `binary_version`: an unaut
 | `defer cancelHB` | request goroutine | none | LIFO: runs before the release defer |
 | `defer` (schedule-release/close/log) | request goroutine | `wsconn.closeOnce` | runs only on the success path; idempotent |
 
-Shutdown: `http.Server` cancels `r.Context()` → forwarder's `Read` returns ctx error → forwarder returns → `cancelHB` fires (heartbeat goroutine observes `ctx.Done()` and exits without touching the conn) → release defer runs → slot scheduled for release. The grace timer is owned by `time.AfterFunc` inside the registry; the handler does not block on, observe, or reason about it. Process exit drops pending timers (the registry has no on-disk state); a binary mid-grace at shutdown loses its slot the moment the new process starts — same shape as a binary mid-claim at shutdown.
+Shutdown first closes registry admission and snapshots handles under the
+registry mutex, then closes admitted WebSockets concurrently with 1001.
+Their reads unblock, heartbeat cancellation runs and the identity-scoped
+release defer unwinds. HTTP shutdown does not wait for hijacked WebSockets.
+An already-upgraded handler reaching claim or takeover after the boundary
+closes its own socket with 1001 outside the registry lock and shutdown wait
+group, even if shutdown has already returned. This preserves the bounded,
+best-effort drain without joining paused handlers; see
+[graceful shutdown](graceful-shutdown.md#concurrency-model).
+
+Dial success proves upgrade only. With a reader active, a native ping/pong
+round trip proves this endpoint reached its post-admission forwarder read
+loop, without an application acknowledgement. Process exit drops pending
+grace timers and registry state.
 
 ## Design notes
 
@@ -139,7 +154,7 @@ The handler is internet-exposed and unauthenticated. Threats considered:
 - **`POST /v1/server` to confuse the upgrade.** `websocket.Accept` rejects non-GET with a library 4xx. Registry untouched. Tested.
 - **Conn-id collision.** Birthday bound is fine at v1 scale. Widen the suffix if scale ever demands; public API doesn't change.
 - **`crypto/rand` failure.** Panic terminates the connection; the http server recovers; other connections continue. A failing host at this depth is operator-visible; refusing to serve is correct (loud failure over silent correction).
-- **Goroutine leak on shutdown.** `r.Context()` cancellation propagates through the forwarder's `Read`; loop returns; `cancelHB` fires; release defer runs; no leak.
+- **Shutdown admission race.** Upgrade precedes registry admission. The registry drain guard rejects late claims, grace reclaims and takeovers; the handler owns their bounded 1001 close. Admitted sockets close through the concurrent shutdown fan-out; the forwarder returns and existing defers cancel the heartbeat and schedule identity-scoped release.
 
 Verdicts from #16's, #21's, and #112's security reviews: **PASS**. No new defences invented; no new threats opened. #21 inherits #20's well-tested registry-side semantics for grace; the residual `grace × accept-rate` map-size scaling is named here and tracked to the per-IP/total-cap tickets that own it. #112's review recorded one residual risk out of scope for that ticket: a *live* incumbent could miss the conflict probe if its forwarder was stalled delivering to a slow phone (pong handling shares the same read pump), so a genuine duplicate binary claim could displace it — tracked as issue #140. Since [#113](phone-outbox.md), that residual no longer holds: delivery to a phone goes through its own bounded queue, so the forwarder's read pump — and the incumbent's pong handling with it — never waits on a phone write. See [`docs/threat-model.md`](../../threat-model.md) § DoS resistance.
 
@@ -151,6 +166,7 @@ The shared `startServer(t, grace)` helper threads the grace duration through. Te
 
 Tests (1:1 with AC bullets):
 
+- `TestShutdown_LateUpgradeGoingAway` and `TestShutdown_ConflictProbeDuringDrain` in `shutdown_admission_test.go` pause after upgrade or during an incumbent probe, complete shutdown, then resume. The late binary must receive wire 1001 without a claim, reclaim or takeover; see [shutdown testing](graceful-shutdown.md#testing).
 - `TestServerEndpoint_ValidUpgrade_RegistersBinary` — valid headers; assert dial succeeds, `reg.BinaryFor(...)` returns a non-nil `Conn` whose `ConnID()` is `"server-<id>-<8 hex>"`.
 - `TestServerEndpoint_HeaderGate_400` — table-driven over the three required headers (each row deletes or empties one); plain `http.Client.Do` with standard upgrade headers; expect `400`; `reg.Counts() == (0, 0)`.
 - `TestServerEndpoint_DuplicateClaim_4409` — first dial succeeds and calls `CloseRead` so it answers the conflict probe (#112: a client that never reads is unresponsive by the ticket's own definition); second dial with same headers; one `Read` on the second conn returns a `*websocket.CloseError` with `Code == 4409` and `Reason == "server-id already claimed"` (asserted via `errors.As`). First conn stays registered, and a phone registered against it stays open — a refused duplicate claim must not touch the incumbent's phones.

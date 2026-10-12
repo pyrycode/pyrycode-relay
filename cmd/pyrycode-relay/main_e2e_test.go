@@ -57,13 +57,25 @@ func TestRun_SigtermClosesWSConnsWithGoingAway(t *testing.T) {
 	}
 	defer c.Close(websocket.StatusInternalError, "")
 
-	// Trigger shutdown.
-	cancel()
-
-	// Next Read must surface a close error with StatusGoingAway.
+	// A pong proves the handler has reached its read loop after ClaimServer.
+	// Dial success alone only proves the HTTP upgrade completed. Keep a reader
+	// active to process the pong, then reuse its existing three-second deadline
+	// to observe the shutdown close without another application handshake.
 	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer readCancel()
-	if _, _, err := c.Read(readCtx); err == nil {
+	readErr := make(chan error, 1)
+	go func() {
+		_, _, err := c.Read(readCtx)
+		readErr <- err
+	}()
+	if err := c.Ping(readCtx); err != nil {
+		t.Fatalf("admission ping: %v", err)
+	}
+
+	// Trigger shutdown after observable admission.
+	cancel()
+
+	if err := <-readErr; err == nil {
 		t.Fatal("Read: got nil error after shutdown, want close error")
 	} else if code := websocket.CloseStatus(err); code != websocket.StatusGoingAway {
 		t.Errorf("close status: got %d, want %d (StatusGoingAway); err=%v",

@@ -101,6 +101,10 @@ func serverHandler(reg *Registry, logger *slog.Logger, grace, probeTimeout time.
 			}
 		}
 		if err != nil {
+			if errors.Is(err, ErrRegistryDraining) {
+				wsconn.CloseWithCode(websocket.StatusGoingAway, "shutting down")
+				return
+			}
 			if errors.Is(err, ErrServerIDConflict) {
 				// Close directly on the underlying *websocket.Conn so we
 				// can send the 4409 close code; WSConn.Close always emits
@@ -115,7 +119,7 @@ func serverHandler(reg *Registry, logger *slog.Logger, grace, probeTimeout time.
 					"remote", remoteHost(r))
 				return
 			}
-			// The only other error is the request context ending during
+			// Any remaining error is the request context ending during
 			// the probe (server shutdown); close without logging, as for
 			// any other shutdown-time teardown.
 			wsconn.Close()
