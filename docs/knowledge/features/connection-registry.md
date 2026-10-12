@@ -20,7 +20,7 @@ type Conn interface {
     Close()                 // idempotent; never called under the registry lock
 }
 
-type Registry struct { /* sync.RWMutex + binaries map + phones map */ }
+type Registry struct { /* sync.RWMutex + binaries/phones/timers maps + draining flag */ }
 
 func NewRegistry() *Registry
 
@@ -35,6 +35,7 @@ func (r *Registry) UnregisterPhone(serverID string, connID string)
 func (r *Registry) BinaryFor(serverID string) (Conn, bool)
 func (r *Registry) PhoneFor(serverID, connID string) (Conn, bool)
 func (r *Registry) PhonesFor(serverID string) []Conn
+func (r *Registry) Snapshot() []Conn
 func (r *Registry) Counts() (binaries, phones int)
 ```
 
@@ -45,16 +46,39 @@ Sentinel errors (branch with `errors.Is`):
 | `ErrServerIDConflict` | `ClaimServer` when slot already held | WS close `4409` |
 | `ErrNoServer` | `RegisterPhone` / `RegisterPhoneCapped` when no binary holds the slot | WS close `4404` |
 | `ErrPhonesAtCap` | `RegisterPhoneCapped` when `len(phones[serverID]) >= max` | WS close `4429` |
+| `ErrRegistryDraining` | `ClaimServer`, `TakeoverServer`, `RegisterPhoneCapped` / `RegisterPhone` after the drain boundary | WS close `1001`, reason `"shutting down"` |
 
 The mapping to close codes is informational; the registry doesn't know about WebSockets — the upgrade handlers translate.
 
-`RegisterPhone(serverID, conn)` is equivalent to `RegisterPhoneCapped(serverID, conn, 0)` — the legacy no-cap entry point, retained for test fixtures and callers that explicitly do not want the cap-aware contract. Production traffic on `/v1/client` uses `RegisterPhoneCapped` with the wiring-site `maxPhones` value (16 today, see [`/v1/client`](client-endpoint.md)). `ErrNoServer` takes precedence over `ErrPhonesAtCap`; the cap check (`max > 0 && len(phones[serverID]) >= max`) and the slice append both run under the same write lock, so two concurrent callers at `max-1` cannot both succeed (race shape mirrors `ClaimServer`'s first-claim-wins).
+`RegisterPhone(serverID, conn)` is equivalent to `RegisterPhoneCapped(serverID, conn, 0)` — the legacy no-cap entry point, retained for test fixtures and callers that explicitly do not want the cap-aware contract. Production traffic on `/v1/client` uses `RegisterPhoneCapped` with the wiring-site `maxPhones` value (16 today, see [`/v1/client`](client-endpoint.md)). `ErrRegistryDraining` takes precedence over `ErrNoServer`, which takes precedence over `ErrPhonesAtCap`; the checks and slice append run under the same write lock, so two concurrent callers at `max-1` cannot both succeed.
+
+## Shutdown admission boundary
+
+[Shutdown](graceful-shutdown.md) calls unexported `beginDrain() []Conn` to
+permanently set `draining` and snapshot all registered binary and phone handles
+under `mu.Lock`. Admission that wins the lock first is included unless
+independently removed; subsequent admission returns `ErrRegistryDraining`.
+`Snapshot()` uses the same snapshot helper under `RLock`, returns a fresh slice
+(nil when empty, unspecified order), and never changes admission state.
+
+The drain check precedes every other admission check and mutation: a fresh
+claim, grace reclaim, identity-scoped takeover and capped or uncapped phone
+registration all fail without changing binary, phone or grace-timer identity.
+A probe started before the boundary cannot install a replacement after it.
+The registry does not close rejected handles; each upgraded endpoint closes
+its own socket with 1001 outside the lock, before success cleanup or read-loop
+startup. Shutdown does not join these handlers.
+
+Draining lasts for the registry's lifetime, even after shutdown returns or
+cleanup empties its maps. Lookups, unregisters, releases and grace expiry
+remain available; freeing a connection-cap reservation does not reopen
+admission. Tests needing a new serving lifetime must construct a new registry.
 
 ## Grace-period reclaim (`ScheduleReleaseServer`, #20)
 
 `ScheduleReleaseServer(serverID, d)` arms a deferred release after duration `d`. The grace window IS the reclaim path — see [ADR-0006](../decisions/0006-grace-period-as-reclaim-path.md) for the rationale.
 
-While the timer is pending:
+While the timer is pending and admission is open:
 
 | Operation | Behaviour during grace window |
 |---|---|
@@ -64,7 +88,7 @@ While the timer is pending:
 | `ScheduleReleaseServer(serverID, d')` | Replaces the pending timer (last call wins). Old timer is `Stop()`'d. |
 | `ReleaseServer(serverID)` | Unchanged — still removes the binary entry immediately. Does not interact with the timer. |
 
-On expiry (no reclaim within `d`): the binary entry is removed, the phones slice for `serverID` is snapshotted and deleted under the lock, then `Close()` is called on every phone *outside* the lock. After expiry, `RegisterPhone` returns `ErrNoServer` and `ClaimServer` succeeds normally.
+On expiry (no reclaim within `d`): the binary entry is removed, the phones slice for `serverID` is snapshotted and deleted under the lock, then `Close()` is called on every phone *outside* the lock. With admission open, `RegisterPhone` then returns `ErrNoServer` and `ClaimServer` succeeds normally. After the drain boundary both continue to return `ErrRegistryDraining`.
 
 `ScheduleReleaseServer` on an unheld server-id is a defensive no-op: it arms a timer that on fire deletes whatever happens to be present (nothing). Same shape as `ReleaseServer("unknown")` returning `false`.
 
@@ -77,6 +101,7 @@ func (r *Registry) TakeoverServer(serverID string, incumbent, conn Conn) error
 ```
 
 - **Identity-scoped.** Under `mu`, if `binaries[serverID]` is held by some conn other than `incumbent`, `TakeoverServer` returns `ErrServerIDConflict` and touches nothing — a concurrent reclaim, or a second prober's takeover, always wins over a stale probe result. `incumbent == nil` means "the slot was empty when the caller looked"; it is refused the same way if anyone has claimed it since.
+- **Drain takes precedence.** `ErrRegistryDraining` is checked before incumbent identity or replacement, even if the slot has since become empty. Neither an in-flight probe nor cleanup can reopen admission.
 - **Same reclaim semantics as `ClaimServer`'s grace branch.** Held by `incumbent` (or empty) → cancel and delete any pending grace timer, install `conn` as the binary, and snapshot-and-delete `phones[serverID]`, closed outside the lock with `reclaimCloseCode`/`reclaimCloseReason` (`4404`), one goroutine per phone — identical to a grace-window reclaim (ADR-0006's 2026-09-15 amendment). Both paths share one implementation, `replaceBinaryLocked`, so there is exactly one reclaim behaviour to reason about.
 - **Does not close `incumbent`.** The registry never invokes `Send`/`Close` on a `Conn` while holding `mu`, and the close code (`1011 "heartbeat timeout"`) is a decision the handler owns, not the registry. The caller closes the incumbent itself, outside the lock, after `TakeoverServer` returns.
 
@@ -98,7 +123,7 @@ The duration `d` is fully trusted — degenerate values (`d <= 0` fires immediat
 
 ## Concurrency model
 
-- **One `sync.RWMutex` covers all three maps** (`binaries`, `phones`, `timers`). Mutating methods take `Lock`; lookups take `RLock`. Sharding is a possible later optimisation but irrelevant at v1 (tens to hundreds of conns, sub-microsecond critical sections, no measured contention).
+- **One `sync.RWMutex` covers all three maps and the permanent `draining` flag.** Mutating methods and `beginDrain` take `Lock`; lookups and `Snapshot` take `RLock`. Admission and the drain snapshot therefore share one atomic boundary, with all socket I/O and closes outside the lock.
 - **Conn callbacks are never invoked under the lock,** with one documented exception: `UnregisterPhone` calls `ConnID()` while holding the write lock to scan for the target. The `Conn` contract requires `ConnID` to be a non-blocking getter.
 - **Broadcast pattern.** A caller wanting to fan out a frame to all phones for a server-id calls `PhonesFor` (returns a freshly allocated copy) and iterates the snapshot calling `Send` per conn — no registry lock held during I/O.
 - **Single-phone lookup.** `PhoneFor(serverID, connID)` (#116) is the zero-allocation counterpart for a caller that only needs one phone by conn-id — the binary forwarder's per-frame resolution, see [Binary-side frame forwarder](binary-forwarder.md). It scans the live `phones[serverID]` slice under `RLock` instead of copying it, returning `(nil, false)` for an unknown server-id or conn_id. The scan (not an index) is deliberate: phones per server-id are capped at 16 (`maxPhones`), so a linear scan is cheap, and a conn_id index would need to stay in sync across the register, unregister, reclaim-eviction and grace-expiry paths for no measured benefit. The returned `Conn` is live past the unlock with the same semantics as an element of a `PhonesFor` snapshot — it may be concurrently unregistered, which callers already tolerate via `Send`/`Enqueue` errors.
@@ -107,6 +132,7 @@ The duration `d` is fully trusted — degenerate values (`d <= 0` fires immediat
 
 ## Invariants the registry enforces
 
+- `beginDrain` permanently rejects every admission route before conflict, grace-reclaim, missing-server or cap checks, leaving identities and timers intact on rejection.
 - `ClaimServer` is atomic check-then-set under the write lock; concurrent claims for the same server-id cannot both succeed.
 - `RegisterPhone` is atomic check-binary-then-append under the write lock; a phone cannot land in the map for a server-id whose binary was released between check and append.
 - `UnregisterPhone` removes by `ConnID` via swap-and-truncate, nils the trailing slot for GC hygiene, and `delete`s the map key when the slice empties — no orphaned empty slices.
@@ -133,6 +159,14 @@ The registry has no networking and no direct exposure to adversarial input. Adve
 - **Slow `ConnID` blocking the write lock** is the cost of the documented non-blocking contract; copying the slice and scanning outside the lock would create a TOCTOU window where a phone could be added between snapshot and removal.
 
 ## Testing
+
+`TestRegistry_DrainRejectsAdmission` in `shutdown_admission_test.go` covers
+repeated post-drain rejection for fresh/conflicting claims, grace reclaim,
+takeover with held/empty/changed incumbent and capped/uncapped phones. It checks
+that rejection installs no late handle, preserves a grace timer's identity,
+and leaves the rejected socket's close to the handler. The same file forces
+late upgrades and an in-flight probe through the boundary with real peers;
+see [shutdown testing](graceful-shutdown.md#testing).
 
 `internal/relay/registry_test.go`, `package relay`. Tests use a minimal `fakeConn` (id, sent buffer, mutex-guarded `closed` flag, optional `closeCh` to signal close synchronously). The mutex was added in #20 because the grace-expiry handler runs `Close()` on a different goroutine from the test, making `closed` cross-goroutine state.
 
@@ -173,6 +207,7 @@ go test -race -count=20 -run TestRegistry_RaceFreedom ./internal/relay
 
 ## Related
 
+- [Graceful shutdown](graceful-shutdown.md) — atomic admission stop, concurrent close fan-out and bounded handler-owned closure of late upgrades.
 - [Connection-count gauges](connection-count-gauges.md) — `pyrycode_relay_connected_binaries` reads `Counts()` directly, so the grace-window exclusion (#115) applies to the gauge with no code of its own.
 - [Binary-side frame forwarder](binary-forwarder.md) — the sole production caller of `PhoneFor`, resolving `env.ConnID` once per forwarded frame (#116).
 - [ADR-0003: Connection registry as a passive store](../decisions/0003-connection-registry-passive-store.md) — single RWMutex, snapshot returns, the orphan-phones invariant.

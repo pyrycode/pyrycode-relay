@@ -2,7 +2,7 @@
 
 On `SIGTERM` or `SIGINT`, the relay drains in-flight WebSocket connections to a clean `1001 StatusGoingAway` close before exiting. Connected phones and binaries observe the close code on the wire and run their existing reconnect path instead of seeing a TCP reset mid-frame.
 
-Best-effort by design: the drain has a bounded deadline (default 10s), and conns still alive at expiry are force-closed. Phones / binaries that have stopped reading from their socket will hit the 5s close-handshake gate (per the underlying `nhooyr.io/websocket` library) — the deadline budgets for one such stuck peer per fan-out goroutine and force-closes the rest.
+Best-effort by design: the drain has a bounded deadline (default 10s). WebSocket closes run concurrently and use the underlying `github.com/coder/websocket` library's close-handshake bounds. At deadline, shutdown force-closes HTTP connections via `http.Server.Close()` and returns; hijacked WebSockets are outside that call's reach, and process exit closes any remaining sockets. Handler goroutines are not joined.
 
 ## Contract
 
@@ -11,9 +11,11 @@ Best-effort by design: the drain has a bounded deadline (default 10s), and conns
   - `0` — drain triggered by a signal (clean operator action). Returned whether `Shutdown` completed cleanly or hit the deadline.
   - `1` — drain triggered by a listener error (`ListenAndServe[TLS]` returned a non-`http.ErrServerClosed` error). Process supervisors should restart.
   - `2` — boot-time configuration refusal (unchanged from before this ticket).
-- **New-connection refusal**: the listener is closed synchronously at the start of the drain (`http.Server.Shutdown(ctx)` shuts down the listener before waiting on handlers). Dials arriving after the drain begins see `ECONNREFUSED`; in-progress upgrades that haven't completed their handshake fail.
-- **Close code on the wire**: every WS conn alive at the moment of drain receives a WebSocket close frame with code 1001 (`StatusGoingAway`) and reason `"shutting down"`. Idempotent: a handler-side `Close` racing the shutdown-side `CloseWithCode` does not double-emit (ADR-0007, `closeOnce`).
-- **Drain deadline**: 10 seconds by default, declared as `const drainDeadline = 10 * time.Second` at the wiring site in `cmd/pyrycode-relay/main.go`. Conns whose close handshake has not completed by the deadline are force-closed via `http.Server.Close()`; their underlying TCP sockets close when the process exits.
+- **Admission boundary**: `Shutdown` first calls `reg.beginDrain()`, which permanently marks the registry draining and snapshots registered handles under the same write lock used for admission. `ClaimServer`, `TakeoverServer` and `RegisterPhoneCapped` then return `ErrRegistryDraining` before conflict, grace-reclaim, missing-server or phone-cap checks; `RegisterPhone` delegates to the guarded method. Rejected admission leaves registry identities and grace timers unchanged.
+- **Late upgrades**: HTTP shutdown runs asynchronously after the boundary and closes listeners, but neither it nor `http.Server.Close()` waits for or closes hijacked WebSockets. An already-upgraded binary or phone reaching admission after the boundary closes itself with `1001 StatusGoingAway`, reason `"shutting down"`, before starting forwarders, heartbeats or success cleanup. A failed conflict probe also reaches the guard through `TakeoverServer`.
+- **Upgrade versus admission**: a successful WebSocket dial proves the HTTP upgrade, not registry admission. On these endpoints a native ping/pong round trip with a reader active proves the handler reached its post-admission read loop. This needs no relay-originated application acknowledgement; registration follows the [Binary → relay contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#binary--relay).
+- **Close code on the wire**: snapshotted connections receive concurrent `CloseWithCode(StatusGoingAway, "shutting down")` calls; late rejected upgrades receive the same call from their own handler. `closeOnce` prevents double emission if another close races it (ADR-0007); only the first close-family call chooses the code.
+- **Drain deadline**: 10 seconds by default, declared as `const drainDeadline = 10 * time.Second` at the wiring site in `cmd/pyrycode-relay/main.go`. Expiry returns `ctx.Err()` after calling `http.Server.Close()` on each server. WebSocket close goroutines and late handlers may outlive that return within the library's close bounds; process exit reaps anything remaining.
 
 ## API
 
@@ -32,6 +34,7 @@ func Shutdown(
 - Returns `ctx.Err()` (`context.DeadlineExceeded`) on deadline expiry; force-closes each `*http.Server` via `srv.Close()` before returning.
 - Errors from `srv.Shutdown` are logged via `logger` but do NOT abort the drain — every server gets a `Shutdown` call, every conn gets a close call. The function's return value reflects only the deadline outcome.
 - Safe to call exactly once per process. Concurrent or repeat invocations are undefined.
+- Registry admission stays closed after return, including deadline expiry. Reusing a released source-cap reservation does not reopen it; a fresh registry is needed for a new serving lifetime.
 
 Package `internal/relay` (`registry.go`):
 
@@ -44,6 +47,11 @@ func (r *Registry) Snapshot() []Conn
 - Order unspecified.
 - Snapshotted under `RLock`; the caller iterates and closes outside the lock — preserves the passive-registry pattern (ADR-0003).
 
+`Snapshot()` remains read-only and does not stop admission. Shutdown uses the
+unexported `beginDrain() []Conn` instead: it sets the permanent `draining` flag
+and calls the shared snapshot helper under `Lock`, then releases the lock
+before any socket I/O.
+
 ## Sequence
 
 1. `main` calls `signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)` and threads the resulting context into `run`.
@@ -51,8 +59,9 @@ func (r *Registry) Snapshot() []Conn
 3. `run` `select`s on `<-sigCtx.Done()` (operator-triggered) or `<-listenerErr` (listener-triggered).
 4. Either branch builds `drainCtx, cancel := context.WithTimeout(context.Background(), drainDeadline)` and calls `relay.Shutdown(drainCtx, logger, reg, servers...)`.
 5. Inside `Shutdown`:
-   - For each server: launch a goroutine running `srv.Shutdown(drainCtx)` — closes the listener synchronously, waits for non-hijacked handlers.
-   - Snapshot `reg.Snapshot()`. For each conn: launch a goroutine running `c.CloseWithCode(StatusGoingAway, "shutting down")` (or plain `c.Close()` if the conn doesn't implement the unexported `gracefulCloser` interface). The fan-out unblocks every WS handler's `Read`, which lets each handler unwind through its existing defers.
+   - Call `conns := reg.beginDrain()` to close admission and snapshot registered handles atomically, before launching HTTP shutdown.
+   - For each server: launch a goroutine running `srv.Shutdown(drainCtx)` — closes listeners and waits for non-hijacked handlers.
+   - For each snapshotted conn: launch a goroutine running `c.CloseWithCode(StatusGoingAway, "shutting down")` (or plain `c.Close()` if the conn doesn't implement the unexported `gracefulCloser` interface). The fan-out unblocks WS handlers' reads so they unwind through their existing defers. Late upgraded handlers rejected by the registry close their own sockets outside this fan-out.
    - Wait on `done` (WaitGroup zero) or `drainCtx.Done()`. On ctx-first, iterate `servers` and call `srv.Close()` to force-close any non-WS conn or listener still pending; return `ctx.Err()`. On done-first, return `nil`.
 6. `run` returns 0 or 1 based on the trigger; `main` calls `os.Exit(run(...))`.
 
@@ -62,18 +71,23 @@ During a drain, the relay holds:
 
 - **Listener goroutines** (1 per `*http.Server`) — block in `ListenAndServe[TLS]` until `srv.Shutdown` is called, at which point they return `http.ErrServerClosed` and exit.
 - **Per-server `Shutdown` goroutines** (1 per server, inside the helper) — wait for non-hijacked handlers and the listener-close. Tracked by the helper's `WaitGroup`.
-- **Per-conn close goroutines** (1 per snapshotted conn, inside the helper) — each may block up to 5s on the WS close handshake. Run in parallel so wall-clock stays bounded at ~5s regardless of conn count. Tracked by the same `WaitGroup`.
-- **Handler goroutines** (1 per live WS) — NOT joined by the helper. `CloseWithCode` unblocks the handler's `Read`; the handler unwinds through its existing `defer reg.ScheduleReleaseServer / wsconn.Close` chain. Process exit reaps anything still alive at the deadline.
+- **Per-conn close goroutines** (1 per snapshotted conn, inside the helper) — run in parallel within the WebSocket library's close bounds, so a stalled peer does not delay another peer's close. Tracked by the same `WaitGroup`; the context limits how long shutdown waits.
+- **Handler goroutines** (1 per live WS) — not joined by the helper. Admitted handlers unwind through existing defers after their reads unblock; binary release uses `ScheduleReleaseServerIfHeld`. Late upgraded handlers close with 1001 themselves, outside the helper's `WaitGroup` and registry lock. A handler paused past shutdown completion still takes this rejection path when it resumes, without extending shutdown's deadline. Process exit reaps any remaining handlers.
 
-**Ordering inside the helper is structural, not enforced by a barrier.** The listener-close goroutine and the close-fan-out are launched in sequence on the helper's goroutine; the snapshot is taken after the per-server `Shutdown` calls are in flight, so no new WS handshake can complete between snapshot and close (the listener is already closed). A conn that registered *just before* the snapshot is covered; a conn that tried to register *just after* the snapshot was started never got its handshake accepted.
+**Admission and drain share one mutex boundary.** Admission that wins `Registry.mu` before `beginDrain` is included in the snapshot unless independently removed. Admission after it fails, even for grace reclaim or a takeover probe begun before draining. Launching HTTP shutdown cannot establish this ordering: an upgrade may already have succeeded, and HTTP shutdown does not wait for hijacked sockets. No registry lock covers ping, socket I/O or a close handshake.
 
-**Why concurrent fan-out is load-bearing**: `nhooyr.io/websocket.Conn.Close` blocks up to 5s waiting for the peer's reciprocal close (see [Lessons § nhooyr Close 5s handshake](../../lessons.md)). Serial iteration would scale linearly in conn count — two stuck peers would already blow past the 10s deadline. The drain deadline budgets for one such 5s handshake plus ~5s of headroom; concurrency keeps that budget achievable.
+**Why concurrent fan-out is load-bearing**: a WebSocket close can block for 5s waiting for the peer's reciprocal close (see [historical close-handshake constraint](../../lessons.md)). Serial iteration would scale linearly in conn count. Independent close goroutines let reading peers receive 1001 while another peer's close is stalled; the context bounds how long shutdown waits for the group.
 
 ## Force-close vs graceful close
 
-`http.Server.Shutdown(ctx)` does NOT call `srv.Close()` internally when `ctx` expires — its listeners stay bound, idle keep-alives stay open. The helper's deadline-path explicit `srv.Close()` loop is what makes the helper return promptly after the deadline. Without it, the helper would still hold listeners open until process exit.
-
-`Close()` on the listeners is the difference between "deadline expired, listeners still bound for ~100ms while goroutines exit" and "deadline expired, immediate force-close, prompt return". The unit test `TestShutdown_DeadlineExpiryReturnsCtxErr` asserts wall-clock < 300ms after a 50ms deadline specifically to catch a regression that drops the force-close.
+`http.Server.Shutdown(ctx)` closes listeners and idle HTTP connections, then
+waits for active HTTP connections. On context expiry it returns without
+force-closing active connections. The helper's explicit `srv.Close()` loop
+handles those HTTP connections before returning `ctx.Err()`. Neither HTTP
+method closes hijacked WebSockets; their concurrent close calls have separate
+library bounds. `TestShutdown_DeadlineExpiryReturnsCtxErr` asserts a return
+within 300ms for a 50ms deadline, and `TestShutdown_UnresponsivePeerDeadline`
+pins deadline expiry with a real unread WebSocket peer.
 
 ## Wiring (`cmd/pyrycode-relay/main.go`)
 
@@ -87,10 +101,10 @@ The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction goro
 
 ## Threat model alignment
 
-- **DoS resistance**: an attacker cannot stall the relay's shutdown beyond `drainDeadline`. Per-conn close goroutines are independent; one stuck peer doesn't block another's close. At deadline, `srv.Close()` force-closes regardless of peer state.
+- **DoS resistance**: shutdown's wait is context-bounded. Per-conn close goroutines are independent; one stuck peer doesn't block another's close. At deadline, `srv.Close()` force-closes HTTP connections; process exit closes remaining hijacked sockets. Late handlers cannot reopen registry admission or hold up shutdown with an unbounded join.
 - **Information disclosure**: the close reason `"shutting down"` is hardcoded and operator-visible only on the wire to already-connected peers; no env/host/process info leaks.
 - **Log hygiene**: the shutdown-path log lines emit only `err` (the wrapped `ctx.Err()` for deadline expiry) and the static "shutdown complete" / "shutdown signal received; draining" / "listener error; draining" / "drain incomplete" messages. No attacker-influenced values.
-- **Sibling-defenses preserved**: the rate-limiter, header gate, registry caps all stay in force during drain — the listener is closed before the snapshot, so no new connection can be accepted; existing handlers continue to enforce their invariants until they unwind.
+- **Sibling-defenses preserved**: the rate limiter, header gates and connection caps still run before endpoint admission. Once draining begins, `ErrRegistryDraining` takes precedence at registry admission, including over the phone cap. Rejected handlers release middleware reservations as they return, without installing connections or changing incumbent identities.
 
 ## Failure modes
 
@@ -98,13 +112,14 @@ The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction goro
 | --- | --- | --- |
 | `SIGTERM` / `SIGINT` arrives during steady state | Drain runs; exit 0 | Operator restarts process or supervisor moves on |
 | `ListenAndServe[TLS]` returns a non-`ErrServerClosed` error | Drain runs (best-effort close of any live conns); exit 1 | Process supervisor restarts |
-| Drain deadline expires before all close handshakes complete | `srv.Close()` force-closes listeners; helper returns `context.DeadlineExceeded`; exit 0 (signal trigger) or 1 (listener-error trigger) | None — peers whose handshakes didn't complete see a TCP reset on those specific conns (no regression from pre-#31 behaviour) |
+| Drain deadline expires before all close handshakes complete | `srv.Close()` force-closes HTTP connections; helper returns `context.DeadlineExceeded`; exit 0 (signal trigger) or 1 (listener-error trigger) | WebSocket cleanup remains best-effort; process exit closes remaining sockets |
 | Second `SIGTERM` arrives during drain | Ignored (`NotifyContext` cancels its context once) | Send `SIGKILL` if drain is wedged; kernel reaps the process |
-| Empty registry at drain start | `Snapshot()` returns nil; close fan-out is a no-op; per-server `Shutdown` calls return promptly; helper returns nil | n/a |
+| Empty registry at drain start | `beginDrain()` returns nil and permanently closes admission; close fan-out is a no-op | HTTP shutdown still runs within the context |
+| Successful upgrade reaches admission after drain starts | Handler closes with 1001 without installing the connection, even after shutdown returns | Peer reconnects to a serving relay |
 
 ## What this deliberately does NOT do
 
-- **Reconnect / resume protocol coordination with peers** — the relay sends `1001` and exits; phones and binaries handle reconnect per their own logic. Resume semantics live in `pyrycode/pyrycode/docs/protocol-mobile.md` and are out of scope here.
+- **Reconnect / resume protocol coordination with peers** — the relay sends `1001` and exits; phones and binaries handle reconnect per the [wire protocol](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md).
 - **Wait for handler goroutines to finish** — the helper unblocks handlers via `CloseWithCode` but does not join them. The handler unwind path is fast (existing defers) and any goroutine still alive at process exit is reaped by the kernel.
 - **Persist in-flight frames** — the relay is stateless. Frames mid-write at drain time are lost; the peer's reconnect path re-establishes state.
 - **Special-case the metrics listener** — `metricsSrv` joins the same `servers` slice as the public listener(s) and goes through the same `srv.Shutdown` / `srv.Close` path. Loopback scrapers see the same `ECONNREFUSED` after drain as any other client.
@@ -129,15 +144,35 @@ The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction goro
 
 `cmd/pyrycode-relay/main_e2e_test.go`:
 
-- `TestRun_SigtermClosesWSConnsWithGoingAway` — full boot via `run`, real WS dial against `/v1/server`, cancel the synthetic sigCtx, assert the next `Read` returns a close error with `websocket.CloseStatus(err) == StatusGoingAway`, assert exit code 0 within `drainDeadline + 2s`.
+- `TestRun_SigtermClosesWSConnsWithGoingAway` — full boot via `run`, real WS dial against `/v1/server`, start the three-second read and complete a native `Ping` round trip before cancelling the synthetic sigCtx. The same read deadline must observe wire code 1001, and `run` must exit 0 within `drainDeadline + 2s`. Cancelling on dial success alone races admission; sleeps or longer timeouts would not prove the ordering.
 - `TestRun_SigtermWithNoConns` — empty-registry happy path; also asserts listener is no longer dialable after `run` returns.
+
+`internal/relay/shutdown_admission_test.go`:
+
+- `TestShutdown_LateUpgradeGoingAway` — a test-only `http.Hijacker` wrapper pauses after the successful 101 upgrade, before `Accept` returns to admission. Shutdown completes before resumption; fresh claims, grace reclaims and phone registrations (including no-server and at-cap states) must receive wire 1001 and leave registry identities unchanged. Synchronizing only on admission would miss the production gap.
+- `TestShutdown_ConflictProbeDuringDrain` — gates an incumbent's `Ping` so its failure reaches takeover after shutdown completes; the replacement receives 1001 and cannot install itself.
+- `TestRegistry_DrainRejectsAdmission` — repeated claims, grace reclaim, takeover with held/empty/changed incumbent, capped and uncapped phone registration all return `ErrRegistryDraining` without installing or closing the rejected connection or changing a grace timer's identity.
+- `TestShutdown_AdmittedPeersGoingAway` — native ping/pong confirms binary and phone admission; both real peers receive 1001 while a separate close is blocked.
+- `TestShutdown_UnresponsivePeerDeadline` — a real unread peer forces `context.DeadlineExceeded`; reading after expiry still receives the already-sent 1001 frame.
+
+`TestSourceConnCap_FailureAndTeardown/shutdown` in
+`internal/relay/source_conncap_test.go` checks that source reservations are
+released and reusable, while a new upgrade against the drained registry is
+closed with 1001 and never claimed. Capacity cleanup and registry reopening
+are separate contracts.
+
+Focused race stress command:
+
+```sh
+go test -race -run '^TestRun_SigtermClosesWSConnsWithGoingAway$' -count=100 ./cmd/pyrycode-relay
+```
 
 ## Related
 
 - [Codebase: #31](../codebase/31.md) — implementation notes for this ticket.
 - [ADR-0003: Connection registry as a passive store](../decisions/0003-connection-registry-passive-store.md) — the pattern `Snapshot` preserves.
 - [ADR-0007: `WSConn.CloseWithCode` for active-conn application close codes](../decisions/0007-wsconn-closewithcode-for-active-conn.md) — the `closeOnce` idempotency the shutdown path inherits.
-- [Connection registry](connection-registry.md) — the registry whose `Snapshot()` accessor this ticket adds.
+- [Connection registry](connection-registry.md) — admission guards and the permanent drain boundary.
 - [Per-IP rate-limit middleware](rate-limit-middleware.md) — `defer limiter.Close()` now runs on every shutdown path.
 - [Metrics listener (localhost-only)](metrics-listener.md) — the third `*http.Server` that joins the drain.
 - [Lessons § nhooyr Close 5s handshake](../../lessons.md) — the constraint that forces concurrent fan-out.
