@@ -39,6 +39,24 @@ observe forwarding at saturation and recovery on both services in an
 [isolated Fly app before production deployment](../../deploy.md#verify-a-deploy).
 The existing passthrough, PROXY v2 and health-check configuration is unchanged.
 
+### App restart recovery
+
+`[[restart]]` explicitly targets `processes = ["app"]` with
+`policy = "always"` and omits `retries` (#199). Fly attempts recovery
+regardless of the main process's exit code, including clean exits. The
+previous implicit policy left recovery to `on-failure`; the production
+inventory on 2026-10-13 observed a ten-retry ceiling. See Fly's
+[restart configuration](https://docs.fly.io/reference/configuration#the-restart-section).
+
+The manifest declares intent; restart policy is effective per Machine and
+can be overridden there. A parsed TOML assertion cannot prove that an
+existing Machine adopted it or recovered beyond the former ceiling.
+The [operator runbook](../../deploy.md#app-restart-recovery) keeps effective
+policy verification, at least eleven consecutive isolated crashes and
+lifecycle evidence pending before manual production deployment. Recovery
+must preserve exactly one active production relay. Alert installation and
+delivery remain [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
+
 ### Single-machine hard cap
 
 The relay's connection registry is **in-process** (`internal/relay/registry.go`); two machines hold two disjoint registries and silently drop phones routed to the "wrong" replica. This is a correctness constraint, not a cost optimisation — `docs/architecture.md § Single-instance constraint (v1)` is canonical.
