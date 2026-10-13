@@ -115,7 +115,7 @@ func TestPushMetrics_RateLimitIsDropped(t *testing.T) {
 	if err := w.Request("push-sid-1", wakeJSON("fcm", testWakeToken)); err != nil {
 		t.Fatalf("first wake: %v", err)
 	}
-	if err := w.Request("push-sid-1", wakeJSON("fcm", testWakeToken)); err == nil {
+	if err := w.Request("push-sid-1", wakeJSON("fcm", "another-device")); err == nil {
 		t.Fatal("second wake admitted, want rate-limited")
 	}
 	w.Close()
@@ -133,7 +133,7 @@ func TestPushMetrics_InFlightCapIsDropped(t *testing.T) {
 		t.Fatalf("first wake: %v", err)
 	}
 	sender.waitStarted(t, 1)
-	if err := w.Request("push-sid-2", wakeJSON("fcm", testWakeToken)); err == nil {
+	if err := w.Request("push-sid-2", wakeJSON("fcm", "another-device")); err == nil {
 		t.Fatal("wake over cap admitted, want refused")
 	}
 	assertPushWakeOutcomes(t, h, map[string]int{"dropped": 1})

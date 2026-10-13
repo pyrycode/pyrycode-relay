@@ -6,7 +6,7 @@ backgrounded Android app by sending it a data-only FCM message. Introduced by
 (`protocol-mobile.md` § `push_wake`) to `Send` and constructs the sender
 from `main` — see [Push wake dispatch](push-wake-dispatch.md) for the
 dispatch path (structural validation, daemon/device/global attempt allowances,
-relay-wide in-flight cap, async send off the binary read loop).
+bounded device coalescing/retained-job cap, async send off the binary read loop).
 
 ## Why
 
@@ -160,7 +160,8 @@ first 8 hex characters of the device token's SHA-256 — stable per token,
 one-way, safe to log in the token's place. It exists for the caller: see
 [Push wake dispatch](push-wake-dispatch.md) § Error handling for the full
 logging contract (`push_wake_sent` / `push_wake_send_failed`, one line per
-admitted wake).
+actual dispatched job attributed to its first admitting daemon; accepted
+coalesced requests produce no line).
 
 ## Concurrency
 
