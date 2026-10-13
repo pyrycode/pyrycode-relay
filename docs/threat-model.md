@@ -59,7 +59,26 @@ incomplete version 1 is rejected unchanged. The relay has no new payload
 access, public endpoint or deployment target, and its content blindness and
 runtime statelessness are unchanged.
 
-**Residual risk:** If the VPS is rooted, every byte through the relay is exposed: TLS terminates here, so plaintext frames are recoverable from process memory. This is the operator-side framing of the protocol spec's "relay operator MITM" threat — same plaintext exposure, different actor.
+**Daemon admission:** Only [enforce](knowledge/features/server-endpoint.md#daemon-admission-before-upgrade)
+blocks anonymous identity reservation and daemon-originated wakes. Off (default)
+and observe retain anonymous admission. Provisioning and explicit production
+activation are [operator work](deploy.md#daemon-admission-activation), not a result
+of merging or passing offline gates. A stolen admission token permits claiming
+its exact bound identity and abusing push; it supplies neither the daemon's
+Noise private key nor phone authorization. Removal plus Relay restart revokes
+future admission and drops existing connections, claims and grace state.
+
+**Residual risk:** A rooted host or compromised Relay can capture admission
+headers and the configured credential map, the transient opaque phone-token
+header, device tokens in relay-directed push requests and routing/traffic metadata.
+TLS terminates here, but application content remains end-to-end Noise ciphertext:
+Relay holds no Noise keys and a memory dump does not yield application plaintext.
+Admission does not protect against a malicious Relay, which can deny service,
+misroute, drop or delay frames and abuse push. See the protocol's
+[relay operator MITM boundary](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#security-model).
+The existing `x-pyrycode-token` phone header is still visible in memory at upgrade;
+Relay presence-checks and discards it without parsing, comparing or forwarding it.
+Daemon phone authorization occurs inside the encrypted Noise handshake.
 
 A compromised CI discovery/download step could expose the read-only credential
 and its organization-wide read access. Event, branch and step restrictions limit
@@ -87,22 +106,24 @@ remain pending. The watcher cannot mutate Fly resources or authorize remediation
 
 **v1 mitigation:** A small, justified dependency surface (`go.mod`): `github.com/coder/websocket v1.8.14` (the WebSocket implementation, chosen 2026-05-28 in [ADR-0010](knowledge/decisions/0010-coder-websocket-migration.md)), `github.com/prometheus/client_golang v1.23.2` with its `client_model v0.6.2` and `common v0.66.1` companions (metrics, [ADR-0008](knowledge/decisions/0008-prometheus-client-adoption.md)), `golang.org/x/crypto v0.57.0` for `acme/autocert`, `golang.org/x/oauth2 v0.37.0` (the `jwt` subpackage only) to mint FCM access tokens from the operator's service-account key ([FCM push sender](knowledge/features/fcm-push-sender.md), [ADR-0011](knowledge/decisions/0011-oauth2-jwt-not-google-for-fcm.md)) — this path pulls in no packages outside the `x/oauth2` module itself; `cloud.google.com/go/compute/metadata` is named in `x/oauth2`'s own `go.mod` (via the unused `oauth2/google` subpackage) but is not compiled into the binary — and `github.com/pires/go-proxyproto v0.15.0` to parse Fly's PROXY protocol v2 header on the pre-TLS HTTPS listener path ([PROXY protocol listener](knowledge/features/proxy-protocol-listener.md), [ADR-0012](knowledge/decisions/0012-go-proxyproto-for-proxy-header-parsing.md)) — its root package imports the standard library only, no transitive modules compiled in. `golang.org/x/net v0.60.0` is also a direct dependency for `netutil.LimitListener` ([ADR-0014](knowledge/decisions/0014-netutil-limitlistener-for-public-admission.md)): it was already pinned indirectly; promotion changes neither versions nor checksums. The package imports only `net` and `sync`, adds no parsing or transitive packages, and wraps opaque sockets for admission, release and shutdown. Standard `net` has no equivalent wrapper. `go.sum` provides per-module checksum verification on every build. `govulncheck` runs in `make lint` (#41 pins it to a semver tag) and daily against `main` in the `govulncheck` job of `.github/workflows/security-scan.yml` (#72) — the repo's only workflow since the convenience `ci.yml` was removed 2026-05-24. The runtime image is additionally scanned by Trivy in the same workflow's `image-scan` job (#68/#72), covering OS-package + Go-binary content, so CVEs disclosed against deps that have not changed since the last PR surface as a red Actions run within ≤24h rather than staying invisible until the next dep bump. A regression also opens a `security-sensitive`-labelled GitHub issue via the workflow's `file-issue` job (#73), lifting the red Actions row to a tracked work-item in the triage queue rather than leaving it as a passive signal. New dependencies require a justification (`docs/PROJECT-MEMORY.md`).
 
-**Residual risk:** A compromised release of `golang.org/x/crypto` would expose TLS private-key handling. A compromised release of `github.com/coder/websocket` would see every routed frame in cleartext, since the relay is the TLS terminus. A compromised release of `golang.org/x/oauth2` would see the FCM service-account private key (held in memory only — see [FCM push sender](knowledge/features/fcm-push-sender.md)) and every device token the relay sends to wake a phone. A compromised release of `github.com/pires/go-proxyproto` sits on the least-trusted, pre-TLS path of the HTTPS listener when `--https-proxy-protocol` is enabled — it sees only PROXY header bytes and TLS ciphertext, never a decrypted frame, but a malicious release could falsify the address every downstream rate-limit decision keys on. A compromised `golang.org/x/net/netutil` release could undermine admission or socket cleanup on every public listener; its current implementation does not read bytes. `go.sum` defends against tampered downloads, not against a malicious release tagged by an authentic maintainer.
+**Residual risk:** A compromised release of `golang.org/x/crypto` would expose TLS private-key handling. A compromised release of `github.com/coder/websocket` could see admission and opaque phone-token headers, routing metadata and routed Noise ciphertext after TLS termination, but Relay has no Noise keys to decrypt application content. A compromised release of `golang.org/x/oauth2` would see the FCM service-account private key (held in memory only — see [FCM push sender](knowledge/features/fcm-push-sender.md)) and every device token the relay sends to wake a phone. A compromised release of `github.com/pires/go-proxyproto` sits on the least-trusted, pre-TLS path of the HTTPS listener when `--https-proxy-protocol` is enabled — it sees only PROXY header bytes and TLS ciphertext, never a decrypted frame, but a malicious release could falsify the address every downstream rate-limit decision keys on. A compromised `golang.org/x/net/netutil` release could undermine admission or socket cleanup on every public listener; its current implementation does not read bytes. `go.sum` defends against tampered downloads, not against a malicious release tagged by an authentic maintainer.
 
-**Future hardening:** SBOM generation in CI; pinned-version review on every `go.mod` change; consider Go module proxy mirroring once any user data flows through the relay.
+Daemon admission adds only standard-library parsing and constant-time equality plus the existing private metrics registry; it introduces no credential service or dependency. A malicious dependency with process access can capture the startup credential map or undermine admission, regardless of its intended API boundary.
+
+**Future hardening:** SBOM generation in CI; pinned-version review on every `go.mod` change; consider Go module proxy mirroring if the supply-chain risk warrants it.
 
 ## Outbound network calls — FCM push wake
 
 **Severity:** `medium`. Trips the "new outbound network call" re-review trigger below (#133).
 
-**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the only trigger for the relay originating an outbound call. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then admits or refuses the wake under two independent, named limits before a single outbound call is made:
+**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the trigger for an outbound push call. In enforce, only a daemon admitted for its exact identity can reach this path; rejected requests never upgrade or gain push access. Off/observe still allow anonymous daemon admission. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then admits or refuses the wake under two independent, named limits before a single outbound call is made:
 
 - **Per-server-id rate** — `pushWakeRefillEvery` (10s) / `pushWakeBurst` (6), an `IPRateLimiter` keyed on server-id. Bounds how fast one binary can push wakes at Google.
 - **Relay-wide in-flight cap** — `pushWakeMaxInFlight` (32), a buffered channel. Bounds concurrent goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
 
 A wake over either limit is dropped with a log line, never queued — no backpressure state accumulates. The credential (`PYRYCODE_RELAY_FCM_CREDENTIALS`, a whole Google service-account JSON key) and the device token are never logged: a refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every *admitted* wake logs exactly one outcome line — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
 
-**Residual risk:** The relay cannot verify a binary's claimed device token belongs to one of that binary's own phones — any binary that has claimed a server-id can ask the relay to wake an arbitrary FCM token. The two limits bound the *rate* of abuse, not eliminate it: a single binary can still cause up to `pushWakeBurst` wakes per `pushWakeRefillEvery` window indefinitely. Because the wake carries no payload, the worst case is an app repeatedly reconnecting, not data exposure. The in-flight cap bounds concurrency relay-wide, not total throughput when many server-ids are claimed simultaneously — a set of colluding binaries, each under its own per-server-id bucket, can still saturate the 32-slot cap. Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` makes that saturation observable on `/metrics` instead of only in logs — see [Push wake dispatch § Metrics](knowledge/features/push-wake-dispatch.md#metrics).
+**Residual risk:** The relay cannot verify a binary's claimed device token belongs to one of that binary's own phones — any binary that has claimed a server-id can ask the relay to wake an arbitrary FCM token. In enforce this requires a credential for that exact identity, including a stolen credential; off/observe retain anonymous push abuse. Admission authenticates the daemon identity, not ownership of the requested device token, and grants no Noise keys or phone authorization. The two limits bound the *rate* of abuse, not eliminate it: a single binary can still cause up to `pushWakeBurst` wakes per `pushWakeRefillEvery` window indefinitely. Because the wake carries no payload, the worst case is an app repeatedly reconnecting, not data exposure. The in-flight cap bounds concurrency relay-wide, not total throughput when many server-ids are claimed simultaneously — a set of colluding binaries, each under its own per-server-id bucket, can still saturate the 32-slot cap. Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` makes that saturation observable on `/metrics` instead of only in logs — see [Push wake dispatch § Metrics](knowledge/features/push-wake-dispatch.md#metrics).
 
 **Future hardening:** A global wakes-per-second ceiling (distinct from the in-flight cap) if abuse across many server-ids is observed; telling the daemon a token is dead (currently out of scope — no retry, no dead-token callback, even though the relay can now tell a dead token apart from any other send failure via `ErrFCMUnregistered`, see [FCM push sender](knowledge/features/fcm-push-sender.md)).
 
@@ -173,7 +194,8 @@ for other sources. Both endpoints share one source count using the exact
 limiting; PROXY HTTPS supplies the declared source through `RemoteAddr`.
 
 Admission order is HTTP-429 metrics observer → rate limiter → source
-allowance → global cap → endpoint. Empty-source and rate-limited attempts
+allowance → global cap → daemon admission on `/v1/server` → endpoint.
+Empty-source and rate-limited attempts
 reserve neither capacity. Source saturation returns HTTP 503 with only a
 newline and one `source_conn_cap_reached` Warn carrying
 `strconv.Quote(source)` under `remote`, without taking a global slot. Global
@@ -230,8 +252,17 @@ paying user.
 
 **v1 mitigation:** The relay logs to stderr via `slog.NewTextHandler` (`cmd/pyrycode-relay/main.go:39`). The contributor-facing rule is enumerated explicitly:
 
-- **MUST NOT be logged:** payload bodies (the inner `json.RawMessage` of an envelope), `x-pyrycode-token` values or any header that carries a token, full request headers, full URL paths if they ever carry tokens.
+- **MUST NOT be logged:** opaque inner-frame bodies (including Noise ciphertext), `x-pyrycode-token` or `x-pyrycode-admission-token` values, the daemon credential map, any secret-bearing header, full request headers, parser excerpts or URL paths carrying tokens. TLS termination exposes headers and routing metadata to Relay; content blindness is not header secrecy.
 - **MAY be logged:** server-id, `conn-id`, device-name (advertised by the binary, not user-secret), remote host (IP), event types (`upgrade`, `forward`, `close`), close codes (`4401`, `4404`, `4409`), a push device token's fingerprint (`token_fp` — the first 8 hex characters of the token's SHA-256, a truncated one-way hash; the raw device token itself is never logged, #160), and an FCM push wake's message id (`fcm_message_id` — Firebase's `name` field from a successful send, kept only when it matches `[A-Za-z0-9/:%_-]{1,256}`, #160).
+
+Admission has no runtime logs. Startup validation discards parser causes and
+returns static, value-free errors. Credentials/maps/raw headers must also stay
+out of returned error chains, rejection bodies, status and metrics; admission
+credentials enter no URL, routing envelope or application frame. Admission
+telemetry has exactly five fixed aggregate `outcome` labels (`valid`, `missing`,
+`malformed`, `unknown`, `mismatch`), never claimed identities or tokens. Existing
+allowlisted endpoint metadata logs remain; they do not prove per-identity
+admission outcomes. Repository credentials must be explicitly synthetic.
 
 **Enforcement:** The canonical set of permitted keys lives in `internal/relay/log_allowlist.go`. `TestLogKeysAreAllowlisted` in `internal/relay/log_keys_test.go` AST-walks every non-test `.go` file in the package on each `make test` run and fails if any `logger.{Info,Warn,Error,Debug}` call carries a key absent from that set or uses a dynamic (non-string-literal) key. Adding a logged key requires editing the allowlist file in the same commit.
 
@@ -289,7 +320,17 @@ pending operator follow-up.
 
 **Severity:** `medium`.
 
-**v1 mitigation:** The current public surface is small. `/healthz` returns a literal `ok`. Port 80 returns `404` for non-challenge traffic (ADR-0002). Port 443 returns `421 Misdirected Request` with no body when the Host header does not match the configured domain (`internal/relay/tls.go:66-78`). None leak internal state. The rule for new endpoints: public-facing handlers return generic messages; detailed errors go to logs only.
+**v1 mitigation:** The current public surface is small. `/healthz` returns bounded status/version/connection-count/uptime JSON with `Cache-Control: no-store` and no credential information. Port 80 returns `404` for non-challenge traffic (ADR-0002). Port 443 returns `421 Misdirected Request` with no body when the Host header does not match the configured domain (`internal/relay/tls.go:66-78`). These responses expose no credentials. The rule for new endpoints: public-facing handlers return generic messages;
+only secret-safe diagnostics may go to logs.
+
+Every enforce rejection at the daemon gate is HTTP 401, `Cache-Control: no-store`,
+and exactly `daemon admission rejected\n`, independent of missing/malformed,
+unknown/revoked or mismatched credentials and occupied identities. There is no
+credential echo, identity echo, parser cause, close code or application error
+frame. Rejection precedes upgrades, claims, probes, grace changes and push access.
+Existing outer limits can return 429/503 before reaching the gate. Observe counts
+outcomes without adding a rejection; off skips checking. Supplied invalid startup
+configuration fails before listeners in every mode with static value-free errors.
 
 **Residual risk:** Future endpoints — WebSocket upgrade error paths in particular — may write `err.Error()` to the response body and leak filesystem paths, dependency names, or stack traces.
 

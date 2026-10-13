@@ -7,27 +7,27 @@
 The wire protocol lives in [`pyrycode/pyrycode/docs/protocol-mobile.md`](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md). That document defines:
 
 - Connection lifecycle (binary connects to `/v1/server`; phones to `/v1/client`)
-- Headers used for routing (`x-pyrycode-server`, `x-pyrycode-token`)
+- Routing identity (`x-pyrycode-server`), the opaque phone-token header (`x-pyrycode-token`) and the daemon admission header (`x-pyrycode-admission-token`)
 - The routing-envelope wrapper that the relay prepends/strips when forwarding
-- Authentication semantics (relay routes blindly by server-id; binary validates token)
+- [Identity-bound daemon admission](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#daemon-admission-declared) at Relay, distinct from daemon-owned phone authentication and end-to-end Noise encryption
 - Error envelope and WS close codes (`4401`, `4404`, `4409`)
 - TLS terminus (relay is the cert holder; autocert via Let's Encrypt)
 
 ## What this binary does
 
-1. Accept WSS upgrades on `/v1/server` and `/v1/client`.
+1. Check daemon admission before `/v1/server` upgrades using a private startup credential mapping: off (default) bypasses checks, observe counts aggregate decisions, enforce requires an exact identity/token match. Only enforce blocks anonymous claims and daemon-originated wakes. Accept admitted WSS upgrades and the existing `/v1/client` path. See [daemon endpoint](knowledge/features/server-endpoint.md#daemon-admission-before-upgrade).
 2. Map server-ids → binary connections (1:1; first-claim-wins with 30s grace on disconnect).
 3. Map server-ids → phone connections (1:N).
 4. Forward frames between phones and the corresponding binary, prepending/stripping the routing envelope.
 5. Surface `4404` (no server) when a phone connects with a server-id no binary holds.
-6. Surface `4409` (server-id conflict) when a binary tries to claim a held server-id.
+6. Surface `4409` (server-id conflict) when an admitted binary claims a held server-id and its incumbent answers the liveness probe; otherwise reclaim the unresponsive incumbent's slot.
 7. Tell the binary when one of its phones' connections ends on its own, via a frameless `{conn_id, close_code}` routing envelope (#152) — skipped when the binary itself requested the close, or no longer holds that server-id. See [`/v1/client` § Close notice to the binary](knowledge/features/client-endpoint.md#close-notice-to-the-binary-152).
 
 ## What this binary does NOT do
 
-- Read message payloads. Frames are opaque bytes.
-- Persist anything (modulo the on-disk autocert cert cache).
-- Validate device tokens. The binary does that.
+- Read application payloads or terminate Noise. Phone↔daemon frames remain opaque; application content is Noise ciphertext. Routing metadata and relay-directed control fields remain visible.
+- Persist user/connection state (modulo the on-disk autocert cert cache). Provisioned admission credentials are read once at startup; restart discards claims and grace state.
+- Authenticate phones, validate their pairing tokens or hold their Noise keys. The daemon does that; Relay only presence-checks and discards the existing opaque phone-token header. Daemon admission does not verify ownership of a push device token.
 - Implement APNs push. Only FCM wakes are sent, and only when the binary
   asks for one.
 - Operate on multiple users / tenants in v1. One operator, many users' server-ids.
@@ -44,7 +44,9 @@ slots last until socket close, including keep-alive and WebSocket hijacking.
 After HTTP headers, `/v1/server` and `/v1/client` share admission in this
 order: metrics observer → per-source attempt-rate limiter →
 `SourceConnCap` (`--max-connections-per-source`, default 8) → relay-wide
-`ConnCap` (`--max-connections`, default 20) → endpoint. Both source limits
+`ConnCap` (`--max-connections`, default 20) → daemon admission on
+`/v1/server` → endpoint. `/v1/client` retains its existing endpoint validation.
+Both source limits
 use the exact `ClientIP` result and the same XFF trust setting; PROXY HTTPS
 supplies the declared source through `RemoteAddr`. Rate denials return 429
 without reservations; either upgraded cap returns 503 before acceptance.

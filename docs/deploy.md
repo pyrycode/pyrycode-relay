@@ -91,6 +91,32 @@ with `flyctl tokens revoke <token ID>`). Keep the expiry reminder current.
 
 ## Secrets
 
+- **`PYRYCODE_RELAY_DAEMON_ADMISSION_MODE`** — unset defaults to `off`;
+  otherwise exactly `off`, `observe` or `enforce`. Off skips credential checks;
+  observe records aggregate decisions while allowing legacy admission. Only
+  enforce blocks anonymous daemon identity claims and daemon-originated wakes.
+- **`PYRYCODE_RELAY_DAEMON_ADMISSION_CREDENTIALS`** — private JSON object
+  mapping exact server-ids to arrays of accepted tokens. Unset means an empty
+  mapping in off/observe; enforce requires a supplied mapping. `{}` is valid
+  and denies all; an identity with `[]` admits nobody. Each token must be
+  exactly 64 lowercase hex characters representing 32 cryptographically random
+  bytes. Bind each token to one exact identity; no aliasing or normalization.
+  Duplicate decoded identity keys, cross-identity token reuse and malformed
+  values fail startup even in off. See [configuration validation](knowledge/features/env-config-validator.md#daemon-admission-configuration).
+
+Privately generate distinct tokens and provision the daemon's private
+`relay_admission_tokens` configuration and Relay's runtime secret mapping
+through trusted operator channels. Follow the [shared storage and admission contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#daemon-admission-declared).
+Keep real tokens, maps and raw headers out of shell history, logs, GitHub,
+checked-in files and public verification evidence. Checked-in examples and test
+fixtures must be explicitly synthetic; never deploy their predictable tokens.
+Credentials enter no URL, QR payload, routing envelope or application frame.
+
+Mode and mapping are immutable startup snapshots. Provisioning changes apply
+only when Relay restarts; daemon token selection also requires daemon restart.
+A Relay restart closes existing connections and discards claims/grace state.
+Coordinate secret changes with the [activation checklist](#daemon-admission-activation).
+
 - **`PYRYCODE_RELAY_FCM_CREDENTIALS`** — optional. Holds the *entire* Google
   service-account JSON key the relay uses to send FCM push wakes (see
   [Push wake dispatch](knowledge/features/push-wake-dispatch.md)). Unset
@@ -312,6 +338,56 @@ Observability:
 - The [restart watcher](#restart-incident-monitoring), once installed and
   verified, reports lifecycle incidents to Pyry; scheduler diagnostics
   identify monitoring or delivery failures separately.
+
+### Daemon admission activation
+
+**Pending operator work:** manual deployment, private provisioning, production
+mode activation and authorized/anonymous reconnect verification. Offline gates
+and merge do not establish live enforcement. Use the
+[shared rollout contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#daemon-admission-declared)
+and preserve exactly one active relay through each restart.
+
+1. Ship the daemon companion and Relay implementation with Relay **off**.
+   Deploy Relay manually from clean `main` through the flow above. Confirm
+   intended daemon versions support credential delivery and terminal 401 handling.
+2. Privately provision distinct cryptographically random tokens for every exact
+   intended identity, putting each selected token in that daemon's private
+   configuration and the accepted array in Relay's runtime secret mapping.
+   Restart daemons to load their selected credentials. Do not publish the mapping.
+3. Set Relay to **observe** and restart. Reconnect every intended daemon under
+   operator control and correlate each reconnect with aggregate
+   `pyrycode_relay_daemon_admission_total{outcome}` deltas on private metrics.
+   Confirm `valid` for all intended identities; resolve missing/malformed,
+   unknown and mismatch outcomes before enforcement. Aggregate counts have no
+   identity labels and do not prove coverage by themselves; use private
+   provisioning records and controlled reconnects. A valid outcome means the
+   gate accepted the credential, not that upgrade/claim succeeded.
+4. Explicitly set **enforce** and restart Relay. Verify authorized reconnects,
+   forwarding and wakes when push is configured. Verify an anonymous daemon
+   upgrade attempt that reaches the gate receives HTTP 401,
+   `Cache-Control: no-store` and exactly `daemon admission rejected\n`, without
+   an upgrade, claim, probe, grace reservation or wake. Existing rate/source/global
+   limits can respond first;
+   a 429/503 is not admission-rejection evidence. Record non-secret results
+   and actual inventory, with exactly one active relay.
+
+**Rotation:** privately add a fresh token alongside the old token in the same
+identity's Relay array, then restart Relay to load the overlap. Update the
+daemon's selected token and restart that daemon; confirm its authorized
+reconnect. Remove the old token and restart Relay again. Removing a token or
+whole identity revokes it only after that restart, which also drops the holder's
+existing connection and its claims/grace state. Confirm revoked rejection and
+remaining authorized reconnects.
+
+**Rollback:** setting off or observe and restarting Relay restores anonymous
+admission and removes the enforcement guarantee. These modes still reject
+malformed supplied startup configuration; correct provisioning before restarting.
+An image rollback also needs review of effective admission mode/configuration.
+
+**Terminal daemon 401:** the first admission 401 stops automatic retries for
+that daemon relay leg while preserving local daemon service. Correct private
+provisioning/mode as needed, then have the operator restart the daemon to retry.
+Changing Relay provisioning alone does not restart that terminal daemon leg.
 
 ## Restart incident monitoring
 

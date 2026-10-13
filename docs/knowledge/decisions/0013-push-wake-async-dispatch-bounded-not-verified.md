@@ -10,9 +10,12 @@ The daemon can ask the relay to wake a backgrounded phone by sending a
 ([FCM push sender](../features/fcm-push-sender.md), #132). Two properties of
 this request shape a decision the relay has to make on every wake:
 
-1. **The relay cannot verify the token.** A binary is authenticated by having
-   claimed a server-id, not by any per-device proof — it could ask the relay
-   to wake any FCM token, including one belonging to a different install.
+1. **The relay cannot verify device-token ownership.** In
+   [daemon admission enforce](../features/server-endpoint.md#daemon-admission-before-upgrade)
+   (#167), a binary needs a credential bound to its exact server-id before
+   upgrade or claim. That proof does not bind a wake's device token to the
+   binary: an admitted holder could ask to wake any FCM token, including one
+   belonging to a different install. Off/observe retain anonymous admission.
 2. **`FCMSender.Send` blocks** on an HTTP call (bounded by `fcmSendTimeout`,
    but still synchronous). The caller is `StartBinaryForwarder`'s read loop,
    which also forwards ordinary phone traffic for the same binary — a stalled
@@ -76,12 +79,15 @@ accumulates under sustained abuse.
 
 - Documented as an accepted, bounded residual risk rather than a solved
   problem: see [`docs/threat-model.md` § Outbound network calls](../../threat-model.md#outbound-network-calls--fcm-push-wake).
-  A binary can still cause up to `pushWakeBurst` wakes per
+  Enforce excludes anonymous daemon-originated wakes, but admitted holders,
+  including stolen-token holders, retain push abuse within their bound identity.
+  Admission grants neither Noise keys nor phone authorization. A binary can
+  still cause up to `pushWakeBurst` wakes per
   `pushWakeRefillEvery` window indefinitely, and a set of colluding binaries
   can still collectively saturate `pushWakeMaxInFlight`.
-- No metric exists yet on refused wakes (out of scope per the ticket) — the
-  residual risk is not currently observable without reading logs. A future
-  ticket adding one does not change this decision, only its visibility.
+- Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` records
+  rate/cap refusals with fixed aggregate labels. This changes visibility,
+  not the decision or its limits; see [push metrics](../features/push-wake-dispatch.md#metrics).
 - If a future ticket makes the wake payload-bearing, or adds a way to verify
   a token belongs to the claiming binary's own phones, this ADR's
   "acceptable because payload-free" rationale no longer holds and the
