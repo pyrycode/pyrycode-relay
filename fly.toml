@@ -41,6 +41,10 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   # TLS so the per-IP rate limiter keys on the real client IP.
   app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443 --https-proxy-protocol"
 
+[[restart]]
+  processes = ["app"]
+  policy = "always"
+
 [[mounts]]
   source = "relay_autocert"
   destination = "/var/lib/relay/autocert"

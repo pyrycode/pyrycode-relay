@@ -220,6 +220,16 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    Complete the isolated non-production check in [Verify a deploy](#verify-a-deploy)
    before production deployment; merging does not perform that check.
 
+7. **Explicit restart recovery for `app`.** `[[restart]]` sets
+   `processes = ["app"]` and `policy = "always"`, with no `retries` setting
+   (#199). Fly attempts recovery after the main process exits regardless
+   of exit code, including a clean exit; see the
+   [restart reference](https://docs.fly.io/reference/configuration#the-restart-section).
+   This replaces implicit `on-failure` recovery with its retry ceiling.
+   Offline manifest validation does not establish the effective Machine
+   policy or live recovery. Complete the operator checks below before
+   production deployment.
+
 ## Steady-state flow
 
 Deploys are **operator-direct from a clean `main`** since 2026-05-24,
@@ -278,6 +288,38 @@ Observability:
 
 ## Verify a deploy
 
+### App restart recovery
+
+The #199 live checks remain **pending for the operator**. On an isolated
+non-production Fly app with separate domain, cache, credentials and clients,
+deploy the intended image and manifest before testing recovery:
+
+- Read the effective Machine config with `flyctl machine status <machine-id>
+  -d -a <isolated-app>` and confirm `config.restart.policy = "always"` for
+  the `app` process group. Inspect the returned retry fields as well;
+  `max_retries` governs `on-failure`, while `always` recovers regardless of
+  exit code. See [Machine restart policies](https://docs.fly.io/machines/guides-examples/machine-restart-policy/).
+- Cause at least eleven consecutive main-process crashes within the former
+  five-minute retry window. Confirm automatic recovery after each crash,
+  including the eleventh, without manual starts, redeploys or policy changes
+  between crashes. Also verify automatic recovery after a clean process exit.
+  An explicit Machine restart is not evidence of crash recovery.
+- Record lifecycle evidence for deliberate Machine stop/start and a rolling
+  redeploy, including state transitions, restored health and client
+  reconnection. Confirm these operator actions still complete as intended.
+  Retain UTC timestamps, Machine ID, image digest, effective config and
+  exit/restart events alongside the recovery observations.
+
+After these checks pass, manually deploy from clean `main` using the
+[steady-state flow](#steady-state-flow). Preserve exactly one active
+production relay throughout recovery and deployment; do not add a production
+replica for testing. Re-read the production Machine's effective restart
+policy after deployment and retain that evidence. Offline validation and a
+merge complete none of these live checks. Alert installation and delivery
+remain [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
+
+### Connection limits and memory
+
 Before deploying the per-source upgraded allowance, raw listener admission
 or Fly forwarding ceilings to production, the operator must verify the
 combined memory estimate and saturation/recovery behavior on an
@@ -333,6 +375,8 @@ socket tests do not substitute for this operational check.
 This verification and deployment are operator-owned and were not performed
 by the ticket pipeline. After production deployment, identify the running
 artifact as follows.
+
+### Running artifact
 
 Answering "is the fix actually live?" requires identifying the running artifact.
 Start with two independent readings, which should agree:
