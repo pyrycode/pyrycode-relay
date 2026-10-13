@@ -1,12 +1,23 @@
 # Single-instance startup self-check
 
-Boot-time refusal that fires when the relay detects it is running on a multi-instance-capable platform (today: Fly.io) and the operator has not asserted single-instance intent via `PYRYCODE_RELAY_SINGLE_INSTANCE=1`. Deterministic backstop to the [`docs/architecture.md` § Single-instance constraint](../../architecture.md#single-instance-constraint-v1) prose half (#64). Closes the foot-gun where `fly scale count 3` silently breaks server-id routing because the connection registry (`internal/relay/registry.go`) is in-memory per process — two replicas hold disjoint server-id tables and a phone routed to the wrong replica closes with `4404` even though the binary is online.
+Boot-time refusal that fires when the relay detects a multi-instance-capable
+platform (today: Fly.io) without operator assertion
+`PYRYCODE_RELAY_SINGLE_INSTANCE=1`. This requires explicit deploy-time intent;
+it does not count Machines or detect scale-out after configuration. The
+[single-instance constraint](../../architecture.md#single-instance-constraint-v1)
+still requires actual inventory verification: two replicas hold disjoint
+registries, so a phone on the wrong replica closes with `4404` even when its
+binary is online.
 
 ## Contract
 
 - **Bypass env var:** `PYRYCODE_RELAY_SINGLE_INSTANCE`. The literal name is pinned by `docs/architecture.md` (the doc and the code agree on the wire). Exact string `"1"` bypasses; anything else is treated as not set.
 - **Multi-instance signal:** `FLY_APP_NAME` non-empty. Fly's platform sets this on every machine in an app, which is also the substrate where `fly scale count > 1` is a one-line command. Presence is sufficient evidence we are on a multi-instance-capable platform; the value is not inspected.
 - **Decision order:** bypass wins unconditionally. If `PYRYCODE_RELAY_SINGLE_INSTANCE=1`, return nil even when the platform signal is present. Otherwise, if the platform signal is present, return `ErrMultiInstanceDeployDetected`. Otherwise nil.
+- **Production Fly usage:** the assertion is permanently required in
+  `fly.toml`, including for one Machine. Every replica can inherit it;
+  [operator inventory checks](../../deploy.md#complete-process-shutdown)
+  preserve exactly one active relay.
 
 ## API (`internal/relay/single_instance.go`)
 
@@ -73,8 +84,6 @@ No env-var *values* are interpolated into the log line — only the literal bypa
 
 ## Out of scope (deferred)
 
-- **`fly.toml [env] PYRYCODE_RELAY_SINGLE_INSTANCE = "1"` block.** Once this ticket lands, the production Fly deploy will refuse to start until the manifest sets the bypass. The `__REGION__` / `__DOMAIN__` placeholders in `fly.toml` would fail the first deploy regardless; the bootstrap procedure in `docs/deploy.md` handles both at once.
-- **Reconciling `docs/architecture.md`'s "NOT recommended for production" framing.** That section, written before this code spec, characterises the bypass as an emergency / migration-window tool. With `FLY_APP_NAME` as the multi-instance signal, the bypass must be set *permanently* in the Fly manifest for the production deploy to start at all. The framing reconciliation is a separate doc-only follow-up ticket against `docs/architecture.md § Single-instance constraint`; this code-side ticket landed first as the contract source.
 - **Shared-registry / sticky-session multi-instance support.** Tracked in `docs/architecture.md § What multi-instance would require`; this ticket is the v1 single-instance backstop.
 
 ## Cross-links

@@ -32,6 +32,26 @@ type fcmTokenRefresh struct {
 	err   error
 }
 
+// RefreshState snapshots the FCM refresh's joined waiters and completion
+// channel for the process shutdown regression. It exposes no credentials and
+// performs no I/O or mutation. Retain done to observe that attempt's cleanup
+// even after the cache removes it. Non-FCM senders have no refresh to observe.
+func (w *PushWaker) RefreshState() (waiters int, done <-chan struct{}) {
+	if w == nil {
+		return 0, nil
+	}
+	s, ok := w.sender.(*FCMSender)
+	if !ok {
+		return 0, nil
+	}
+	s.tokens.mu.Lock()
+	defer s.tokens.mu.Unlock()
+	if r := s.tokens.refresh; r != nil {
+		return r.waiters, r.done
+	}
+	return 0, nil
+}
+
 func (c *fcmTokenCache) token(ctx context.Context) (*oauth2.Token, error) {
 	c.mu.Lock()
 	if err := ctx.Err(); err != nil {
