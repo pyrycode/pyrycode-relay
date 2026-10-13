@@ -116,16 +116,52 @@ Daemon admission adds only standard-library parsing and constant-time equality p
 
 **Severity:** `medium`. Trips the "new outbound network call" re-review trigger below (#133).
 
-**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the trigger for an outbound push call. In enforce, only a daemon admitted for its exact identity can reach this path; rejected requests never upgrade or gain push access. Off/observe still allow anonymous daemon admission. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then admits or refuses the wake under two independent, named limits before a single outbound call is made:
+**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the trigger for an outbound push call. In enforce, only a daemon admitted for its exact identity can reach this path; rejected requests never upgrade or gain push access. Off/observe still allow anonymous daemon admission. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then checks three initially full attempt allowances and a concurrency cap before dispatch:
 
-- **Per-server-id rate** — `pushWakeRefillEvery` (10s) / `pushWakeBurst` (6), an `IPRateLimiter` keyed on server-id. Bounds how fast one binary can push wakes at Google.
+- **Per-daemon allowance** — burst 6, refill one token per 10s, across all devices requested by the same server-id.
+- **Per-device allowance** — burst 6, refill one token per 10s, shared across all daemons requesting the complete same device token.
+- **Global allowance** — burst 32, refill one token per second, shared across all daemons and devices in the relay process.
 - **Relay-wide in-flight cap** — `pushWakeMaxInFlight` (32), a buffered channel. Bounds concurrent goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
 
-A wake over either limit is dropped with a log line, never queued — no backpressure state accumulates. The credential (`PYRYCODE_RELAY_FCM_CREDENTIALS`, a whole Google service-account JSON key) and the device token are never logged: a refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every *admitted* wake logs exactly one outcome line — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
+Burst capacity is maximum stored credit; sustained refill is one per 10s for
+each daemon/device and one per second globally, never six per 10s indefinitely.
+Admission charges all three allowances and reserves a slot atomically under
+one mutex. Rate, state-capacity and concurrency refusals spend nothing and
+queue nothing; dispatched failures remain charged. Completing sends frees
+slots without restoring tokens. Changing daemon identity or reconnecting
+cannot reset the device or global budget.
 
-**Residual risk:** The relay cannot verify a binary's claimed device token belongs to one of that binary's own phones — any binary that has claimed a server-id can ask the relay to wake an arbitrary FCM token. In enforce this requires a credential for that exact identity, including a stolen credential; off/observe retain anonymous push abuse. Admission authenticates the daemon identity, not ownership of the requested device token, and grants no Noise keys or phone authorization. The two limits bound the *rate* of abuse, not eliminate it: a single binary can still cause up to `pushWakeBurst` wakes per `pushWakeRefillEvery` window indefinitely. Because the wake carries no payload, the worst case is an app repeatedly reconnecting, not data exposure. The in-flight cap bounds concurrency relay-wide, not total throughput when many server-ids are claimed simultaneously — a set of colluding binaries, each under its own per-server-id bucket, can still saturate the 32-slot cap. Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` makes that saturation observable on `/metrics` instead of only in logs — see [Push wake dispatch § Metrics](knowledge/features/push-wake-dispatch.md#metrics).
+Daemon and device maps each retain at most 1,024 buckets with full 32-byte
+SHA-256 keys independent of input length, rather than raw tokens or truncated
+logging fingerprints. Five-minute idle expiry counts refused requests to
+existing keys as activity. Periodic sweeps or new-key admission reclaim only
+fully refilled idle buckets; capacity pressure never deletes debt. If a new
+key still cannot fit, it is refused, while existing keys remain usable within
+budget. All modes receive these single-process in-memory budgets; restart
+resets them. Multiple replicas would need shared accounting.
 
-**Future hardening:** A global wakes-per-second ceiling (distinct from the in-flight cap) if abuse across many server-ids is observed; telling the daemon a token is dead (currently out of scope — no retry, no dead-token callback, even though the relay can now tell a dead token apart from any other send failure via `ErrFCMUnregistered`, see [FCM push sender](knowledge/features/fcm-push-sender.md)).
+A refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every *admitted* wake logs exactly one outcome line — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
+
+**Residual risk:** Device-token ownership remains unverified. Enforce alone
+authenticates daemon identity, including a holder of a stolen credential;
+off/observe retain anonymous push abuse. Admission grants no Noise keys or
+phone authorization. A holder can still cause arbitrary devices to reconnect
+within the shared device/global budgets, and colluding holders can exhaust
+those budgets or the 32 slots, denying legitimate wakes. Because wakes carry
+no payload, this exposes no session data. Restart grants fresh credit, and
+the budgets are not shared across processes. Every rate, state-capacity or
+concurrency refusal increments
+`pyrycode_relay_push_wakes_total{outcome="dropped"}` exactly once; its five fixed
+labels carry no identities, tokens or fingerprints — see
+[push metrics](knowledge/features/push-wake-dispatch.md#metrics).
+
+**Future hardening:** Telling the daemon a token is dead remains out of scope
+(no dead-token callback, despite `ErrFCMUnregistered` distinguishing it — see
+[FCM push sender](knowledge/features/fcm-push-sender.md)). #173 owns later
+retry/coalescing behavior; retries must consume the same attempt budgets.
+Manual deployment and production admission activation remain
+[operator follow-ups](deploy.md#daemon-admission-activation); repository checks
+establish neither deployment nor live enforcement.
 
 ## DoS resistance — connection floods, slow-loris, fork-bomb retry
 
@@ -174,7 +210,7 @@ the loopback metrics server uses the same HTTP timeouts.
 
 Shutdown's ten-second HTTP/WebSocket drain is separate from complete process
 exit. Deferred cleanup then closes the upgrade limiter and cancels/joins push
-sends and shared authentication before closing the push limiter. The
+sends, shared authentication and the push accounting sweep. The
 [complete-process budget](knowledge/features/graceful-shutdown.md#contract)
 reserves 25s; Fly's explicit SIGTERM/30s allowance adds five seconds but is
 best-effort, not a guarantee. Local process regression proves cleanup joining

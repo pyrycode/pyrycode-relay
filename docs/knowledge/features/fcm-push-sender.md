@@ -5,8 +5,8 @@ backgrounded Android app by sending it a data-only FCM message. Introduced by
 \#132. #133 wires the daemon's `push_wake` routing envelope
 (`protocol-mobile.md` § `push_wake`) to `Send` and constructs the sender
 from `main` — see [Push wake dispatch](push-wake-dispatch.md) for the
-dispatch path (structural validation, per-server-id rate limit, relay-wide
-in-flight cap, async send off the binary read loop).
+dispatch path (structural validation, daemon/device/global attempt allowances,
+relay-wide in-flight cap, async send off the binary read loop).
 
 ## Why
 
@@ -220,9 +220,11 @@ residual-risk accounting.
 - APNs (iOS push).
 - Telling the daemon that a device token is dead (no retry, no dead-token
   callback).
-- A global wakes-per-second ceiling beyond the per-server-id rate and
-  relay-wide in-flight cap — see
-  [`docs/threat-model.md` § Outbound network calls](../../threat-model.md#outbound-network-calls--fcm-push-wake).
+
+Shared global/device attempt budgets are implemented by
+[`PushWaker`](push-wake-dispatch.md#allowances-and-concurrency-cap), alongside
+the daemon allowance and concurrency cap (#172). Later retries (#173) must
+consume those same budgets.
 
 ## Cross-links
 

@@ -342,8 +342,11 @@ Observability:
 ### Daemon admission activation
 
 **Pending operator work:** manual deployment, private provisioning, production
-mode activation and authorized/anonymous reconnect verification. Offline gates
-and merge do not establish live enforcement. Use the
+mode activation and authorized/anonymous reconnect verification. Repository
+checks and merge establish neither deployment nor live enforcement. Shared
+push attempt budgets (#172) apply in every admission mode once deployed; they
+do not activate enforce mode. Each relay restart resets the in-memory budgets.
+Use the
 [shared rollout contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#daemon-admission-declared)
 and preserve exactly one active relay through each restart.
 

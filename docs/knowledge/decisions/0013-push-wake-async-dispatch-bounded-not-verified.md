@@ -1,7 +1,8 @@
-# ADR-0013: Push wakes dispatch async off the read loop, bounded by two limits, token unverified
+# ADR-0013: Push wakes dispatch async off the read loop, bounded attempts, token unverified
 
-**Status:** Accepted (#133)
+**Status:** Accepted (#133), extended with shared allowances (#172)
 **Date:** 2026-09-24
+**Updated:** 2026-10-13
 
 ## Context
 
@@ -31,18 +32,32 @@ loop.
 
 Dispatch every admitted wake on its own goroutine ([`PushWaker.Request`](../features/push-wake-dispatch.md)),
 never blocking the binary read loop. Accept that the relay cannot verify a
-wake's token, and bound the resulting abuse surface with two independent,
-named limits instead of refusing the feature or adding token verification:
+wake's token, and bound the resulting abuse surface with three initially full
+attempt allowances and a separate concurrency cap:
 
-- **Per-server-id rate** (`pushWakeRefillEvery` / `pushWakeBurst`, an
-  `IPRateLimiter` keyed on server-id) — bounds how fast one binary can push
-  wakes at Google.
+- **Per-daemon allowance** (`pushWakeBurst` / `pushWakeRefillEvery`) — burst
+  6, refill one token per 10s, across all devices requested by that server-id.
+- **Per-device allowance** (`pushWakeDeviceBurst` / `pushWakeDeviceRefillEvery`)
+  — burst 6, refill one token per 10s, shared by all daemons requesting the
+  complete same device token.
+- **Global allowance** (`pushWakeGlobalBurst` / `pushWakeGlobalRefillEvery`)
+  — burst 32, refill one token per second, across all daemons and devices.
 - **Relay-wide in-flight cap** (`pushWakeMaxInFlight`, a buffered-channel
   semaphore) — bounds concurrent goroutines and outbound sockets across
   every binary regardless of how many server-ids they claim.
 
-A wake over either limit is dropped, never queued — no backpressure state
-accumulates under sustained abuse.
+Burst capacity is stored credit, distinct from sustained refill rate; refills
+stop at capacity. Under one `PushWaker` mutex, admission charges one token
+from each allowance and reserves a slot atomically. A rate, keyed-capacity or
+concurrency refusal spends nothing and queues nothing. A dispatched failure
+remains charged. Each daemon/device map is capped at 1,024 full SHA-256 keys;
+only fully refilled state idle for five minutes, counting refusals as
+activity, may be reclaimed by periodic sweep or new-key admission.
+
+These budgets apply in every admission mode, live in the single relay
+process's memory and reset on restart. Reconnects and identity churn cannot
+reset the shared device/global allowances. Only enforce authenticates daemon
+identity; device-token ownership remains unverified and wakes carry no payload.
 
 ## Rationale
 
@@ -53,12 +68,11 @@ accumulates under sustained abuse.
   the rate is an acceptable substitute for verifying the token rather than a
   stopgap. A future protocol change that lets the wake carry any payload
   would need to revisit this trade.
-- **Two limits, not one.** A single global cap alone would let one abusive
-  binary starve every other binary's wakes; a single per-server-id cap alone
-  would let a large-enough set of claimed server-ids collectively exhaust
-  relay goroutines. The per-server-id bucket bounds one actor's rate; the
-  in-flight cap bounds the relay's own resource consumption regardless of
-  how many actors are involved. Neither alone was sufficient.
+- **Separate attempt and concurrency bounds.** Completed sends free slots,
+  so concurrency alone cannot bound outgoing rate. Fresh identities receive
+  fresh daemon credit, so a daemon-only allowance cannot bound shared-device
+  pressure or aggregate throughput. Shared device/global allowances address
+  those paths, while the semaphore still bounds simultaneous send work.
 - **Drop, don't queue.** A bounded queue would still need its own size limit
   and would turn "the relay is under wake pressure" into growing memory
   instead of an immediate, logged refusal. Dropping keeps the failure mode
@@ -69,11 +83,13 @@ accumulates under sustained abuse.
   design exists to avoid. A goroutine-per-send bounded by a semaphore gets
   the same concurrency ceiling without a queue: `Request` either gets a slot
   immediately or is refused immediately.
-- **`IPRateLimiter` reused, not reimplemented.** The existing limiter
-  ([rate-limit middleware](../features/rate-limit-middleware.md), #47) is
-  already a generic string-keyed token bucket with bounded memory via
-  eviction. Server-id and IP are both just string keys to it — a second
-  instance, not a new type.
+- **Local atomic accounting.** Successive `IPRateLimiter.Allow` calls cannot
+  reserve three budgets and a slot atomically; an early charge would be lost
+  on a later refusal. Push uses local buckets, leaving the
+  [upgrade-path limiter](../features/rate-limit-middleware.md) unchanged.
+  Fixed-size complete-input digests bound key storage without conflating
+  tokens through their truncated log fingerprint. Full-refill-only eviction
+  prevents identity reuse or capacity pressure from deleting allowance debt.
 
 ## Consequences
 
@@ -82,17 +98,25 @@ accumulates under sustained abuse.
   Enforce excludes anonymous daemon-originated wakes, but admitted holders,
   including stolen-token holders, retain push abuse within their bound identity.
   Admission grants neither Noise keys nor phone authorization. A binary can
-  still cause up to `pushWakeBurst` wakes per
-  `pushWakeRefillEvery` window indefinitely, and a set of colluding binaries
-  can still collectively saturate `pushWakeMaxInFlight`.
+  still request arbitrary-device wakes within its daemon allowance and the
+  shared device/global budgets. Colluding holders can exhaust those budgets
+  or saturate the 32 slots, denying legitimate wakes. Restart grants fresh
+  credit; multiple replicas would need shared accounting.
 - Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` records
-  rate/cap refusals with fixed aggregate labels. This changes visibility,
-  not the decision or its limits; see [push metrics](../features/push-wake-dispatch.md#metrics).
+  refusals with fixed aggregate labels. Each rate, state-capacity or
+  concurrency refusal increments it exactly once; malformed and push-off
+  requests still count nothing. Labels contain no identities, device tokens
+  or fingerprints; errors remain static and token-free. See
+  [push metrics](../features/push-wake-dispatch.md#metrics).
+- Deployment from clean `main` and production admission activation remain
+  [manual operator follow-ups](../../deploy.md#daemon-admission-activation).
+  Repository checks establish neither deployment nor live enforcement.
+  Later retries (#173) must consume these same attempt budgets.
 - If a future ticket makes the wake payload-bearing, or adds a way to verify
   a token belongs to the claiming binary's own phones, this ADR's
   "acceptable because payload-free" rationale no longer holds and the
   decision should be revisited — the limits alone would no longer be
   sufficient reasoning to skip verification.
-- Establishes the "drop under either of two independently-scoped limits,
-  never queue" shape as available precedent for any future relay-originated
+- Establishes atomic admission across shared budgets and concurrency,
+  with immediate refusal and no queue, as precedent for future relay-originated
   outbound call triggered by untrusted-binary input.

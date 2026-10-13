@@ -45,9 +45,9 @@ The relay neither parses nor canonicalises the inner bytes; `env.Frame` is forwa
 
 ## `push_wake` handling
 
-A `push_wake` envelope addresses the relay itself, not a phone, so it never reaches the `PhonesFor` lookup. `StartBinaryForwarder` hands `env.PushWake` straight to `reg.pushWaker.Request(serverID, env.PushWake)` (`internal/relay/registry.go`'s `pushWaker` field, set once at boot via `SetPushWaker` — nil means push is off, same "optional collaborator" shape as `SetForwarderHooks`). See [Push wake dispatch](push-wake-dispatch.md) for what `Request` does: structural validation, a per-server-id rate limit, a relay-wide in-flight cap, and an async send off this loop so a blocking `FCMSender.Send` never stalls frame forwarding.
+A `push_wake` envelope addresses the relay itself, not a phone, so it never reaches the `PhonesFor` lookup. `StartBinaryForwarder` hands `env.PushWake` straight to `reg.pushWaker.Request(serverID, env.PushWake)` (`internal/relay/registry.go`'s `pushWaker` field, set once at boot via `SetPushWaker` — nil means push is off, same "optional collaborator" shape as `SetForwarderHooks`). See [Push wake dispatch](push-wake-dispatch.md) for what `Request` does: structural validation, atomic daemon/device/global attempt allowances and slot reservation, bounded keyed state, and an async send off this loop so a blocking `FCMSender.Send` never stalls frame forwarding.
 
-Every refusal — bad platform, empty token, malformed object, over either limit, or push off — comes back from `Request` as an error and is logged as a single line, same as any other per-frame drop:
+Every refusal — bad platform, empty token, malformed object, rate/state-capacity/concurrency limit, or push off — comes back from `Request` as an error and is logged as a single line, same as any other per-frame drop:
 
 ```go
 if err := reg.pushWaker.Request(serverID, env.PushWake); err != nil {
