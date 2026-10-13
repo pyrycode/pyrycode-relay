@@ -37,6 +37,28 @@ Scanner jobs retain `contents: read`; `issues: write` belongs only to
 `file-issue`. Explicit expiry, rotation and the initial live access check are
 operator-owned in [the bootstrap runbook](deploy.md#daily-security-scan-credential).
 
+The standalone [restart watcher](deploy.md#restart-incident-monitoring) (#198)
+adds an operational outbound boundary on pyrybox: one read-only GET to the
+selected Machine at fixed `api.machines.dev`, then a trusted assistant-channel
+notification command. The dedicated local token is expiring and org-scoped,
+including read access to other apps; it is separate from CI and deploy credentials.
+Requests use TLS with no redirects/retries, 10s socket/20s request deadlines
+and a 1 MiB cap. Operator argv receives a generated `0600` message file,
+never Fly-derived command text, and runs without a shell for at most 15s with
+an allowlisted environment excluding the Fly credential and discarded output.
+
+Private configuration/token/state files require current-UID ownership and
+`0600`; the state directory requires `0700`. Final-component symlinks and
+insecure existing storage are rejected. A nonblocking lock serializes polls,
+and state replacement uses file/directory fsync. API input is projected to
+validated lifecycle evidence; duplicates must agree on full flags/codes and
+exit time across polls, and history overlap must also satisfy platform-time
+coverage. Conflicting or incomplete evidence fails monitoring rather than
+fabricating an incident or recovery. Version 2 state validates this evidence;
+incomplete version 1 is rejected unchanged. The relay has no new payload
+access, public endpoint or deployment target, and its content blindness and
+runtime statelessness are unchanged.
+
 **Residual risk:** If the VPS is rooted, every byte through the relay is exposed: TLS terminates here, so plaintext frames are recoverable from process memory. This is the operator-side framing of the protocol spec's "relay operator MITM" threat — same plaintext exposure, different actor.
 
 A compromised CI discovery/download step could expose the read-only credential
@@ -47,6 +69,15 @@ cannot establish that a patch shipped. The
 [deployed-image result](knowledge/features/docker-image.md#deployed-image-scanning)
 describes the digest at its observation time, and may be stale after a later
 deploy.
+
+Compromise of pyrybox or its scheduler UID could expose the watcher's org-wide
+read credential, alter operational state or control trusted notification argv;
+owner-only storage does not protect against that UID. Token expiry, API history
+truncation, missed polls or channel failure can leave monitoring/delivery
+unavailable. A send followed by interruption before the delivery-state save
+can repeat a notice. The operator owns credential rotation and scheduler
+failure visibility; [installation and delivered verification](deploy.md#restart-incident-response)
+remain pending. The watcher cannot mutate Fly resources or authorize remediation.
 
 **Future hardening:** A documented deploy runbook; a per-operator SSH-key inventory; `fail2ban` (or equivalent) on the SSH port; a host-based IDS once user count justifies the operational cost.
 
@@ -197,6 +228,17 @@ paying user.
 
 Log retention and rotation are operator-owned. The relay writes only to stderr; on a typical deployment the systemd journal or a `logrotate`-managed flat file owns rotation.
 
+The operational watcher has a separate output contract: notifications contain
+only validated app/Machine identity, UTC observation/window, reason/count and
+Pyry's response ownership. Failures exit `2` with the fixed diagnostic
+`relay monitoring failure; incident delivery or monitoring coverage unavailable`.
+No credentials, relay payloads, raw API configuration or remote/subprocess
+error text enter messages or diagnostics; child stdout/stderr is discarded.
+Private state retains normalized lifecycle evidence, not API configuration.
+Operators must keep scheduler diagnostics visible and distinguish monitoring
+failures from relay incidents without publishing raw responses or secret files.
+No new relay logger keys are introduced.
+
 **Residual risk:** A future contributor adds a debug log statement that prints a payload body or token. Code review and the acceptance criteria of any frame-forwarding ticket are the first line of defence; runtime redaction is not built.
 
 **Future hardening:** A `slog` middleware that redacts known sensitive keys structurally, so the rule is enforced by code rather than vigilance.
@@ -242,6 +284,11 @@ This document must be revisited when any of the following occurs:
 - The deploy target changes (new VPS provider, container platform, managed Kubernetes).
 - A new public endpoint is exposed (any new path under `/v1/*` or otherwise).
 - A new outbound network call is added — the relay itself originates a request, rather than only serving one. First tripped by [Outbound network calls — FCM push wake](#outbound-network-calls--fcm-push-wake) (#133).
+- An operational tool gains a network/notification boundary, broader credential
+  scope, new storage or lifecycle-evidence semantics. The #198 pyrybox Fly GET
+  and assistant-channel boundary is reviewed in [Deploy security](#deploy-security--vps-compromise)
+  and [Log hygiene](#log-hygiene--what-must-not-be-logged); changing its fixed
+  host, trusted argv, environment isolation or private-state contract requires re-review.
 - A security incident occurs — any unexpected behaviour with security implications, even if no compromise is confirmed.
 
 ## Out of scope
