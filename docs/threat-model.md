@@ -37,6 +37,28 @@ Scanner jobs retain `contents: read`; `issues: write` belongs only to
 `file-issue`. Explicit expiry, rotation and the initial live access check are
 operator-owned in [the bootstrap runbook](deploy.md#daily-security-scan-credential).
 
+The standalone [restart watcher](deploy.md#restart-incident-monitoring) (#198)
+adds an operational outbound boundary on pyrybox: one read-only GET to the
+selected Machine at fixed `api.machines.dev`, then a trusted assistant-channel
+notification command. The dedicated local token is expiring and org-scoped,
+including read access to other apps; it is separate from CI and deploy credentials.
+Requests use TLS with no redirects/retries, 10s socket/20s request deadlines
+and a 1 MiB cap. Operator argv receives a generated `0600` message file,
+never Fly-derived command text, and runs without a shell for at most 15s with
+an allowlisted environment excluding the Fly credential and discarded output.
+
+Private configuration/token/state files require current-UID ownership and
+`0600`; the state directory requires `0700`. Final-component symlinks and
+insecure existing storage are rejected. A nonblocking lock serializes polls,
+and state replacement uses file/directory fsync. API input is projected to
+validated lifecycle evidence; duplicates must agree on full flags/codes and
+exit time across polls, and history overlap must also satisfy platform-time
+coverage. Conflicting or incomplete evidence fails monitoring rather than
+fabricating an incident or recovery. Version 2 state validates this evidence;
+incomplete version 1 is rejected unchanged. The relay has no new payload
+access, public endpoint or deployment target, and its content blindness and
+runtime statelessness are unchanged.
+
 **Residual risk:** If the VPS is rooted, every byte through the relay is exposed: TLS terminates here, so plaintext frames are recoverable from process memory. This is the operator-side framing of the protocol spec's "relay operator MITM" threat — same plaintext exposure, different actor.
 
 A compromised CI discovery/download step could expose the read-only credential
@@ -47,6 +69,15 @@ cannot establish that a patch shipped. The
 [deployed-image result](knowledge/features/docker-image.md#deployed-image-scanning)
 describes the digest at its observation time, and may be stale after a later
 deploy.
+
+Compromise of pyrybox or its scheduler UID could expose the watcher's org-wide
+read credential, alter operational state or control trusted notification argv;
+owner-only storage does not protect against that UID. Token expiry, API history
+truncation, missed polls or channel failure can leave monitoring/delivery
+unavailable. A send followed by interruption before the delivery-state save
+can repeat a notice. The operator owns credential rotation and scheduler
+failure visibility; [installation and delivered verification](deploy.md#restart-incident-response)
+remain pending. The watcher cannot mutate Fly resources or authorize remediation.
 
 **Future hardening:** A documented deploy runbook; a per-operator SSH-key inventory; `fail2ban` (or equivalent) on the SSH port; a host-based IDS once user count justifies the operational cost.
 
@@ -119,6 +150,15 @@ Stalled phases retain their respective deadlines: PROXY header parsing 5s
 server timeouts), and HTTP headers 5s (`ReadHeaderTimeout`). All public
 servers retain `ReadTimeout: 60s`, `WriteTimeout: 60s`, `IdleTimeout: 120s`;
 the loopback metrics server uses the same HTTP timeouts.
+
+Shutdown's ten-second HTTP/WebSocket drain is separate from complete process
+exit. Deferred cleanup then closes the upgrade limiter and cancels/joins push
+sends and shared authentication before closing the push limiter. The
+[complete-process budget](knowledge/features/graceful-shutdown.md#contract)
+reserves 25s; Fly's explicit SIGTERM/30s allowance adds five seconds but is
+best-effort, not a guarantee. Local process regression proves cleanup joining
+under held synthetic authentication; [isolated Fly validation](deploy.md#complete-process-shutdown)
+remains pending.
 
 After `websocket.Accept` hijacks the connection, post-upgrade slow peers are bounded by three complementary mechanisms: a per-message read deadline armed the moment a message's first data-frame header arrives (`internal/relay/ws_conn.go`'s `readMessageTimeout`, 30s — [WSConn adapter](knowledge/features/ws-conn-adapter.md), #111), the write timeout on `Send` (`writeTimeout`, 10s, #15), and the heartbeat ping/pong for idle liveness (#7). The read deadline never bounds the idle gap before a message starts — a peer may sit silent indefinitely between messages — only the time to receive one once it begins, so a peer that dribbles a started message one byte at a time while still answering pings is cut off within the deadline instead of pinning the connection forever. A per-IP token-bucket rate limit fronts the `/v1/server` and `/v1/client` upgrade paths (`cmd/pyrycode-relay/main.go` policy block, `internal/relay/ratelimit_middleware.go`): ~10 attempts/IP/minute steady-state, burst 20, eviction sweep every 5 minutes. Over-cap attempts receive `429 Too Many Requests` before `websocket.Accept` runs; the wrapped registry is never touched on a deny. The middleware extracts the source IP via `relay.ClientIP`, which reads `r.RemoteAddr`; `X-Forwarded-For` is honoured only when the operator opts in with `--trust-x-forwarded-for` (default `false`). In production, `RemoteAddr` on the HTTPS listener is no longer the raw socket peer: Fly's raw-TCP services hand the relay Fly's own edge-proxy address, so since [#110](knowledge/codebase/110.md) the `443` port runs `--https-proxy-protocol` ([PROXY protocol listener](knowledge/features/proxy-protocol-listener.md)), which requires and parses a Fly `proxy_proto` v2 header before the TLS handshake and rewrites `RemoteAddr` to the header's source — the per-IP key the rate limiter reads is the client's real address, not Fly's. `/healthz` bypasses upgrade-rate and upgraded-session limits, but still needs a raw listener slot. Bandwidth amplification is structurally absent: the relay forwards 1:1, so there is no amplification factor an attacker can lever. A conflicting `/v1/server` claim now probes the incumbent binary for liveness before displacing it ([`/v1/server` § conflict probe](knowledge/features/server-endpoint.md), #112); the probe costs one ping frame per upgrade attempt and holds one handler goroutine for at most `conflictProbeTimeout` (10s) — no worse than the pre-#112 upgraded-then-closed conflict, and no amplification (one claim, one ping). Since [#113](knowledge/codebase/113.md), delivering a routed frame to a phone no longer runs on the binary forwarder's read loop at all: each phone is registered behind a bounded [per-phone delivery queue](knowledge/features/phone-outbox.md), and the forwarder only enqueues — an operation that never blocks. A stalled phone can therefore no longer hold up the binary's `Read`, its sibling phones, or the binary's own pong processing; it is bounded first by the queue filling and then by `WSConn.Send`'s 10s write deadline, and is closed with `1011` either way. The queue was originally bound by frame count (16 deep); since [#154](knowledge/codebase/154.md) it is bound by bytes instead (`phoneOutboxBudget` = 4 MiB, charging each item's frame length plus a fixed per-item overhead, including the frame currently being written), because a daemon holding a dozen or more sessions can legitimately send well over 16 small frames back to back right after the handshake — a burst the frame-count bound mistook for a stalled phone and closed with `1011`. The 4 MiB-per-phone / 64 MiB-per-server-id worst case is unchanged.
 
@@ -197,6 +237,17 @@ paying user.
 
 Log retention and rotation are operator-owned. The relay writes only to stderr; on a typical deployment the systemd journal or a `logrotate`-managed flat file owns rotation.
 
+The operational watcher has a separate output contract: notifications contain
+only validated app/Machine identity, UTC observation/window, reason/count and
+Pyry's response ownership. Failures exit `2` with the fixed diagnostic
+`relay monitoring failure; incident delivery or monitoring coverage unavailable`.
+No credentials, relay payloads, raw API configuration or remote/subprocess
+error text enter messages or diagnostics; child stdout/stderr is discarded.
+Private state retains normalized lifecycle evidence, not API configuration.
+Operators must keep scheduler diagnostics visible and distinguish monitoring
+failures from relay incidents without publishing raw responses or secret files.
+No new relay logger keys are introduced.
+
 **Residual risk:** A future contributor adds a debug log statement that prints a payload body or token. Code review and the acceptance criteria of any frame-forwarding ticket are the first line of defence; runtime redaction is not built.
 
 **Future hardening:** A `slog` middleware that redacts known sensitive keys structurally, so the rule is enforced by code rather than vigilance.
@@ -205,7 +256,20 @@ Log retention and rotation are operator-owned. The relay writes only to stderr; 
 
 **Severity:** `high`.
 
-**v1 mitigation:** `internal/relay/tls.go:16-55` enforces `0700` on the cache directory at startup. If the directory exists with permissions broader than `0700` — any group or world bit set — `NewAutocertManager` returns `ErrCacheDirInsecure` and the process refuses to start. This is the project's loud-failure pattern (`docs/PROJECT-MEMORY.md`): refuse rather than re-chmod and continue. The default location is `~/.pyrycode-relay/certs` (`cmd/pyrycode-relay/main.go:111-116`). Key rotation is handled by autocert: Let's Encrypt issues 90-day certificates and autocert renews at roughly 30 days remaining.
+**v1 mitigation:** `NewAutocertManager` enforces `0700` on the cache directory
+at startup. A broader existing mode is tightened only when the owner is the
+relay's own effective UID; a foreign or undiscoverable owner causes
+`ErrCacheDirInsecure` and startup refusal. The default cache is
+`~/.pyrycode-relay/certs`; Fly explicitly mounts it at `/var/lib/relay/autocert`.
+Key rotation is handled by autocert: Let's Encrypt issues 90-day certificates
+and autocert renews at roughly 30 days remaining.
+
+[Certificate snapshot recovery](deploy.md#certificate-snapshot-recovery)
+requires operator-local Fly access and a current snapshot restored to a new
+encrypted isolated volume. Preserve cache ownership/permissions, disclose no
+private keys and never mount over the live volume. Snapshots also contain
+keys; successful access, isolated recovery and elapsed-time evidence remain
+pending operator follow-up.
 
 **Residual risk:** If a separate process running as the relay's UID is compromised, it can read the cache and exfiltrate the private key. The `0700` check defends against other UIDs on the same host, not against same-UID compromise.
 
@@ -242,6 +306,11 @@ This document must be revisited when any of the following occurs:
 - The deploy target changes (new VPS provider, container platform, managed Kubernetes).
 - A new public endpoint is exposed (any new path under `/v1/*` or otherwise).
 - A new outbound network call is added — the relay itself originates a request, rather than only serving one. First tripped by [Outbound network calls — FCM push wake](#outbound-network-calls--fcm-push-wake) (#133).
+- An operational tool gains a network/notification boundary, broader credential
+  scope, new storage or lifecycle-evidence semantics. The #198 pyrybox Fly GET
+  and assistant-channel boundary is reviewed in [Deploy security](#deploy-security--vps-compromise)
+  and [Log hygiene](#log-hygiene--what-must-not-be-logged); changing its fixed
+  host, trusted argv, environment isolation or private-state contract requires re-review.
 - A security incident occurs — any unexpected behaviour with security implications, even if no compromise is confirmed.
 
 ## Out of scope

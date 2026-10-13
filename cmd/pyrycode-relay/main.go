@@ -85,6 +85,13 @@ const defaultMaxListenerConnections = 32
 // Version is overridden at build time via -ldflags.
 var Version = "dev"
 
+// Boot factories retain production construction; the process shutdown
+// regression wraps them in its isolated child to observe cleanup after run.
+var (
+	newPushWakerFromEnv = relay.NewPushWakerFromEnv
+	newMetricsRegistry  = relay.NewMetricsRegistry
+)
+
 func main() {
 	os.Exit(run(os.Args[1:], signalContextFor(syscall.SIGTERM, syscall.SIGINT)))
 }
@@ -273,7 +280,7 @@ func run(args []string, sigCtx context.Context) int {
 	// Push is optional: unset PYRYCODE_RELAY_FCM_CREDENTIALS means the relay
 	// drops every push_wake. CheckEnvConfig has already rejected an unusable
 	// value, so an error here is unexpected and fails loud.
-	pushWaker, err := relay.NewPushWakerFromEnv(os.LookupEnv, logger)
+	pushWaker, err := newPushWakerFromEnv(os.LookupEnv, logger)
 	if err != nil {
 		logger.Error("refusing to start: cannot build the FCM push sender", "err", err)
 		return 2
@@ -285,7 +292,7 @@ func run(args []string, sigCtx context.Context) int {
 		defer pushWaker.Close()
 	}
 
-	metricsReg := relay.NewMetricsRegistry()
+	metricsReg := newMetricsRegistry()
 	relay.NewConnectionsMetrics(metricsReg, reg)
 	relay.NewForwardMetrics(metricsReg, reg)
 	relay.NewGraceMetrics(metricsReg, reg)

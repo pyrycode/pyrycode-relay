@@ -120,6 +120,11 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    refuses to boot. See
    [`docs/architecture.md` § *The `PYRYCODE_RELAY_SINGLE_INSTANCE` bypass*](architecture.md#the-pyrycode_relay_single_instance-bypass)
    for the rationale.
+   The assertion does not count Machines. Disabled autostart prevents
+   automatic starts, not creation; these settings enforce no maximum of one.
+   Verify actual inventory with `flyctl machine list -a pyrycode-relay`
+   before and after rehearsals and production activation, preserving exactly
+   one active relay.
 2. **`processes = ["app"]` on each `[[services]]` block.** Fly's schema
    requires every service to name its process whenever `[processes]` is
    defined, and `[processes]` is always defined here because the
@@ -230,6 +235,19 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    policy or live recovery. Complete the operator checks below before
    production deployment.
 
+8. **Explicit complete-process stop allowance.** Top-level
+   `kill_signal = "SIGTERM"` and integer `kill_timeout = 30` (#200) allow
+   five seconds above the conservative 25-second process budget: 10s for
+   `runServers`' HTTP/WebSocket drain, 10s for subsequent concurrent push
+   cancellation/authentication join, and 5s for local limiter joins,
+   scheduling and exit. The ten-second drain alone does not cover deferred
+   cleanup. Neither the measured fast regression exit nor the two-second
+   push unit-test assertion replaces that budget. No production deadline
+   changed. Fly's [stop allowance](https://docs.fly.io/reference/configuration/#runtime-options)
+   is best-effort (maximum 300s); shorter stopping times remain possible.
+   Recheck the full call path and retain at least five seconds of margin
+   when changing shutdown behavior. See [graceful shutdown](knowledge/features/graceful-shutdown.md#contract).
+
 ## Steady-state flow
 
 Deploys are **operator-direct from a clean `main`** since 2026-05-24,
@@ -250,7 +268,13 @@ auto-deploys on push.
 2. From a clean local checkout of `main`, run `make check` for the
    final pre-deploy gate. Tag the commit and push the tag
    (`git tag -a vX.Y.Z -m "pyrycode-relay vX.Y.Z" && git push origin
-   vX.Y.Z`), then deploy with the tag stamped into the binary:
+   vX.Y.Z`). Before deploying, register a finite UTC planned-release
+   interval in the watcher's `maintenance` configuration, covering the
+   intended release window; see [Restart incident monitoring](#restart-incident-monitoring).
+   This suppresses stopped-state notices only during that interval;
+   unexpected automatic restarts still count and report. Installation and
+   delivered verification remain pending until the checklist below is complete.
+   Then deploy with the tag stamped into the binary:
    `flyctl deploy --remote-only -a pyrycode-relay --build-arg
    VERSION=vX.Y.Z`. Without `--build-arg` the image falls back to
    `VERSION=dev` and the running relay cannot say which build it is.
@@ -285,8 +309,224 @@ Observability:
 - `flyctl logs -a pyrycode-relay` — relay stderr in real time.
 - Local deploy output records the build + roll progress (the GHA
   Actions log no longer exists for deploys).
+- The [restart watcher](#restart-incident-monitoring), once installed and
+  verified, reports lifecycle incidents to Pyry; scheduler diagnostics
+  identify monitoring or delivery failures separately.
+
+## Restart incident monitoring
+
+[`operations/relay_health.py`](../operations/relay_health.py) is a standalone
+standard-library Python tool (#198). Each invocation polls one explicitly
+selected Fly app/Machine and exits; the operator owns installation, scheduling,
+credential rotation and delivery. It stores operational history outside the
+relay process. [#170](https://github.com/pyrycode/pyrycode-relay/issues/170)
+owns secure-exchange, certificate, capacity and push-outcome monitoring.
+
+Install the reviewed `operations/relay_health.py` under
+`/home/pyry/pyry-workspace/crons/relay-health/` on pyrybox. Use a directory owned
+by the scheduler's UID with mode `0700`; keep `config.json`, `fly-readonly.token`
+and state files at `0600`, with a `0700` state directory. The tool requires
+current-UID ownership, exact modes and no final-component symlinks for private
+inputs/storage, and refuses insecure existing files rather than repairing them.
+Keep parent directories and the script under trusted operator control.
+
+Provision a **dedicated expiring org-scoped read-only token**, separate from
+deploy credentials and the CI scan secret:
+
+```sh
+flyctl tokens create readonly --org <owning-org> --name relay-health --expiry <duration>
+```
+
+Choose a finite duration, record expiry and arrange rotation before it. Store
+the value only in the private local token file, never in config, cron arguments,
+logs, GitHub or relay runtime secrets. Its read scope includes other apps and
+resources in the organization; selecting one Machine does not narrow that scope.
+Rotate by provisioning another read-only token, replacing the private file,
+verifying access and revoking the old token through the operator's Fly login.
+Expired/failed authentication is a monitoring failure; never substitute a deploy
+or personal token. See [Fly token provisioning](#daily-security-scan-credential).
+
+Example private `config.json` (confirm the Machine against current inventory):
+
+```json
+{
+  "app": "pyrycode-relay",
+  "machine": "7817426a000438",
+  "state_dir": "/home/pyry/pyry-workspace/crons/relay-health/state",
+  "token_file": "/home/pyry/pyry-workspace/crons/relay-health/fly-readonly.token",
+  "notify": ["pyry", "channel", "post", "--name", "Pyrybox board watch", "--file", "{message_file}"]
+}
+```
+
+The Machine above was observed started in `arn` on 2026-10-13; it is historical
+inventory, not automatic discovery. Select the actual Machine explicitly, not
+one distinct image digest. After replacement, update `machine` and verify the
+new identity and access. State is scoped to `<app>-<machine>.json`; retain the
+old Machine's evidence separately. A new scope starts with the current
+ten-minute window and does not inherit the old incident or recovery progress.
+Verify actual production inventory and preserve exactly one active relay.
+
+Run once per minute as that UID, with a verified Python 3 interpreter and
+`PATH`/`HOME` suitable for the existing assistant-channel command. For example,
+the operator's crontab can use:
+
+```cron
+* * * * * /usr/bin/python3 -B /home/pyry/pyry-workspace/crons/relay-health/relay_health.py /home/pyry/pyry-workspace/crons/relay-health/config.json
+```
+
+Arrange visibility of scheduler exit status and stderr; a silent scheduler
+cannot establish monitoring coverage. A nonblocking directory lock covers
+load, poll, notification and save; overlapping invocations fail safely.
+`notify` is trusted argv, executed without a shell, with exactly one standalone
+`{message_file}` argument. It configures
+`pyry channel post --name "Pyrybox board watch" --file <message-file>`.
+The watcher creates a `0600` message file in the private state directory and
+removes it after the command returns or fails. The child has a 15s timeout,
+discarded stdout/stderr and only `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL` from
+the environment; it receives no Fly credential. Verify channel access under
+this scheduler environment. Messages name app/Machine, UTC observation/window,
+reason, automatic restart count and Pyry as response owner.
+
+### Incident and recovery semantics
+
+Five distinct automatic exits in `(observation UTC minus ten minutes,
+observation UTC]` latch an incident; a valid `stopped` observation outside
+maintenance also latches one. Only normalized `exit` evidence with
+`restarting: true` and `requested_stop: false` counts. Omitted booleans default
+to false and omitted exit/signal codes to zero. Four exits, older exits, first
+boot and ordinary `started` observations do not trigger an incident.
+
+Both `request.exit_event` and `request.MonitorEvent.exit_event` normalize to
+the same evidence. Identity uses nanosecond `exited_at`; window counting uses
+its millisecond time, so late retrieval uses exit time rather than retrieval
+time. Duplicate/out-of-order wrappers and repeated polls count that exit once.
+Duplicates must agree on normalized exit time, `restarting`, `requested_stop`,
+`oom_killed`, `exit_code`, `guest_exit_code`, `guest_signal` and `signal`, including
+across saved polls. Conflicting evidence fails monitoring even if both records
+derive the same crash classification.
+
+For a planned release, add optional `maintenance` with finite UTC `start` and
+`end` strings ending in `Z`, for example
+`{"start":"2026-10-13T18:00:00Z","end":"2026-10-13T18:15:00Z"}`; replace these
+example times with the actual window and require `start < end`. Suppression is
+start-inclusive/end-exclusive and applies only to stopped observations while
+active. Requested stops never count as automatic crashes; unrequested automatic
+restarts still count during maintenance. Expiry cannot suppress a later stopped
+observation. Omit `maintenance` when no interval is needed.
+
+Version **2** state persists normalized evidence, proven coverage, the last
+successful observation, recovery progress and incident/delivery state through
+atomic replacement with file/directory fsync. Version 1 lacks the required
+evidence and is rejected unchanged; there is no automatic migration. Investigate
+incompatible state without discarding an ongoing incident's evidence.
+The incident is saved before notification. Failed delivery remains pending and
+is retried on a later valid poll, even after the Machine recovers. Once sending
+and saving `delivered` both succeed, the ongoing incident sends no further notice,
+including a restart-to-stopped transition. Interruption between send and durable
+save can cause a repeat delivery.
+
+Rearm requires ten continuous minutes of successful observations showing
+`started` with fewer than five current-window automatic exits, after delivery.
+A failed poll, nonhealthy observation, duplicate observation time or gap greater
+than 90s interrupts recovery; pending delivery cannot be cleared by recovery.
+A later incident after rearming gets a new notice.
+
+### Coverage, bounds and local checks
+
+Each poll makes exactly one read-only HTTPS GET to the selected Machine at
+`api.machines.dev`, with no redirects or retries, a 10s socket timeout, 20s
+request deadline and 1 MiB response cap. Local input/state sizes and event rows
+are bounded too. The tool does not paginate history or remediate production.
+History must reach the window boundary, retain a launch covering a newly
+created Machine's lifetime, or overlap previously proven persisted coverage.
+Persisted overlap additionally requires the earliest incoming platform timestamp
+to reach the prior successful observation. A duplicate exit with a later wrapper
+timestamp cannot bridge a history gap; a local marker is not a pagination cursor.
+
+Authentication, API, schema, conflicting evidence, incomplete history, clock
+rollback, private-storage and delivery failures exit `2` with only
+`relay monitoring failure; incident delivery or monitoring coverage unavailable`.
+This is distinct from a relay incident, not proof of a crash or healthy recovery.
+Polling failures preserve prior history and incident/delivery state and reset
+recovery where safely writable; incompatible state remains unchanged. Messages
+and diagnostics exclude credentials, relay payloads, raw API configuration and
+remote/subprocess error text. Absence of an alert proves neither delivery nor
+healthy coverage.
+
+From the repository root, run the offline hermetic check:
+
+```sh
+python3 -B -m unittest discover -s operations -p 'test_relay_health.py'
+```
+
+It uses controlled UTC time, fake API/notification behavior and temporary private
+storage, with no Fly access or real posts. `make check` remains the Go gate.
+
+## Restart incident response
+
+Pyry receives notices in **Pyrybox board watch**, investigates read-only and
+escalates to Juhana when operator action is needed. Compare the notice's UTC
+observation/window and app/Machine with current read-only lifecycle observations;
+check requested-stop evidence, maintenance, repeated exits and stopped state.
+Record non-secret event references, current state and delivery time, and distinguish
+a monitoring-failure diagnostic from a confirmed relay incident. For monitoring
+failures, inspect scheduler execution, private-file access, credential expiry,
+API/history coverage and channel access without copying tokens or raw error text
+into the channel. A pending notification needs successful delivery, not a state reset.
+
+Escalation should give Juhana the identity, times, restart count/state, safe evidence
+and the operator action needed. Monitoring grants no production mutation authority;
+restart, stop, deploy, scaling or volume recovery requires separate operator
+authorization. Follow [App restart recovery](#app-restart-recovery) and the
+[#197 recovery/stop and certificate-snapshot handoff](https://github.com/pyrycode/pyrycode-relay/issues/197#issuecomment-6148485681).
+Its complete-shutdown and certificate-snapshot procedures are owned by
+[#200](https://github.com/pyrycode/pyrycode-relay/issues/200); use those procedures
+when available rather than improvising recovery or restoring over the live cache.
+
+All #198 operator follow-ups remain **pending**; merge and hermetic tests complete none:
+
+- [ ] Install/configure the private pyrybox home/state, expiring read-only credential,
+  actual Machine identity, one-minute schedule and assistant-channel command.
+- [ ] In isolation, deliver five-unplanned-restart and stopped-state notices to
+  **Pyrybox board watch**. Record planned-release exclusion, repeated-poll/watcher-restart
+  deduplication and later-incident rearming, with delivery UTC and non-secret
+  app/Machine/event references.
+- [ ] Verify monitoring failures are distinguishable, Pyry's read-only response is
+  usable and escalation reaches Juhana; remediation needs separate authorization.
+- [ ] Activate production monitoring only after delivered verification and read-only
+  access/current inventory evidence. Coordinate with #197's recovery work and
+  preserve exactly one active production relay; keep rehearsals isolated.
 
 ## Verify a deploy
+
+### Complete-process shutdown
+
+The #200 operator checklist remains **pending**; local tests and merge
+complete none of these operational checkboxes. Use an isolated Fly
+deployment with separate domains, clients and synthetic credentials, and
+never route rehearsal traffic through production.
+
+- [ ] Under admitted binary/phone traffic and held synthetic authentication,
+  send real SIGTERM. Record both peers' close codes (1001), whole-process
+  exit time, authentication cancellation time, one OAuth/no FCM request,
+  six `token_fetch_failed` outcomes and joined authentication cleanup.
+  Inspect `flyctl machine status <machine-id> -d -a <isolated-app>` for
+  effective `config.kill_signal`, `config.kill_timeout` and `app` restart
+  policy, and compare the observed lifecycle to the 25s budget/30s allowance.
+  Socket cancellation alone is insufficient evidence of cleanup completion.
+- [ ] Discover a current certificate snapshot and restore to a new encrypted
+  isolated volume using [Certificate snapshot recovery](#certificate-snapshot-recovery).
+  Record access, source/snapshot/destination IDs, steps, successful cache
+  recovery without key disclosure and elapsed recovery time.
+- [ ] Before and after both rehearsals and production activation, record actual
+  production Machine inventory (`flyctl machine list -a pyrycode-relay`),
+  IDs and states; preserve exactly one active production relay.
+- [ ] After isolated shutdown and [#199's eleven-crash recovery checks](#app-restart-recovery)
+  pass, deploy from clean `main` using the [steady-state flow](#steady-state-flow).
+  Verify the production Machine's effective `app`/`always` restart policy,
+  SIGTERM/30s stop settings and image digest; retain UTC observations and
+  results. Capture the prior immutable image for [rollback](#rollback).
+  Alert installation/delivery remains [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
 
 ### App restart recovery
 
@@ -310,7 +550,8 @@ deploy the intended image and manifest before testing recovery:
   Retain UTC timestamps, Machine ID, image digest, effective config and
   exit/restart events alongside the recovery observations.
 
-After these checks pass, manually deploy from clean `main` using the
+After these recovery checks and the [isolated shutdown check](#complete-process-shutdown)
+pass, manually deploy from clean `main` using the
 [steady-state flow](#steady-state-flow). Preserve exactly one active
 production relay throughout recovery and deployment; do not add a production
 replica for testing. Re-read the production Machine's effective restart
@@ -429,17 +670,21 @@ through the daemon's backoff ladder — measured at 13 s for two binaries on
 
 ## Rollback
 
-Two paths, in increasing order of disruption.
+Before activation, capture the currently running immutable image digest
+from the Machine's detailed status and retain it with the release evidence.
+The #200 inventory observed this rollback target; refresh it if the running
+image has changed:
 
-1. **By image digest (preferred).** `flyctl releases list -a
-   pyrycode-relay` shows recent release digests. `flyctl deploy --image
-   <prior-digest> --remote-only -a pyrycode-relay` pins to the prior
-   image without rebuilding. The autocert cache persists across
-   rollbacks (it's on the volume), so no Let's Encrypt re-issuance is
-   triggered.
-2. **By release number.** `flyctl releases rollback -a pyrycode-relay`
-   rolls back the *most recent* release. Use when the prior release's
-   digest isn't to hand and a rollback is needed immediately.
+```text
+registry.fly.io/pyrycode-relay@sha256:cf2f4d979e111157ca776f771bcd2df0ea1ff7cac24a355763047249d9cde241
+```
+
+Roll back with `flyctl deploy --image <previous-immutable-image-digest>
+--remote-only -a pyrycode-relay`. This pins the previous artifact without
+rebuilding. The autocert cache persists on its volume across image rollbacks.
+Retain the explicit SIGTERM/30s settings and #199's `app`/`always` restart
+policy, verify their effective Machine values and image after rollback,
+and record actual inventory with exactly one active relay.
 
 A rollback does **not** revert the `main` commit. Because deploys are
 operator-direct, there is no auto-deploy that would re-roll a broken
@@ -447,8 +692,9 @@ release forward — but the next manual `flyctl deploy --remote-only`
 WILL rebuild from `main`'s current HEAD. Revert the offending PR on
 `main` before the next deploy, or you'll re-ship the bad change.
 
-Both rollback paths redeploy the image only — they do **not** touch the
-checked-in `fly.toml`. A rollback to a pre-#110 image while the manifest
+An image rollback does **not** edit the checked-in `fly.toml`; review its
+compatibility with the selected image. A rollback to a pre-#110 image while
+the manifest
 still carries `handlers = ["proxy_proto"]` on `443` fails `443` closed (the
 older binary has no `--https-proxy-protocol` flag and never opens the
 proxyproto-wrapped listener, so the PROXY header hits its TLS handshake as
@@ -465,3 +711,47 @@ The production manifest selects 64 total live WebSocket connections, 48 per sour
 The operator has kept the production allocation at 256 MiB. These higher allowances give normal live suites room to connect, but do not guarantee that fully occupied connections with full queues fit in that allocation. The selected later allocation is 1024 MiB. The existing conservative budget estimates 4.4 MiB per upgraded session and 128 KiB per raw slot. Charging both full listeners and all upgraded sessions, then allowing twice that live state for garbage collection and the 56 MiB runtime reserve, gives about 684 MiB. The later allocation is a sizing plan, not a completed resize or an unbounded-load guarantee.
 
 Validate changed limits with isolated concurrent fixtures before deployment. Confirm the deployed command, memory, both Fly listener limits and a single active machine after deployment. Retain the previous image digest and machine configuration for rollback.
+
+## Certificate snapshot recovery
+
+This rehearsal is **pending**, using the operator's local Fly login
+(`flyctl auth login`), not the CI read-only scan credential. Follow
+[Fly's restore procedure](https://docs.fly.io/volumes/volume-manage/).
+The source observed for #200 is `vol_rkggyj5jel8o0xk4`, mounted at
+`/var/lib/relay/autocert`. Confirm its current identity and provisioned size
+with `fly volumes show vol_rkggyj5jel8o0xk4 --app pyrycode-relay`, then
+refresh discovery:
+
+```sh
+fly volumes snapshots list vol_rkggyj5jel8o0xk4 --app pyrycode-relay
+```
+
+The inventory observed `vs_ov9G6nK906KS2JD4ZZJ11Y`, created
+2026-10-12T14:50:17Z with five-day retention. It expires; do not pin it in a
+recovery command. Select a current completed snapshot and record its creation
+time and retention. Use the source's provisioned volume size, not the
+snapshot's compressed stored size, for the destination size.
+
+Create a new volume with a distinct recovery name and size at least as large
+as the source and at least 1 GiB:
+
+```sh
+fly volumes create <recovery-volume-name> --snapshot-id <current-snapshot-id> --size <size-in-GiB> --region <recovery-region> --app <recovery-app>
+```
+
+[Volume creation](https://docs.fly.io/flyctl/cmd/fly_volumes_create)
+encrypts contents by default; do not use `--no-encryption`, and verify
+`Encrypted: true` in the destination metadata. Attach only the new destination
+volume to an isolated recovery Machine with no production traffic, DNS or
+clients. Never replace or mount over the live volume, and never start a
+second active production relay. A restored cache contains production private
+keys even when the recovery Machine is isolated.
+
+Preserve cache ownership and permissions for the relay UID (`65532` in the
+image), with directory mode `0700` and private cache files. Validate successful
+cache recovery in isolation without printing file contents or certificate
+keys and without sending ACME requests for the production domain. Record
+local-login access success (no token), source/snapshot/destination and recovery
+Machine IDs, sizes/encryption, commands, isolation controls, permission and
+cache-read results, start/end UTC times and elapsed recovery time. Snapshot
+discovery alone does not complete the recovery checkbox.

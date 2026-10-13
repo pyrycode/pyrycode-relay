@@ -4,7 +4,7 @@ The relay's production host is a single [Fly.io](https://fly.io) machine in one 
 
 ## What it does
 
-- **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and a single-machine hard cap.
+- **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and explicit single-machine intent. Actual Machine count remains operator-verified.
 - **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `rolling` strategy, which waits for the `internal_port = 8080` service's TCP check before finishing — a relay that refuses to boot fails the deploy rather than leaving production down ([#118](../codebase/118.md)). No GHA workflow auto-deploys.
 - **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment). The separate daily scan uses the GitHub repository secret `FLY_READONLY_TOKEN`; provisioning and rotation are in [the bootstrap runbook](../../deploy.md#daily-security-scan-credential).
 
@@ -55,26 +55,90 @@ The [operator runbook](../../deploy.md#app-restart-recovery) keeps effective
 policy verification, at least eleven consecutive isolated crashes and
 lifecycle evidence pending before manual production deployment. Recovery
 must preserve exactly one active production relay. Alert installation and
-delivery remain [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
+delivery remain [operator follow-up](../../deploy.md#restart-incident-response).
+
+### Restart incident watcher
+
+[`operations/relay_health.py`](../../../operations/relay_health.py) (#198) is
+an independent one-shot Python poller for one explicitly configured app/Machine.
+The operator owns its one-minute pyrybox schedule, private configuration/state,
+dedicated expiring org-scoped read-only token and trusted notification argv.
+Pyry receives incidents in **Pyrybox board watch**, investigates read-only and
+escalates to Juhana; this tool grants no production mutation authority. Its
+installation, delivered rehearsal and production activation remain pending in
+the [operator runbook](../../deploy.md#restart-incident-monitoring).
+[#170](https://github.com/pyrycode/pyrycode-relay/issues/170) owns secure-exchange,
+certificate, capacity and push-outcome monitoring separately.
+
+`fetch` makes one bounded, redirect-free GET for the selected Machine;
+`normalize`/`merge` project lifecycle evidence, `evaluate` proves coverage and
+updates the incident, and `poll` holds a nonblocking file lock through durable
+state and `notify`. Five automatic exits in the current ten-minute UTC window
+or a valid stopped observation outside finite maintenance latch one incident.
+Delivery remains pending until sending and saving succeed; a delivered latch
+survives watcher restarts and restart-to-stopped transitions. Ten continuous
+minutes of valid started observations below threshold rearm it. Poll failures
+or gaps greater than 90s interrupt recovery. Configuration, bounds and the
+offline test command are in [Restart incident monitoring](../../deploy.md#restart-incident-monitoring).
+
+Exit identity and history coverage answer different questions. Equivalent
+wrappers can have different platform timestamps for the same nanosecond
+`exited_at`; deduplicate by that normalized exit identity, count by exit time,
+and assess the earliest incoming platform timestamp **before** deduplication.
+When relying on persisted overlap, prior coverage must reach the current
+window boundary and incoming history must reach the prior successful observation.
+Identity overlap alone can hide a retained-history gap and wrongly complete
+recovery. Incomplete history fails monitoring without advancing coverage or
+clearing the incident; a local history marker is not an API pagination cursor.
+
+A derived automatic boolean cannot establish evidence consistency: different
+restarting/requested-stop flags can both produce false, and conflicting exit
+codes would disappear. Version 2 state therefore retains normalized nanosecond
+exit time, all three flags and all four exit/signal codes. `merge` compares the
+full evidence across records and polls; `load_state` validates types and
+identity/time/classification agreement. Omitted false/zero fields and equivalent
+wrappers remain valid. Version 1 is rejected unchanged because its discarded
+evidence cannot be reconstructed. The hermetic regressions cover a duplicate
+wrapper after nine recovery minutes, conflicts across saved polls, and
+equivalent evidence after a watcher restart.
 
 ### Single-machine hard cap
 
 The relay's connection registry is **in-process** (`internal/relay/registry.go`); two machines hold two disjoint registries and silently drop phones routed to the "wrong" replica. This is a correctness constraint, not a cost optimisation — `docs/architecture.md § Single-instance constraint (v1)` is canonical.
 
-Fly Apps v2 has **no `max_machines` key**. The cap is encoded via four declarative knobs:
+Fly Apps v2 has **no `max_machines` key**. Despite the historical section
+name, these knobs express intent and enforce no maximum of one:
 
 | Knob | Setting | Why |
 | --- | --- | --- |
-| `[[services]] min_machines_running` | `1` | Don't drop below one |
-| `[[services]] auto_start_machines` | `false` | Don't let Fly create new machines on demand |
-| `[[services]] auto_stop_machines` | `"off"` | Don't stop the one machine |
-| `[deploy] strategy` | `"rolling"` | Updates the one machine in place and waits for its health check; never creates a second machine |
+| `[[services]] min_machines_running` | `1` | Minimum for proxy autostop in the primary region when enabled; no upper bound |
+| `[[services]] auto_start_machines` | `false` | Prevent automatic starts of existing Machines, not creation |
+| `[[services]] auto_stop_machines` | `"off"` | Disable proxy-driven idle stops |
+| `[deploy] strategy` | `"rolling"` | Update Machines one at a time and wait for checks; no count guard |
 
-Operator discipline at `flyctl scale count` is the platform-level ceiling — Fly itself does not enforce one. The in-binary `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing backstop for an operator mistake.
+`PYRYCODE_RELAY_SINGLE_INSTANCE=1` is required on Fly to assert operator
+intent to the [startup check](single-instance-check.md). It reads environment
+variables only, not Machine inventory; all replicas can inherit the same
+assertion. Verify `flyctl machine list -a pyrycode-relay` before and after
+rehearsals and activation and preserve exactly one active production relay.
+Neither a successful boot nor the manifest proves that count.
+
+### Complete-process stop allowance
+
+Top-level `kill_signal = "SIGTERM"` and `kill_timeout = 30` (#200) cover the
+[25-second complete-process budget](graceful-shutdown.md#contract) with five
+seconds of margin. The ten-second drain precedes deferred push/limiter cleanup;
+observed fast exits do not replace that full drain in the budget. The
+allowance is [best-effort](https://docs.fly.io/reference/configuration/#runtime-options),
+not a platform guarantee or new production deadline. The hermetic real-SIGTERM
+regression checks joined authentication cleanup inside the child as well as
+wire closes and process exit. Effective settings, live shutdown and
+[certificate snapshot recovery](../../deploy.md#certificate-snapshot-recovery)
+remain [pending operator checks](../../deploy.md#complete-process-shutdown).
 
 ### Deploy health check — TCP on 8080, `rolling` waits for it ([#118](../codebase/118.md))
 
-`[deploy] strategy` is `"rolling"`, not `"immediate"`. `rolling` replaces machines one at a time and waits for each machine's checks before finishing; `immediate` replaces machines without waiting for any check, even when one exists. On this one-machine fleet `rolling` still updates in place — it creates no second machine, so the single-machine hard cap above is unaffected; only `immediate` vs. `rolling` changed, not `min_machines_running` / `auto_start_machines` / `auto_stop_machines`.
+`[deploy] strategy` is `"rolling"`, not `"immediate"`. `rolling` replaces machines one at a time and waits for each machine's checks before finishing; `immediate` replaces machines without waiting for any check, even when one exists. The intended one-machine fleet updates in place, but rolling strategy enforces no maximum count; inspect actual inventory. The #118 change left `min_machines_running` / `auto_start_machines` / `auto_stop_machines` unchanged.
 
 The `internal_port = 8080` service carries a `[[services.tcp_checks]]` block (`grace_period = "30s"`, `interval = "15s"`, `timeout = "5s"`). The `internal_port = 8443` service has no check. The check is TCP, not HTTP, and lives on 8080 rather than 8443, because no port a Fly check can reach serves `/healthz`:
 
@@ -130,6 +194,13 @@ app-scoped even though the helper queries only `pyrycode-relay`. It cannot deplo
 or mutate Fly resources. Authentication failures must be resolved with the
 read-only token, never by substituting a deploy or personal token.
 
+The restart watcher has its own local read-only token with the same org-wide
+exposure. It is not a deploy credential or a reuse of the CI scan secret.
+Only the fixed Fly HTTPS request receives it; trusted notification argv and
+the allowlisted child environment exclude it. Private operational state stays
+on pyrybox, outside the stateless relay runtime. See the
+[operational boundary review](../../threat-model.md#deploy-security--vps-compromise).
+
 The deployed job runs only for `schedule` or `workflow_dispatch` on
 `refs/heads/main` and checks out `main`. Only discovery and download receive the
 secret as a step environment variable; fixtures, Trivy, rendering and issue
@@ -158,17 +229,18 @@ Fly's remote builder rebuilds the image from `Dockerfile` on every deploy rather
 
 ## Rollback
 
-Two paths in `docs/deploy.md`, both operator-driven:
-
-1. **By image digest (preferred).** `flyctl releases list` → `flyctl deploy --image <prior-digest> --remote-only`. Autocert cache persists across rollbacks (it's on the volume) — no Let's Encrypt re-issuance triggered.
-2. **By release number.** `flyctl releases rollback` rolls back the most recent release. Use when the prior digest isn't to hand.
+Capture the previous immutable running image digest before activation, then
+use `flyctl deploy --image <prior-digest> --remote-only` as described in
+[the rollback runbook](../../deploy.md#rollback). The autocert cache persists
+on its volume. Retain SIGTERM/30s and `app`/`always` settings, verify their
+effective values and image, and inspect actual Machine inventory after rollback.
 
 A rollback does **not** revert the `main` commit. Because deploys are operator-direct, no auto-deploy re-rolls a broken release forward — but the next manual `flyctl deploy --remote-only` rebuilds from `main`'s current HEAD. Revert the offending PR on `main` before the next deploy, or it ships again.
 
 ## What this feature deliberately does NOT do
 
 - **No Fly-managed TLS, no Fly HTTP proxy.** Both would break autocert and silently change the rate-limiter's view of the peer IP.
-- **No platform-level enforcement of single-machine cap.** Fly has no ceiling knob; operator discipline + the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing combination.
+- **No Machine-count enforcement.** The manifest and `PYRYCODE_RELAY_SINGLE_INSTANCE` assertion do not count Machines or prevent scale-out; the operator verifies inventory.
 - **No deploy-approval gate.** Deploys are operator-direct; the gate is operator discipline (clean `main` + `make check` before `flyctl deploy`), not a CI approval step.
 - **No multi-region / multi-instance scaling.** Blocked on the in-process-registry constraint; separate prerequisite ticket.
 - **No image-reuse from the scan job.** Always `--remote-only` rebuild; privilege-minimisation over rebuild-time.

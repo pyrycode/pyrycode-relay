@@ -111,20 +111,19 @@ Documented as future work, not a commitment. Neither path is planned for v1, and
 
 ### The `PYRYCODE_RELAY_SINGLE_INSTANCE` bypass
 
-A startup self-check (see #65) refuses to run when the relay detects it is one of several instances. Setting
+A startup self-check (see [single-instance startup check](knowledge/features/single-instance-check.md), #65)
+refuses to run on a multi-instance-capable substrate (`FLY_APP_NAME` is set)
+unless the operator asserts single-instance intent. Setting
 
 ```text
 PYRYCODE_RELAY_SINGLE_INSTANCE=1
 ```
 
-skips that check. The variable name matches what the relay binary checks at startup.
-
-Intended uses:
-
-- **Emergency rollback** — the self-check itself misfires and blocks startup.
-- **Migration windows** — the operator is mid-switch to a multi-instance topology and accepts the routing breakage transiently.
-
-**NOT recommended for production.** Setting it permanently silences a check whose entire purpose is to catch the silent-routing-failure mode described above.
+skips that refusal and is required in the production Fly manifest. The check
+reads environment variables only; it neither counts Machines nor detects a
+later scale-out. Every replica can inherit the same assertion. Operators must
+verify actual Machine inventory and preserve exactly one active relay; the
+assertion does not make a multi-instance topology safe.
 
 ## Hosting
 
@@ -148,12 +147,23 @@ recovery/lifecycle checks remain [operator follow-up](deploy.md#app-restart-reco
 before manual production deployment. Merge alone does not establish live
 recovery.
 
+Top-level `kill_signal = "SIGTERM"` and `kill_timeout = 30` reserve a
+best-effort stop allowance five seconds above the conservative 25-second
+complete-process budget (#200). The ten-second HTTP/WebSocket drain is
+followed by deferred upgrade-limiter and push cleanup, including joined
+authentication and the push limiter. This is a configured budget, not a new
+production deadline or platform guarantee. Effective settings and isolated
+shutdown evidence remain [operator follow-up](deploy.md#complete-process-shutdown).
+
 Exactly one active production relay must be preserved through recovery and
 deployment. `min_machines_running = 1`, `auto_start_machines = false`, and
 `auto_stop_machines = "off"` in `fly.toml` express single-machine intent;
-Fly has no maximum-machine ceiling. Operator discipline enforces the count,
-and `PYRYCODE_RELAY_SINGLE_INSTANCE=1` asserts that intent to the startup
-self-check (#65). Multi-instance scaling is out of scope for v1 — see
+these settings enforce no maximum of one. Disabled autostart prevents
+automatic starts, not Machine creation; rolling deployment is not a count
+guard. Verify actual inventory before and after rehearsals and production
+activation. `PYRYCODE_RELAY_SINGLE_INSTANCE=1` asserts intent to the startup
+self-check (#65), without querying inventory. Multi-instance scaling is out
+of scope for v1 — see
 § *Single-instance constraint* above.
 
 Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). Deploys are operator-direct from clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](deploy.md).
@@ -167,6 +177,17 @@ only a separate issue-filing job has `issues: write`. Repository scans describe
 what `main` would ship; the deployed result describes its digest at its UTC
 observation time. See [CI image scanning](knowledge/features/docker-image.md#ci-image-scanning)
 and [deploy privileges](knowledge/features/fly-deploy.md#deploy-privilege-model--operator-direct).
+
+The repository also supplies an independent pyrybox
+[restart incident watcher](deploy.md#restart-incident-monitoring) (#198).
+An operator-scheduled process reads one selected Machine's lifecycle through
+the fixed Fly Machines API, keeps private app/Machine-scoped incident state
+on pyrybox, and invokes the trusted assistant-channel command to notify Pyry.
+Pyry investigates read-only and escalates to Juhana. This operational outbound
+Fly/notification boundary adds no relay endpoint, payload access or relay
+deployment target; relay routing remains stateless and content-blind.
+Installation, delivered verification and production activation are
+[pending operator work](deploy.md#restart-incident-response).
 
 ## Threat model
 

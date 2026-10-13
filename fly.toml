@@ -16,6 +16,11 @@
 app = "pyrycode-relay"
 primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 
+# Complete-process budget: 10s drain + 10s push cleanup + 5s local
+# cleanup/exit headroom. Fly's best-effort stop allowance adds 5s margin.
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
 [env]
   # Asserts single-instance intent to the #65 self-check, which would
   # otherwise refuse to boot on Fly's multi-instance-capable substrate.
