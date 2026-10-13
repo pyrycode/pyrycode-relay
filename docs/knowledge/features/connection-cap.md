@@ -260,6 +260,26 @@ and a valid source/global configuration so they reach the global gate.
 `cmd/pyrycode-relay/listener_cap_test.go` exercises actual `run` wiring in
 insecure, HTTPS and PROXY HTTPS modes, with independent HTTP-01 and metrics
 checks. Local certificates and a cached challenge avoid external ACME calls.
+
+`startCappedRelay` uses `reserveCapAddrs` to bind one complete endpoint set
+on `127.0.0.1:0`: public and metrics in insecure mode, plus HTTP-01 in HTTPS
+and PROXY HTTPS. Holding all listeners through certificate, transport and
+argument setup keeps the endpoints pairwise distinct; selecting and releasing
+them one at a time can reuse a port and cause a false admission failure.
+Reservations are released immediately before the `run` goroutine starts,
+without startup retries. Cleanup is registered before allocation, so setup
+failure also closes any reservations already obtained. A brief window for
+another process to claim a released endpoint remains because `run` binds
+its own listeners (#206).
+
+`TestReserveCapAddrs/2` and `/3` check distinct addresses and require bind
+attempts against every held endpoint to fail with `EADDRINUSE`. After release,
+the test rebinds all endpoints together, releases the old reservations again,
+and verifies the new listeners still hold them. Uniqueness alone misses
+reservations released too early; the held-address bind check detects that
+broken lifetime deterministically, without depending on accidental OS port
+reuse or retrying failed startups.
+
 A successful HTTP response establishes admission; the queued peer must get
 no response until a slot frees. Dial success alone would let a broken cap
 pass. Keep-alive and WebSocket tests prove slots survive request completion
