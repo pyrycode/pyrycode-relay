@@ -456,3 +456,12 @@ garbage). Rolling back across the #110 boundary means also reverting
 `fly.toml`'s `443` port block and `[processes] app` line to their pre-#110
 state, then deploying that combination — see the *fly.toml gotchas* item
 above.
+
+
+## Production capacity headroom
+
+The production manifest selects 64 total live WebSocket connections, 48 per source address, and 128 raw connections per public listener. Fly forwarding has the same 128-connection limit on each listener. Upgrade requests refill at one attempt per 10 ms with a burst of 200 per source. The binary defaults remain 20 total, eight per source, 32 raw per listener, one attempt per six seconds, and burst 20.
+
+The operator has kept the production allocation at 256 MiB. These higher allowances give normal live suites room to connect, but do not guarantee that fully occupied connections with full queues fit in that allocation. The selected later allocation is 1024 MiB. The existing conservative budget estimates 4.4 MiB per upgraded session and 128 KiB per raw slot. Charging both full listeners and all upgraded sessions, then allowing twice that live state for garbage collection and the 56 MiB runtime reserve, gives about 684 MiB. The later allocation is a sizing plan, not a completed resize or an unbounded-load guarantee.
+
+Validate changed limits with isolated concurrent fixtures before deployment. Confirm the deployed command, memory, both Fly listener limits and a single active machine after deployment. Retain the previous image digest and machine configuration for rollback.
