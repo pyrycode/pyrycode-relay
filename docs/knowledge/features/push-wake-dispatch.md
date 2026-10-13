@@ -17,8 +17,13 @@ blocks on `Send`: it either admits the wake and returns immediately (the
 send runs on its own goroutine) or refuses it immediately.
 
 The relay also cannot verify that a binary's claimed device token belongs to
-one of its own phones — the binary is authenticated by having claimed a
-server-id, not by any per-token proof. `PushWaker` is the point that accepts
+one of its own phones. In [daemon admission enforce](server-endpoint.md#daemon-admission-before-upgrade),
+claiming a server-id first requires its exact identity-bound credential; the gate
+rejects anonymous requests before upgrade, claim or push access. Off/observe
+retain anonymous claims and wakes. An admitted holder, including one with a
+stolen token, can still request a wake for an arbitrary device token: admission
+proves daemon identity, not device-token ownership. It grants neither Noise keys
+nor phone authorization. `PushWaker` is the point that accepts
 this and bounds the resulting risk with two named limits, on the reasoning
 that a payload-free wake (see [FCM push sender](fcm-push-sender.md)) makes
 the worst case "an app reconnects more than it should," not data exposure.
@@ -286,6 +291,7 @@ round trip, still scrape right after `Close`.
 
 ## Related
 
+- [Daemon admission](server-endpoint.md#daemon-admission-before-upgrade) — enforce narrows wake abuse to admitted credential holders; limits and unverified device-token risk remain.
 - [Binary-side frame forwarder](binary-forwarder.md#push_wake-handling) — the
   sole caller.
 - [Routing envelope](routing-envelope.md#push_wake-shape-relay-addressed) —
