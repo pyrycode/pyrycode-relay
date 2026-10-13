@@ -80,37 +80,51 @@ token request to `https://oauth2.googleapis.com/token` when its cached token
 is no longer valid (or the key's `token_uri` when supplied;
 see [FCM push sender](knowledge/features/fcm-push-sender.md)), and an FCM
 send to `https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send`.
-The wake carries no payload — no `notification`, no `data` field — so a
-successful send tells the phone only to reconnect, never what happened in
-the session. See [Push wake dispatch](knowledge/features/push-wake-dispatch.md)
+The high-priority wake carries no payload — no `notification`, no `data`
+field — so a successful send tells the phone only to reconnect, never what
+happened in the session. See [Push wake dispatch](knowledge/features/push-wake-dispatch.md)
 for the dispatch path (async off the binary read loop) and
 [`docs/threat-model.md` § Outbound network calls](threat-model.md#outbound-network-calls--fcm-push-wake)
 for the abuse accounting.
 
-Every admitted attempt atomically consumes one token each from initially full
-daemon, device and global allowances and reserves a send slot. Daemon and
-device bursts are 6, refilling one token per 10s; the global burst is 32,
-refilling one per second. Burst capacity is stored credit, distinct from
+Each admitted job reserves one slot through sending and retry waits. Every
+sender invocation atomically consumes one token each from initially full
+daemon, device and global allowances, attributed to the originating daemon.
+Daemon and device bursts are 6, refilling one token per 10s; the global burst
+is 32, refilling one per second. Burst capacity is stored credit, distinct from
 sustained refill rate. Same complete device tokens coalesce across daemon
 identities for a fixed ten seconds from first admission, or until the active
-send finishes, whichever is later. Accepted duplicates start no send, spend
-no allowance and emit no outcome; they extend neither the window nor the
-whole-send deadline, regardless of success or failure. At the exact boundary
-a completed job becomes eligible for ordinary admission.
+job finishes, including backoff, whichever is later. Accepted duplicates
+start no send, spend no allowance and emit no outcome. They extend neither
+the window nor the 45s job deadline, reset no attempts and schedule no
+follow-on work, regardless of success or failure. At the exact boundary a
+completed job becomes eligible for ordinary admission.
 
 At most 32 device jobs are retained, including completed jobs still inside
-the window; active sends also remain capped at 32. New distinct work at
-capacity is refused without a queue or charge, while duplicates still
-succeed. Expired completed jobs are reclaimed before capacity checks without
-erasing allowance debt. Failed attempts remain charged. Local push
-accounting retains at most 1,024 daemon and 1,024 device buckets using full
+the window and jobs waiting to retry; simultaneous sends also remain capped
+at 32. New distinct work at capacity is refused without a queue or charge,
+while duplicates still succeed. Expired completed jobs are reclaimed before capacity checks without
+erasing allowance debt. Failed attempts remain charged; retry allowance or
+accounting-capacity refusal stops the job with one `dropped` outcome and no
+partial charge, refund or refill queue. Local push accounting retains at most
+1,024 daemon and 1,024 device buckets using full
 SHA-256 keys, reclaiming only fully refilled state idle for five minutes.
 
 Jobs use full SHA-256 device keys and store only expiry/active metadata;
-completed jobs retain no raw device token or requester list. Each actual send
-records one outcome and log line attributed to its first admitting daemon.
-Delivery is payload-free and best-effort, with no retry, daemon reply,
-durability or exactly-once guarantee.
+completed jobs retain no raw device token or requester list. Each sender
+invocation records one outcome and log line attributed to its first admitting
+daemon.
+Delivery is payload-free and best-effort, with no daemon reply, durability or
+exactly-once guarantee. Each job permits at most three sender invocations
+within one immutable 45s deadline from first admission, covering authentication,
+sends and waiting. Transient failures use 10s/20s backoff from call completion
+plus independent [0, 1s] jitter, or later receipt-anchored Retry-After guidance.
+HTTP 429 imposes at least 60s and therefore ends the job without another call.
+A next attempt at or beyond the deadline is never sent early. See
+[sender retry policy](knowledge/features/fcm-push-sender.md#retry-classification-and-guidance)
+for the status/transport allowlists, permanent-stop precedence and sanitisation.
+Outcomes/logs count each invocation once, not each job; ending between calls
+adds no synthetic outcome. Duplicates emit none.
 
 These single-process in-memory budgets and coalescing apply in off, observe
 and enforce modes and reset on relay restart. Reconnects and new daemon
@@ -121,13 +135,14 @@ and production enforcement activation remain
 [manual operator work](deploy.md#daemon-admission-activation); passing
 repository checks establishes neither.
 
-Each send uses one 10s deadline from entry through token waiting,
-authentication and delivery, respecting earlier caller deadlines. Concurrent
+Each sender call uses one 10s deadline from entry through token waiting,
+authentication and delivery, respecting the earlier job deadline. Concurrent
 token waiters share a refresh's success or sanitised failure. The last
 departing waiter cancels and joins unfinished authentication, so
 `PushWaker.Close` refuses subsequent structurally valid requests, cancels and
-joins sends, shared authentication and the existing cleanup sweep, then
-releases retained jobs. Repeated and concurrent closes join the same work.
+joins sends, retry timers, shared authentication and the existing cleanup
+sweep, then releases retained jobs. Repeated and concurrent closes join the
+same work.
 Push cleanup runs after `runServers`' separate 10s HTTP/WebSocket drain;
 see [push concurrency](knowledge/features/push-wake-dispatch.md#concurrency-model).
 

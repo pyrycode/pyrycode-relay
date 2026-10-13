@@ -121,14 +121,15 @@ Daemon admission adds only standard-library parsing and constant-time equality p
 - **Per-daemon allowance** — burst 6, refill one token per 10s, across all devices requested by the same server-id.
 - **Per-device allowance** — burst 6, refill one token per 10s, shared across all daemons requesting the complete same device token.
 - **Global allowance** — burst 32, refill one token per second, shared across all daemons and devices in the relay process.
-- **Relay-wide retained-job cap** — `pushWakeMaxInFlight` (32), counting active sends and completed jobs still inside the coalescing window. A buffered channel also bounds active send goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
+- **Relay-wide retained-job cap** — `pushWakeMaxInFlight` (32), counting active sends, retry waits and completed jobs still inside the coalescing window. A job keeps its buffered-channel slot through backoff, bounding job goroutines and simultaneous sends at 32 across every binary regardless of how many server-ids they claim.
 
 The complete device token coalesces across daemon identities for a fixed ten
 seconds from first admission, regardless of success or failure; an active job
-suppresses duplicates even beyond expiry. At the exact boundary a completed
-job is eligible for ordinary admission. After structural validation and the
+suppresses duplicates through sending/backoff even beyond expiry. At the
+exact boundary a completed job is eligible for ordinary admission. After structural validation and the
 closed check, duplicates return `nil` before capacity or allowance checks,
-extend neither window nor deadline, spend nothing, create no daemon bucket
+extend neither window nor the immutable 45s job deadline, reset no attempts,
+schedule no follow-on work, spend nothing, create no daemon bucket
 and emit no outcome. Distinct complete tokens remain independent. Full
 SHA-256 job keys retain only fixed expiry and active metadata, no requester
 list; completed jobs retain no raw token. Expired completed jobs are reclaimed
@@ -139,9 +140,12 @@ coalesced device still succeeds.
 Burst capacity is maximum stored credit; sustained refill is one per 10s for
 each daemon/device and one per second globally, never six per 10s indefinitely.
 Admission charges all three allowances and reserves a slot atomically under
-one mutex. Rate, state-capacity and retained-capacity refusals spend nothing and
-queue nothing; dispatched failures remain charged. Completing sends frees
-slots without restoring tokens or freeing jobs still inside their window.
+one mutex. Every retry invocation charges the same three budgets atomically,
+retaining the first daemon identity. Rate, state-capacity and retained-capacity
+refusals spend nothing and queue nothing; a retry refusal stops with one
+`dropped` outcome, no partial charge, refund or waiting for refill.
+Dispatched failures, including authentication failures, remain charged.
+Job completion frees slots without restoring tokens or freeing jobs still inside their window.
 Changing daemon identity or reconnecting cannot reset the device or global
 budget.
 
@@ -155,14 +159,30 @@ deletes debt. If a new
 key still cannot fit, it is refused, while existing keys remain usable within
 budget. All modes receive these single-process in-memory budgets and
 coalescing; restart resets both. Multiple replicas would need shared accounting
-and coalescing. Delivery remains payload-free and best-effort: there is no
-retry, daemon reply, durable or exactly-once guarantee. Each actual send keeps
-one whole-send ten-second deadline through authentication and delivery.
-`Close` refuses subsequent structurally valid requests, cancels and joins
-sends/shared authentication and the cleanup sweep, then releases retained
-jobs. Repeated and concurrent closes join the same work.
+and coalescing. Delivery remains payload-free and best-effort, without a
+daemon reply, durable or exactly-once guarantee. Each job is limited to three
+sender invocations within one immutable 45s deadline from admission,
+covering authentication, delivery and waiting. Each call retains the earlier
+of its own ten-second deadline and the job deadline. Transient failures wait
+10s/20s from call completion plus independent [0, 1s] jitter; receipt-anchored
+Retry-After may delay further. Guidance at or beyond the deadline stops the
+job, and HTTP 429's minimum 60s wait never fits. Overflowing positive seconds
+cannot wrap into an early send.
 
-A refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every actual dispatched job logs exactly one outcome line attributed to its first admitting daemon — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
+Retry allowlists are FCM 429/500/503, OAuth 429/500/502/503/504 and wrapped
+`net.Error` timeout/temporary evidence. UNREGISTERED at any status and OAuth
+credential rejection are permanent; other statuses, malformed successful
+token replies and unclassified transport failures stop. A complete permanent
+reply overrides status, which overrides body-read retryability; only 2xx
+defers to the read error. Cancellation always stops, while an invocation's
+own timeout may retry if the job remains live. Receipt time and sanitised
+classification survive shared OAuth publication; a trailing read failure
+cannot erase status/guidance or turn a permanent rejection into a retry.
+`Close` refuses subsequent structurally valid requests, cancels and joins
+sends, retry timers, shared authentication and the cleanup sweep, then
+releases retained jobs. Repeated and concurrent closes join the same work.
+
+A refused fresh wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every sender invocation logs exactly one outcome line attributed to its first admitting daemon — `push_wake_sent` or `push_wake_send_failed`, including a call cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the call's `duration`; a successful call additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed call carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status, FCM's validated enum reasons and safe phase/context identities, never raw transport causes, endpoint bodies, credential-bearing URLs or Retry-After text (see [FCM push sender](knowledge/features/fcm-push-sender.md#error-handling--nothing-leaks)). The high-priority wake itself carries no payload, so even a successful send tells the phone only to reconnect.
 
 **Residual risk:** Device-token ownership remains unverified. Enforce alone
 authenticates daemon identity, including a holder of a stolen credential;
@@ -177,13 +197,14 @@ retained-capacity refusal increments
 labels carry no identities, tokens or fingerprints — see
 [push metrics](knowledge/features/push-wake-dispatch.md#metrics).
 Accepted duplicates count no outcome and produce no send log line; each
-actual send is attributed only to its first admitting daemon.
+sender invocation is attributed only to its first admitting daemon and
+records its phase outcome once. Attempt/deadline/backoff exhaustion and
+cancellation between calls add no synthetic job outcome or log line.
 
 **Future hardening:** Telling the daemon a token is dead remains out of scope
 (no dead-token callback, despite `ErrFCMUnregistered` distinguishing it — see
 [FCM push sender](knowledge/features/fcm-push-sender.md)). Bounded coalescing
-is implemented by #211, split from #173; later retries must consume the same
-attempt budgets.
+is implemented by #211 and bounded transient retries by #212, split from #173.
 Manual deployment and production admission activation remain
 [operator follow-ups](deploy.md#daemon-admission-activation); repository checks
 establish neither deployment nor live enforcement.
@@ -324,6 +345,15 @@ telemetry has exactly five fixed aggregate `outcome` labels (`valid`, `missing`,
 `malformed`, `unknown`, `mismatch`), never claimed identities or tokens. Existing
 allowlisted endpoint metadata logs remain; they do not prove per-identity
 admission outcomes. Repository credentials must be explicitly synthetic.
+
+Push retry classification is typed and sanitised before returning or sharing
+errors, preserving only phase/context identities, HTTP status, validated FCM
+enums and parsed not-before guidance. Raw transport causes, OAuth/FCM bodies,
+credential-bearing URLs and Retry-After text enter neither error chains nor
+logs. Each sender invocation logs once using the existing allowlisted keys;
+duplicates and between-call job termination add no log line. The push metric
+retains exactly five fixed labels without identity or token values; see
+[push outcomes](knowledge/features/push-wake-dispatch.md#metrics).
 
 **Enforcement:** The canonical set of permitted keys lives in `internal/relay/log_allowlist.go`. `TestLogKeysAreAllowlisted` in `internal/relay/log_keys_test.go` AST-walks every non-test `.go` file in the package on each `make test` run and fails if any `logger.{Info,Warn,Error,Debug}` call carries a key absent from that set or uses a dynamic (non-string-literal) key. Adding a logged key requires editing the allowlist file in the same commit.
 

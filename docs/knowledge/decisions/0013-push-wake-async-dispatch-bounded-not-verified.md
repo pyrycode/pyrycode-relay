@@ -1,6 +1,6 @@
 # ADR-0013: Push wakes dispatch async off the read loop, bounded attempts, token unverified
 
-**Status:** Accepted (#133), extended with shared allowances (#172) and bounded coalescing (#211)
+**Status:** Accepted (#133), extended with shared allowances (#172), bounded coalescing (#211) and transient retries (#212)
 **Date:** 2026-09-24
 **Updated:** 2026-10-13
 
@@ -33,11 +33,13 @@ loop.
 Dispatch each new device job on its own goroutine ([`PushWaker.Request`](../features/push-wake-dispatch.md)),
 never blocking the binary read loop. Coalesce structurally valid requests for
 the complete same device token across daemon identities for a fixed ten
-seconds from first admission, or until its active send ends, whichever is
-later. Duplicates return `nil` without another send, charge, bucket or outcome,
-even when new work would be refused. They extend neither the window nor send
-deadline, regardless of success or failure. A completed job is eligible for
-ordinary admission at the exact window boundary.
+seconds from first admission, or until its active job ends (including retry
+backoff), whichever is later. Duplicates return `nil` without another send,
+charge, bucket or outcome, even when new work would be refused. They extend
+neither the window nor job
+deadline, reset no attempts and schedule no follow-on work, regardless of
+success or failure. A completed job is eligible for ordinary admission at the
+exact window boundary.
 
 Accept that the relay cannot verify a wake's token, and bound the resulting
 abuse surface with three initially full
@@ -51,15 +53,19 @@ attempt allowances and a separate retained-job cap:
 - **Global allowance** (`pushWakeGlobalBurst` / `pushWakeGlobalRefillEvery`)
   — burst 32, refill one token per second, across all daemons and devices.
 - **Relay-wide retained-job cap** (`pushWakeMaxInFlight`, 32) — counts active
-  sends and completed jobs still inside the window. A buffered-channel
-  semaphore also bounds concurrent send goroutines and outbound sockets.
+  sends, retry waits and completed jobs still inside the window. A job keeps
+  its buffered-channel slot through backoff, bounding job goroutines and
+  simultaneous sends at 32.
   Tests retain the constructor's configurable smaller capacity.
 
 Burst capacity is stored credit, distinct from sustained refill rate; refills
 stop at capacity. Under one `PushWaker` mutex, admission charges one token
 from each allowance and reserves a slot atomically. A rate, keyed-capacity or
-retained-capacity refusal spends nothing and queues nothing. A dispatched
-failure remains charged. Full SHA-256 device keys distinguish complete tokens;
+retained-capacity refusal spends nothing and queues nothing. Before each
+retry, the same atomic accounting charges all three allowances using the
+originating daemon; exhaustion/capacity refusal stops the job without partial
+charging, refunds or waiting for refill. Authentication and delivery failures
+remain charged. Full SHA-256 device keys distinguish complete tokens;
 job records contain only fixed expiry/active metadata, no requester list, and
 completed jobs retain no raw token. Expired completed jobs are reclaimed before
 capacity checks without erasing allowance debt. At capacity new distinct work
@@ -74,16 +80,25 @@ These budgets and coalescing apply in every admission mode, live in the
 single relay process's memory and reset on restart. Reconnects and identity churn cannot
 reset the shared device/global allowances. Only enforce authenticates daemon
 identity; device-token ownership remains unverified and wakes carry no payload.
-Delivery is best-effort with no retry, daemon reply, durability or exactly-once
-guarantee. Each actual send retains the existing whole-send ten-second budget
-through authentication and delivery. `Close` refuses subsequent structurally
-valid requests, cancels and joins sends/shared authentication and the sweep,
-then releases retained jobs; concurrent closes join the same work.
+Delivery is best-effort without a daemon reply, durability or exactly-once
+guarantee. Each job invokes the sender at most three times inside one
+immutable 45s deadline from first admission, covering authentication, sends
+and waits. Each invocation retains its whole-call ten-second cap, limited by
+the job deadline. Only sanitised transient HTTP/transport classification
+permits a retry, with 10s/20s backoff from call completion plus independently
+sampled [0, 1s] jitter, or later receipt-anchored Retry-After guidance. HTTP
+429 imposes at least 60s, so another call cannot fit; a next-attempt time at
+or beyond the deadline ends the job without sending early. Permanent reply
+and HTTP-status precedence survive body-read failures and shared refresh
+publication; see [sender retry policy](../features/fcm-push-sender.md#retry-classification-and-guidance).
+`Close` refuses subsequent structurally valid requests, cancels and joins
+sends, retry timers, shared authentication and the sweep, then releases
+retained jobs; concurrent closes join the same work.
 
 ## Rationale
 
 - **The wake carries no payload.** `FCMSender.Send` sends a data-only,
-  field-free FCM message — a successful send tells the phone only to
+  field-free, high-priority FCM message — a successful send tells the phone only to
   reconnect. That makes the worst case of an unverified token "an app
   reconnects more than it should," not data exposure, which is why bounding
   the rate is an acceptable substitute for verifying the token rather than a
@@ -94,6 +109,11 @@ then releases retained jobs; concurrent closes join the same work.
   fresh daemon credit, so a daemon-only allowance cannot bound shared-device
   pressure or aggregate throughput. Shared device/global allowances address
   those paths, while the semaphore still bounds simultaneous send work.
+- **Retry within the admitted job.** Temporary failures can recover without
+  another daemon request. An immutable deadline, three charged calls and a
+  slot retained through backoff bound amplification and retained work;
+  duplicates cannot restart either bound. Quota guidance may end a job
+  without a retry, preserving best-effort delivery rather than sending early.
 - **Fixed bounded coalescing.** Duplicate events for one device need only one
   wake. Keeping completed jobs until a fixed first-admission boundary also
   suppresses duplicates after early success or failure; extending on every
@@ -107,7 +127,7 @@ then releases retained jobs; concurrent closes join the same work.
 - **Async dispatch, not a worker pool.** A fixed pool of long-lived worker
   goroutines would need its own queue (same objection as above) or would
   block admission on a worker being free, reintroducing the stall this
-  design exists to avoid. A goroutine-per-send bounded by a semaphore gets
+  design exists to avoid. A goroutine-per-job bounded by a semaphore gets
   the same concurrency ceiling without a queue: `Request` either gets a slot
   immediately or is refused immediately.
 - **Local atomic accounting.** Successive `IPRateLimiter.Allow` calls cannot
@@ -134,15 +154,17 @@ then releases retained jobs; concurrent closes join the same work.
 - Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` records
   refusals with fixed aggregate labels. Each rate, state-capacity or
   retained-capacity refusal increments it exactly once; accepted duplicates,
-  malformed and push-off requests count nothing. Each actual dispatched job
-  records one outcome and log line attributed to its first admitting daemon.
+  malformed and push-off requests count nothing. Retry refusals also count
+  one `dropped`; every sender invocation records one phase-specific outcome
+  and log line attributed to its first admitting daemon. Ending a job for
+  attempt/deadline/backoff limits or cancellation between calls adds no
+  synthetic outcome or log line.
   Labels contain no identities, device tokens or fingerprints; errors remain
   static and token-free. See
   [push metrics](../features/push-wake-dispatch.md#metrics).
 - Deployment from clean `main` and production admission activation remain
   [manual operator follow-ups](../../deploy.md#daemon-admission-activation).
   Repository checks establish neither deployment nor live enforcement.
-  Later retries (#173) must consume these same attempt budgets.
 - If a future ticket makes the wake payload-bearing, or adds a way to verify
   a token belongs to the claiming binary's own phones, this ADR's
   "acceptable because payload-free" rationale no longer holds and the

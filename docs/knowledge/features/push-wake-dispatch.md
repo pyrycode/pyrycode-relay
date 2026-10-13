@@ -7,8 +7,8 @@ caller) and [`FCMSender`](fcm-push-sender.md) (the thing that actually talks
 to Google), and owns daemon, device and global attempt allowances plus a
 retained-device-job cap. Introduced by #133; shared allowances added by
 [#172](https://github.com/pyrycode/pyrycode-relay/issues/172), bounded
-coalescing by #211 and joined cancellation by
-[#169](https://github.com/pyrycode/pyrycode-relay/issues/169).
+coalescing by #211, bounded transient retries by #212 and joined cancellation
+by [#169](https://github.com/pyrycode/pyrycode-relay/issues/169).
 
 ## Why a waker, not a direct call
 
@@ -18,8 +18,8 @@ on it — a slow or hung FCM send would delay every subsequent frame the
 binary sends, including ordinary phone traffic. `PushWaker.Request` never
 blocks on `Send`: it either starts one asynchronous job, accepts a duplicate
 without another send, or refuses new work immediately. Delivery is
-payload-free and best-effort; there is no retry, daemon reply or durable
-delivery guarantee.
+payload-free and best-effort, with bounded transient retries inside the job;
+there is no daemon reply or durable delivery guarantee.
 
 The relay also cannot verify that a binary's claimed device token belongs to
 one of its own phones. In [daemon admission enforce](server-endpoint.md#daemon-admission-before-upgrade),
@@ -92,26 +92,47 @@ call with an error and no send:
    - a non-blocking acquire of a `slots` token fails → `ErrPushWakeInFlightCap`
    - otherwise: reserve the slot, insert missing buckets, subtract one token
      from all three allowances, insert the active job with a fixed ten-second
-     expiry, `wg.Add(1)`, spawn the send goroutine, return `nil`
+     coalescing expiry, capture an immutable 45-second deadline from admission,
+     `wg.Add(1)`, spawn the job goroutine, return `nil`
 
 Coalescing crosses daemon identities and applies regardless of the send's
-success or failure. Duplicates never extend the admission window or send
+success or failure. Duplicates never extend the admission window or job
 deadline, touch accounting timestamps, charge allowances, create daemon
-buckets or emit outcomes. They succeed even when allowances, accounting maps
-or retained-job capacity would refuse new work. No requester list is kept.
+buckets or emit outcomes. They neither reset attempts nor schedule follow-on
+work, including during retry backoff. They succeed even when allowances,
+accounting maps or retained-job capacity would refuse new work. No requester
+list is kept.
 At the exact ten-second boundary a completed job becomes eligible for
 ordinary admission; an active job still suppresses duplicates beyond it.
 Different complete device tokens remain independent.
 
-A rate, state-capacity or retained-capacity refusal spends no tokens, reserves
-no slot and inserts no new bucket. Refills, idle timestamp updates and eligible
-reclamation can still occur after the retained-capacity check. An admitted
+A fresh rate, state-capacity or retained-capacity refusal spends no tokens,
+reserves no slot and inserts no new bucket. Refills, idle timestamp updates
+and eligible reclamation can still occur after the retained-capacity check. An admitted
 attempt stays charged even if authentication or FCM delivery fails;
-completion frees its send slot but retains the job until the window expires.
-A refused wake is never queued or retried — the caller logs it and moves on.
-An admitted wake's send runs on its own goroutine against `w.ctx` (cancelled
-by `Close`, not the binary connection's context), so disconnecting the
-requesting binary does not cancel delivery.
+job completion frees its reserved slot but retains completed metadata only
+until the original ten-second window expires. Completion after that window
+permits ordinary fresh admission, without refunding allowance debt.
+A refused fresh wake is never queued — the caller logs it and moves on.
+An admitted job runs on its own goroutine with a deadline context descending
+from `w.ctx` (cancelled by `Close`, not the binary connection's context), so
+disconnecting the requesting binary does not cancel delivery.
+
+Each job invokes `Send` at most three times within its immutable 45-second
+budget, covering token waiting, authentication, delivery and retry waits.
+Each invocation retains the sender's whole-call 10s cap, limited by the
+earlier job deadline. Only the sender's sanitised transient classification
+permits another call; see [FCM retry policy](fcm-push-sender.md#retry-classification-and-guidance).
+A call's own timeout may retry while the job remains live; job expiry or
+cancellation stops it.
+
+After failed attempts 1 and 2, ordinary backoff is respectively 10s and 20s
+from call completion, plus an independently sampled jitter in [0, 1s].
+The next attempt uses the later of that time and the sender's receipt-anchored
+`Retry-After` guidance. A next-attempt time at or beyond the job deadline
+ends the job immediately, without an early send. HTTP 429's minimum 60s
+wait cannot fit this 45s job. Permanent failure, attempt exhaustion or
+cancellation also ends it without scheduling another job.
 
 ## Allowances and concurrency cap
 
@@ -127,23 +148,34 @@ preserves elapsed-time remainder and stops at burst capacity:
 
 `pushWakeMaxInFlight` caps retained device jobs at 32, including completed
 jobs still inside their window, and bounds active sends via a buffered
-channel. Tests can supply a smaller constructor capacity. At capacity a new
-distinct device returns `ErrPushWakeInFlightCap`, charges nothing, queues
-nothing and counts one `dropped` outcome; an existing coalesced device still
+channel. Active jobs keep their slot through retry waits, so at most 32
+simultaneous sends and 32 retained jobs exist. Tests can supply a smaller
+constructor capacity. At capacity a new distinct device returns
+`ErrPushWakeInFlightCap`, charges nothing, queues nothing and counts one
+`dropped` outcome; an existing coalesced device still
 returns `nil`. Expired completed jobs are reclaimed before capacity checks,
 on completion after expiry and by the existing periodic sweep. Job expiry
 never removes allowance debt. Freed send slots do not replenish allowances
 or free completed jobs still in their window. Reconnecting resets neither
 daemon, device nor global credit.
 
+Every sender invocation atomically consumes one token from each allowance,
+including authentication failures and retries. Retries keep the first
+admitting daemon's identity and the complete-device key; a coalesced requester
+cannot substitute its credit. An exhausted allowance or accounting-capacity
+refusal stops the retry with one `dropped` outcome, without partial charging,
+refunds or waiting for refill. Retries reuse the job's reserved slot.
+
 With full production allowances and an available sender, four daemons can
 each issue two back-to-back wakes to each of three paired devices (devices
 distinct across daemons): 24 accepted requests produce 12 actual sends,
-charging three per daemon, one per device and 12 globally. A finished turn
-and a waiting prompt for the same device within the window share a wake.
+charging three per daemon, one per device and 12 globally before any retries.
+A finished turn and a waiting prompt for the same device within the window
+share a wake.
 Sustained daemon/device refill remains one per 10s, while aggregate refill
 is one per second. Coalescing and device refill both take ten seconds, so
-ordinary same-device attempts cannot exhaust production device credit.
+fresh same-device admissions alone cannot exhaust production device credit;
+each retry still consumes device credit.
 
 Push accounting is local to `PushWaker`, rather than successive
 [`IPRateLimiter.Allow`](rate-limit-middleware.md) calls: separate calls cannot
@@ -152,9 +184,9 @@ at most `pushWakeMaxBuckets` (1,024) buckets keyed by full 32-byte SHA-256
 digests of the complete inputs. Accounting-key size is independent of input
 length. The truncated `tokenFingerprint` used in logs is unsuitable for
 accounting because distinct tokens can share it. Raw tokens do not enter
-accounting state; active sends retain them for delivery. Device jobs use the
-same full digest and contain only a fixed expiry and active flag; completed
-jobs retain no raw token or daemon identity. Accounting and job digests are
+accounting state; active job goroutines retain them through delivery/backoff.
+Device jobs use the same full digest and contain only a fixed expiry and
+active flag; completed jobs retain no raw token or daemon identity. Accounting and job digests are
 never logged.
 
 Accounting state becomes eligible for expiry after five minutes without a
@@ -190,7 +222,7 @@ ever carries the device token or the service-account credential. The
 forwarder logs a refusal as `binary_forwarder_push_wake_dropped`, using only
 `server_id` (or `binary_conn_id`) and `err`.
 
-Every actual dispatched job logs exactly one outcome line from `send`
+Every sender invocation logs exactly one outcome line from `send`
 (#160), attributed to its first admitting daemon. Accepted duplicates log
 nothing. A send cancelled by `Close` also logs its outcome — the cancelled
 context makes `Send` return an error, so it takes the failure branch:
@@ -221,12 +253,13 @@ incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
 - **`dropped`** — increments exactly once when `Request` refuses a wake for
   any daemon/device/global allowance (`ErrPushWakeRateLimited`), either keyed
   map's capacity (`ErrPushWakeStateCap`) or retained-job/send capacity
-  (`ErrPushWakeInFlightCap`).
+  (`ErrPushWakeInFlightCap`), or when allowance/accounting-capacity checks
+  refuse a retry. A retry refusal adds no sender invocation or send log line.
   A malformed `push_wake` object and a push-off refusal (nil or closed
   waker) count nothing — they never reach admission, so they are not a
   "drop" in this counter's sense.
 - **`sent` / `unregistered` / `send_failed` / `token_fetch_failed`** — exactly
-  one increments per actual dispatched job, once its `send` goroutine's call to
+  one increments per sender invocation, once its `send` goroutine's call to
   `Send` returns. `classifyPushWake(err)` maps the result by error identity,
   never by matching text: `nil` → `sent` (with or without a message id in
   the reply); `errors.Is(err, ErrFCMUnregistered)` → `unregistered`;
@@ -238,8 +271,11 @@ incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
   counting as `send_failed`.
 
 Accepted duplicate requests increment none of these counters. Outcome counts
-measure actual sends and refused new work, rather than all `nil` returns
-from `Request`; each send's log uses only its first admitting daemon.
+measure sender invocations and admission/retry refusals, rather than all `nil`
+returns from `Request`; each attempt's log uses only its first admitting daemon.
+Attempt exhaustion, an excluded backoff/deadline and cancellation between
+calls add no synthetic job outcome or log line. Cancellation during a call
+still records that invocation's phase-specific outcome once.
 
 [`ErrFCMUnregistered`](fcm-push-sender.md) is the sentinel `FCMSender.Send`
 now also wraps, alongside the existing `ErrFCMSend`, when FCM's reply's
@@ -258,38 +294,42 @@ zero.
 
 ## Concurrency model
 
-- One goroutine per actual dispatched job, with at most 32 retained jobs
-  and active sends. Duplicates spawn no goroutine. Each send exits when `Send`
-  returns —
-  using one whole-send `fcmSendTimeout` budget in production, and honouring
-  `w.ctx` cancellation on `Close`. Token waiting consumes delivery time;
-  authentication does not grant the FCM POST a fresh budget. Shared refresh
-  work runs separately, with cancellation owned by its active waiters (see
-  [FCM sender concurrency](fcm-push-sender.md#concurrency)). Each send logs
-  its one outcome line before `wg.Done`
-  (deferred first, so it runs last) — `Close` returning therefore means
-  every dispatched job's outcome line has already been written (#160).
+- One goroutine per admitted job, with at most 32 retained jobs and
+  simultaneous sends. Duplicates spawn no goroutine. The job owns its fixed
+  45s deadline, up to three sender invocations and cancellable retry timers;
+  each timer is stopped on return. Its reserved slot remains occupied while
+  waiting. Each invocation uses one whole-call `fcmSendTimeout` budget in
+  production, limited by the job context. Token waiting consumes delivery
+  time; authentication does not grant the FCM POST a fresh budget. Shared
+  refresh work runs separately, with cancellation owned by its active waiters (see
+  [FCM sender concurrency](fcm-push-sender.md#concurrency)). Each invocation logs
+  its outcome line before `wg.Done` (deferred first, so it runs last) —
+  `Close` returning therefore means
+  every invoked attempt's outcome line has already been written (#160).
   Completion releases the slot and marks the job completed under `w.mu`,
   removing it immediately if its fixed window has expired, before `wg.Done`.
 - `w.mu` owns all buckets, their refill/idle timestamps, job lookup/expiry,
   sweeping and the admission commit. The closure check, duplicate check,
   all three charges, job/slot reservation and `wg.Add` are atomic against
-  other requests and `Close`.
+  other requests and `Close`. Retry charging is atomic under the same mutex,
+  after rechecking closure and the job deadline.
   Concurrent requests cannot overspend, and none is admitted after the closed
-  transition. No mutex is held across the blocking `Send` call.
+  transition. No mutex is held across blocking `Send` calls or retry waits.
 - One sweep goroutine runs every five minutes, exits on `w.ctx` cancellation
   and has its own `sweepWG`. It also reclaims expired completed jobs; new-job
   admission reclaims them before capacity checks, so no extra cleanup timer
-  or goroutine is needed. Active jobs never expire. The injected clock used
-  by budget tests is read under `w.mu`, as are the timestamps it supplies.
+  or goroutine is needed. The sweep never removes active jobs; their deadline
+  ends their goroutine instead. Allowance/coalescing time (`now`) and job
+  scheduling time (`jobNow`) are read under `w.mu`; both default to real time.
 - `Close` is idempotent: set `closed` under `w.mu`, cancel `w.ctx`,
-  `wg.Wait()` for every admitted send to return and `sweepWG.Wait()` for the
-  sweep goroutine, then clear retained jobs under `w.mu`, releasing their
-  device identities. Repeated and concurrent callers all join admitted work;
+  `wg.Wait()` for every admitted job, including sends and retry waits, and
+  `sweepWG.Wait()` for the sweep goroutine, then clear retained jobs under
+  `w.mu`, releasing their device identities. Repeated and concurrent callers
+  all join admitted work;
   none returns early merely because another caller marked the waker closed.
   With `FCMSender`, the last waiter cancels and joins unfinished token
   refresh work before its send returns, so the wait group joins cancellable
-  authentication as well as FCM delivery.
+  authentication as well as FCM delivery and stopped retry timers.
   Hijacked WebSocket connections outlive `http.Server.Shutdown`, so a
   forwarder can still call `Request` after `Close` — it gets `ErrPushOff`
   rather than a panic or a send racing shutdown.
@@ -356,7 +396,7 @@ would also pass with the incorrect truncated accounting key.
 
 Because the coalescing window equals device refill, repeated same-token
 requests cannot prove device-budget exhaustion: duplicates spend nothing,
-and each eligible new attempt has had time to refill. Controlled depleted
+and each eligible fresh admission has had time to refill. Controlled depleted
 device buckets prove exhaustion and exact refill instead. Global/daemon
 exhaustion fixtures use distinct devices so they still count actual attempts.
 Held-authentication shutdown fixtures likewise need distinct device tokens:
@@ -375,8 +415,21 @@ log attribution even with exhausted allowances and full state.
 initial admitted wakes plus reconnects using a distinct device without clock
 advance, so duplicate acceptance cannot hide reset daemon debt. These
 tests are hermetic; repository checks establish neither deployment nor live
-admission enforcement. Later retries (#173) must consume these same attempt
-budgets.
+admission enforcement.
+
+`push_retry_test.go` combines held OAuth/FCM peers with controlled scheduling,
+allowance time, waits and jitter to cover transient success, three-attempt
+exhaustion, same/cross-daemon duplicates during sends/backoff, immutable
+deadlines, guidance exclusion, atomic independent budget refusal and
+shutdown while waiting/sending. Authentication-expiry cases distinguish a
+surviving refresh waiter from last-waiter cancellation/join. Outcome/log
+assertions count invocations and refusals, with no synthetic job outcomes.
+Keep scheduling time separate from allowance-test time: historical allowance
+fixtures must not immediately expire real deadline contexts. Backoff anchors
+at call return before logging, so logging time cannot restart the delay.
+Fresh slot reservation must stay after allowance checks and before charging:
+moving it earlier skips refused-request idle timestamps; charging earlier
+would spend partial credit on refusal.
 
 `push_wake_test.go`: burst exhausted for one server-id → `ErrPushWakeRateLimited`
 using distinct devices while a different server-id is still admitted;
