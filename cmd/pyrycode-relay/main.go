@@ -209,6 +209,12 @@ func run(args []string, sigCtx context.Context) int {
 		return 2
 	}
 
+	admission, err := relay.NewDaemonAdmissionFromEnv(os.LookupEnv)
+	if err != nil {
+		logger.Error("refusing to start: invalid daemon admission config", "err", err)
+		return 2
+	}
+
 	// CheckSingleInstance is the deterministic backstop to the
 	// docs/architecture.md § Single-instance constraint prose half (#64).
 	// Refuses to start on multi-instance-capable platforms (today: Fly.io,
@@ -333,7 +339,7 @@ func run(args []string, sigCtx context.Context) int {
 	// Source admission precedes global admission inside rate limiting.
 	// Rate denials reserve neither capacity; source denials take no global
 	// slot. Both caps are shared across endpoints and return 503, not 429.
-	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics))))))
+	mux.Handle("/v1/server", upgradeMetrics.WrapServerRateLimitDeny(rateLimit(sourceCap.Wrap(connCap.Wrap(admission.Wrap(relay.ServerHandler(reg, logger, 30*time.Second, maxFrameBytes, upgradeMetrics), metricsReg))))))
 	// maxPhones=16 caps phones per server-id; over-cap registrations are
 	// rejected with WS close 4429. Per #30 architect spec.
 	mux.Handle("/v1/client", upgradeMetrics.WrapClientRateLimitDeny(rateLimit(sourceCap.Wrap(connCap.Wrap(relay.ClientHandler(reg, logger, maxFrameBytes, 16, upgradeMetrics))))))

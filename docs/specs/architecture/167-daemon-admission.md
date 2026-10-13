@@ -80,3 +80,7 @@ Pending documentation stage:
 
 **Reviewer:** builder (self-review per security-review checklist)
 **Date:** 2026-10-13
+
+## Revisions
+
+2026-10-13: Decision-table precedence is explicit: an absent identity or empty accepted-token array counts unknown even when another identity owns the token; mismatch applies to a provisioned identity with accepted tokens. Final recount is 798 added/deleted lines including the plan, one exported type, one consumer update, five criteria and five admission outcomes; the user-required full `make check` passes.

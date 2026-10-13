@@ -50,6 +50,11 @@ type envContract struct {
 // reads at boot". Every new env-var read added under cmd/pyrycode-relay or
 // internal/relay must register an entry here. Code review enforces.
 var envContracts = []envContract{
+	{name: envDaemonAdmissionMode, validate: validateDaemonAdmissionMode},
+	{name: envDaemonAdmissionCredentials, validate: func(v string) error {
+		_, err := parseDaemonAdmissionCredentials(v)
+		return err
+	}},
 	{
 		name:     envProductionMode,
 		required: false,
@@ -94,7 +99,14 @@ var envContracts = []envContract{
 // envContracts are ignored (the validator polices its declared contract, not
 // arbitrary process env).
 func CheckEnvConfig(lookup func(string) (string, bool)) error {
-	return checkEnvConfigWith(lookup, envContracts)
+	if err := checkEnvConfigWith(lookup, envContracts); err != nil {
+		return err
+	}
+	mode, _ := lookup(envDaemonAdmissionMode)
+	if _, supplied := lookup(envDaemonAdmissionCredentials); mode == "enforce" && !supplied {
+		return &ErrInvalidConfig{Key: envDaemonAdmissionCredentials, Reason: "required in enforce mode"}
+	}
+	return nil
 }
 
 func checkEnvConfigWith(lookup func(string) (string, bool), contracts []envContract) error {
