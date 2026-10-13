@@ -21,7 +21,7 @@ func NewPushMetrics(reg prometheus.Registerer, w *PushWaker) {
 	vec := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "pyrycode_relay_push_wakes_total",
-			Help: "Push wakes by outcome. dropped counts rate-limit and in-flight-cap refusals; every admitted wake counts once as sent, unregistered, send_failed or token_fetch_failed when its send returns.",
+			Help: "Push sender attempts by outcome. Each invocation counts once as sent, unregistered, send_failed or token_fetch_failed; dropped counts allowance and capacity refusals at admission or retry. Coalesced requests count nothing.",
 		},
 		[]string{"outcome"},
 	)

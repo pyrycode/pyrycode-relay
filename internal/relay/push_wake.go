@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -23,6 +24,8 @@ const (
 	pushWakeDeviceRefillEvery = 10 * time.Second
 	pushWakeDeviceBurst       = 6
 	pushWakeCoalesceWindow    = 10 * time.Second
+	pushWakeJobTimeout        = 45 * time.Second
+	pushWakeMaxAttempts       = 3
 	// Global attempt rate is distinct from concurrent sends: completed or
 	// failed sends do not return tokens to this allowance.
 	pushWakeGlobalRefillEvery = time.Second
@@ -32,7 +35,7 @@ const (
 	pushWakeMaxBuckets       = 1024 // independently for daemons and devices
 	// pushWakeMaxInFlight caps retained device jobs, including completed jobs
 	// inside their coalescing window, and concurrent sends across the relay.
-	// Each send holds one goroutine under one fcmSendTimeout deadline;
+	// Each job holds one goroutine through its bounded retry lifetime;
 	// the cap bounds goroutines and outbound sockets however
 	// many server-ids a set of binaries claims.
 	pushWakeMaxInFlight = 32
@@ -103,6 +106,9 @@ type PushWaker struct {
 	global      pushWakeBucket
 	jobs        map[[sha256.Size]byte]*pushWakeJob
 	now         func() time.Time // called only under mu
+	jobNow      func() time.Time // scheduling clock, called only under mu
+	wait        func(context.Context, time.Duration) bool
+	jitter      func() time.Duration
 
 	// onOutcome counts outcomes; nil is a no-op. Set once at boot by
 	// setOutcomeHook. It must not call back into the waker.
@@ -160,7 +166,8 @@ func newPushWaker(sender pushSender, refillEvery time.Duration, burst, maxInFlig
 		devices: make(map[[sha256.Size]byte]*pushWakeBucket),
 		jobs:    make(map[[sha256.Size]byte]*pushWakeJob),
 		global:  pushWakeBucket{tokens: pushWakeGlobalBurst, refillLast: time.Now()},
-		now:     time.Now, ctx: ctx, cancel: cancel,
+		now:     time.Now, jobNow: time.Now, wait: waitPushRetry,
+		jitter: func() time.Duration { return time.Duration(rand.Int64N(int64(time.Second) + 1)) }, ctx: ctx, cancel: cancel,
 	}
 	w.sweepWG.Add(1)
 	go w.sweepLoop()
@@ -285,6 +292,18 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		w.record(pushWakeDropped)
 		return ErrPushWakeInFlightCap
 	}
+	if err := w.chargeAttemptLocked(daemonKey, deviceKey, now, true); err != nil {
+		return err
+	}
+	deadline := w.jobNow().Add(pushWakeJobTimeout)
+	w.jobs[deviceKey] = &pushWakeJob{until: now.Add(pushWakeCoalesceWindow), active: true}
+	w.wg.Add(1)
+	go w.send(serverID, wake.Token, deviceKey, deadline)
+	return nil
+}
+
+// chargeAttemptLocked commits all three allowances together or records one drop.
+func (w *PushWaker) chargeAttemptLocked(daemonKey, deviceKey [sha256.Size]byte, now time.Time, reserveSlot bool) error {
 	daemon := requestedBucket(w.daemons, daemonKey, now, w.refillEvery, w.burst)
 	device := requestedBucket(w.devices, deviceKey, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
 	w.global.refill(now, pushWakeGlobalRefillEvery, pushWakeGlobalBurst)
@@ -300,28 +319,35 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		w.record(pushWakeDropped)
 		return ErrPushWakeRateLimited
 	}
-	select {
-	case w.slots <- struct{}{}:
-	default:
-		w.record(pushWakeDropped)
-		return ErrPushWakeInFlightCap
+	if reserveSlot {
+		select {
+		case w.slots <- struct{}{}:
+		default:
+			w.record(pushWakeDropped)
+			return ErrPushWakeInFlightCap
+		}
 	}
-	// Commit all charges only after the non-blocking slot reservation.
 	w.daemons[daemonKey], w.devices[deviceKey] = daemon, device
 	daemon.tokens--
 	device.tokens--
 	w.global.tokens--
-	w.jobs[deviceKey] = &pushWakeJob{until: now.Add(pushWakeCoalesceWindow), active: true}
-	w.wg.Add(1)
-	go w.send(serverID, wake.Token, deviceKey)
 	return nil
 }
 
-// send runs one wake, records its outcome and logs exactly one outcome line
-// for it, keyed by a fingerprint of the token, never the token. It exits when Send returns,
-// which the sender's own timeout and the waker's context (cancelled by
-// Close) both bound.
-func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte) {
+func waitPushRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// send owns one bounded device job, logging/counting each actual invocation.
+// Its reserved slot bounds active work through backoff as well as delivery.
+func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte, deadline time.Time) {
 	defer w.wg.Done()
 	defer func() {
 		w.mu.Lock()
@@ -333,31 +359,62 @@ func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte) {
 			delete(w.jobs, deviceKey)
 		}
 	}()
-	start := time.Now()
-	id, err := w.sender.Send(w.ctx, token)
-	duration := time.Since(start)
-	w.record(classifyPushWake(err))
-	fp := tokenFingerprint(token)
-	switch {
-	case err != nil:
-		// FCMSender's errors carry at most an HTTP status and FCM's enum
-		// reason codes, never the token or free text.
-		w.logger.Warn("push_wake_send_failed",
-			"server_id", serverID,
-			"token_fp", fp,
-			"duration", duration,
-			"err", err)
-	case id != "":
-		w.logger.Info("push_wake_sent",
-			"server_id", serverID,
-			"token_fp", fp,
-			"duration", duration,
-			"fcm_message_id", id)
-	default:
-		w.logger.Info("push_wake_sent",
-			"server_id", serverID,
-			"token_fp", fp,
-			"duration", duration)
+	ctx, cancel := context.WithDeadline(w.ctx, deadline)
+	defer cancel()
+	for attempt := 1; attempt <= pushWakeMaxAttempts; attempt++ {
+		start := time.Now()
+		id, err := w.sender.Send(ctx, token)
+		duration := time.Since(start)
+		w.mu.Lock()
+		completion := w.jobNow()
+		w.mu.Unlock()
+		w.record(classifyPushWake(err))
+		fp := tokenFingerprint(token)
+		switch {
+		case err != nil:
+			// FCMSender's errors carry at most an HTTP status and FCM's enum
+			// reason codes, never the token or free text.
+			w.logger.Warn("push_wake_send_failed",
+				"server_id", serverID,
+				"token_fp", fp,
+				"duration", duration,
+				"err", err)
+		case id != "":
+			w.logger.Info("push_wake_sent",
+				"server_id", serverID,
+				"token_fp", fp,
+				"duration", duration,
+				"fcm_message_id", id)
+		default:
+			w.logger.Info("push_wake_sent",
+				"server_id", serverID,
+				"token_fp", fp,
+				"duration", duration)
+		}
+		var failure *fcmRetryError
+		if attempt == pushWakeMaxAttempts || ctx.Err() != nil || errors.Is(err, ErrFCMUnregistered) || !errors.As(err, &failure) || !failure.retry {
+			return
+		}
+		w.mu.Lock()
+		now := w.jobNow()
+		w.mu.Unlock()
+		next := completion.Add(time.Duration(attempt)*10*time.Second + w.jitter())
+		if failure.notBefore.After(next) {
+			next = failure.notBefore
+		}
+		if !next.Before(deadline) || !w.wait(ctx, next.Sub(now)) {
+			return
+		}
+		w.mu.Lock()
+		if w.closed || ctx.Err() != nil || !w.jobNow().Before(deadline) {
+			w.mu.Unlock()
+			return
+		}
+		err = w.chargeAttemptLocked(sha256.Sum256([]byte(serverID)), deviceKey, w.now(), false)
+		w.mu.Unlock()
+		if err != nil {
+			return
+		}
 	}
 }
 
