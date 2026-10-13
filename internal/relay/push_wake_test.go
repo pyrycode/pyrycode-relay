@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -162,11 +163,11 @@ func TestPushWaker_RateLimitedPerServerID(t *testing.T) {
 	defer w.Close()
 
 	for i := 0; i < 2; i++ {
-		if err := w.Request("s1", wakeJSON("fcm", testWakeToken)); err != nil {
+		if err := w.Request("s1", wakeJSON("fcm", fmt.Sprint(testWakeToken, i))); err != nil {
 			t.Fatalf("wake %d: %v", i, err)
 		}
 	}
-	if err := w.Request("s1", wakeJSON("fcm", testWakeToken)); !errors.Is(err, ErrPushWakeRateLimited) {
+	if err := w.Request("s1", wakeJSON("fcm", "another-device")); !errors.Is(err, ErrPushWakeRateLimited) {
 		t.Fatalf("over-burst wake = %v, want ErrPushWakeRateLimited", err)
 	}
 	if err := w.Request("s2", wakeJSON("fcm", testWakeToken)); err != nil {
@@ -176,36 +177,22 @@ func TestPushWaker_RateLimitedPerServerID(t *testing.T) {
 }
 
 func TestPushWaker_InFlightCap(t *testing.T) {
-	t.Parallel()
-	sender := newFakePushSender()
+	w, sender, advance := budgetWaker(t, time.Millisecond, 100, 2)
 	release := make(chan struct{})
 	sender.block = release
-	w := newPushWaker(sender, time.Millisecond, 100, 2, discardLogger())
-	defer w.Close()
-
-	// Distinct server-ids so only the in-flight cap can refuse.
 	for _, id := range []string{"s1", "s2"} {
-		if err := w.Request(id, wakeJSON("fcm", testWakeToken)); err != nil {
-			t.Fatalf("wake %s: %v", id, err)
+		if err := w.Request(id, wakeJSON("fcm", id)); err != nil {
+			t.Fatal(err)
 		}
 	}
 	sender.waitStarted(t, 2)
 	if err := w.Request("s3", wakeJSON("fcm", testWakeToken)); !errors.Is(err, ErrPushWakeInFlightCap) {
-		t.Fatalf("wake over cap = %v, want ErrPushWakeInFlightCap", err)
+		t.Fatal(err)
 	}
-
 	close(release)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		err := w.Request("s4", wakeJSON("fcm", testWakeToken))
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, ErrPushWakeInFlightCap) || time.Now().After(deadline) {
-			t.Fatalf("wake after release = %v, want nil", err)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	w.wg.Wait()
+	advance(10 * time.Second)
+	budgetSend(t, w, sender, "s4", testWakeToken)
 }
 
 func TestPushWaker_CloseCancelsBlockedSend(t *testing.T) {
@@ -402,7 +389,7 @@ func TestPushWaker_CloseCancelsAuthentication(t *testing.T) {
 	w := newPushWaker(sender, time.Hour, 6, 6, logger)
 	t.Cleanup(w.Close)
 	for i := 0; i < 6; i++ {
-		if err := w.Request("s1", wakeJSON("fcm", testFCMDeviceToken)); err != nil {
+		if err := w.Request("s1", wakeJSON("fcm", fmt.Sprint(testFCMDeviceToken, i))); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -446,6 +446,7 @@ func TestDaemonAdmission_ReconnectForwardPush(t *testing.T) {
 	if err != nil || string(got) != string(opaque) {
 		t.Fatalf("opaque forward: %q, %v", got, err)
 	}
+	wake = strings.Replace(wake, testWakeToken, testWakeToken+"-other", 1) // A distinct device job without refilling debt.
 	if err := second.Write(ctx, websocket.MessageText, []byte(wake)); err != nil {
 		t.Fatal(err)
 	}
@@ -454,8 +455,9 @@ func TestDaemonAdmission_ReconnectForwardPush(t *testing.T) {
 	globalTokens := waker.global.tokens
 	daemonTokens := waker.daemons[sha256.Sum256([]byte("s1"))].tokens
 	deviceTokens := waker.devices[sha256.Sum256([]byte(testWakeToken))].tokens
+	otherDeviceTokens := waker.devices[sha256.Sum256([]byte(testWakeToken+"-other"))].tokens
 	waker.mu.Unlock()
-	if globalTokens != 30 || daemonTokens != 4 || deviceTokens != 4 {
+	if globalTokens != 30 || daemonTokens != 4 || deviceTokens != 5 || otherDeviceTokens != 5 {
 		t.Fatal("reconnect reset push allowances")
 	}
 }

@@ -18,12 +18,17 @@ func TestPushWaker_SharedAllowances(t *testing.T) {
 		n      int
 		device func(int) string
 	}{
-		{"device across identities", 6, func(int) string { return testWakeToken }},
+		{"device across identities", 0, func(int) string { return testWakeToken }},
 		{"global across devices and identities", 32, func(i int) string { return fmt.Sprint("device-", i) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w, s, _ := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, pushWakeMaxInFlight)
+			w, s, _ := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, 64)
 			defer w.Close()
+			if tc.n == 0 {
+				w.mu.Lock()
+				w.devices[sha256.Sum256([]byte(testWakeToken))] = &pushWakeBucket{refillLast: w.now(), pollLast: w.now()}
+				w.mu.Unlock()
+			}
 			for i := 0; i < tc.n; i++ {
 				if err := w.Request(fmt.Sprint("daemon-", i), wakeJSON("fcm", tc.device(i))); err != nil {
 					t.Fatal(err)
@@ -68,11 +73,16 @@ func TestPushWaker_PairedDeviceBurstAndCompleteKeys(t *testing.T) {
 	for daemon := 0; daemon < 4; daemon++ {
 		for device := 0; device < 3; device++ {
 			for event := 0; event < 2; event++ {
-				budgetSend(t, w, s, fmt.Sprint("daemon-", daemon), fmt.Sprintf("device-%d-%d", daemon, device))
+				d, token := fmt.Sprint("daemon-", daemon), fmt.Sprintf("device-%d-%d", daemon, device)
+				if event == 0 {
+					budgetSend(t, w, s, d, token)
+				} else if err := w.Request(d, wakeJSON("fcm", token)); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
-	if got := len(s.sentTokens()); got != 24 {
+	if got := len(s.sentTokens()); got != 12 {
 		t.Fatalf("paired burst = %d", got)
 	}
 	// Complete tokens sharing a long prefix or a log fingerprint remain separate.
@@ -83,7 +93,7 @@ func TestPushWaker_PairedDeviceBurstAndCompleteKeys(t *testing.T) {
 	prefix := strings.Repeat("synthetic-", 1000)
 	for _, tokens := range [][]string{{prefix + "0", prefix + "1"}, collision} {
 		w2, s2, _ := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, pushWakeMaxInFlight)
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 2; i++ {
 			budgetSend(t, w2, s2, fmt.Sprint(i), tokens[i%2])
 		}
 		if len(w2.devices) != 2 {
@@ -93,16 +103,13 @@ func TestPushWaker_PairedDeviceBurstAndCompleteKeys(t *testing.T) {
 }
 
 func TestPushWaker_RefillBoundaries(t *testing.T) {
-	for _, kind := range []string{"daemon", "device", "global"} {
+	for _, kind := range []string{"daemon", "global"} {
 		t.Run(kind, func(t *testing.T) {
-			w, s, advance := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, pushWakeMaxInFlight)
+			w, s, advance := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, 64)
 			request := func(i int) error {
 				d, token := fmt.Sprint("daemon-", i), fmt.Sprint("device-", i)
 				if kind == "daemon" {
 					d = "same-daemon"
-				}
-				if kind == "device" {
-					token = testWakeToken
 				}
 				return w.Request(d, wakeJSON("fcm", token))
 			}
@@ -147,7 +154,7 @@ func TestPushWaker_RefillBoundaries(t *testing.T) {
 
 // snapshot ignores timestamps, which must advance on a refusal, but pins every
 // retained token count and slot so partial charges and temporary inserts fail.
-func budgetSnapshot(w *PushWaker) [4]any {
+func budgetSnapshot(w *PushWaker) [5]any {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	copyTokens := func(buckets map[[32]byte]*pushWakeBucket) map[[32]byte]int {
@@ -157,7 +164,11 @@ func budgetSnapshot(w *PushWaker) [4]any {
 		}
 		return result
 	}
-	return [4]any{copyTokens(w.daemons), copyTokens(w.devices), w.global.tokens, len(w.slots)}
+	jobs := make(map[[32]byte]pushWakeJob)
+	for key, job := range w.jobs {
+		jobs[key] = *job
+	}
+	return [5]any{copyTokens(w.daemons), copyTokens(w.devices), w.global.tokens, len(w.slots), jobs}
 }
 
 func TestPushWaker_AtomicRefusals(t *testing.T) {
@@ -288,7 +299,7 @@ func TestPushWaker_StateBoundsAndExpiry(t *testing.T) {
 				t.Fatalf("idle state retained: %d", len(buckets))
 			}
 			if kind == "daemon" {
-				d = "key-0"
+				d, token = "key-0", "reuse-device"
 			} else {
 				token = "key-0"
 			}
@@ -297,11 +308,9 @@ func TestPushWaker_StateBoundsAndExpiry(t *testing.T) {
 	}
 	t.Run("refusals renew idle timestamp", func(t *testing.T) {
 		w, s, advance := budgetWaker(t, pushWakeRefillEvery, 6, 1)
-		s.block = make(chan struct{})
-		if err := w.Request("daemon", wakeJSON("fcm", testWakeToken)); err != nil {
-			t.Fatal(err)
-		}
-		s.waitStarted(t, 1)
+		budgetSend(t, w, s, "daemon", testWakeToken)
+		w.slots <- struct{}{} // Refuse a new attempt after its old job expires.
+		defer func() { <-w.slots }()
 		advance(4 * time.Minute)
 		if err := w.Request("daemon", wakeJSON("fcm", testWakeToken)); !errors.Is(err, ErrPushWakeInFlightCap) {
 			t.Fatal(err)
@@ -349,11 +358,11 @@ func TestPushWaker_StateBoundsAndExpiry(t *testing.T) {
 }
 
 func TestPushWaker_ConcurrentAdmission(t *testing.T) {
-	for _, kind := range []string{"daemon", "device", "global", "concurrency"} {
+	for _, kind := range []string{"daemon", "global", "concurrency"} {
 		t.Run(kind, func(t *testing.T) {
 			slots, want := 32, 6
 			if kind == "global" {
-				want = 32
+				slots, want = 64, 32 // Isolate allowance exhaustion from retained capacity.
 			}
 			if kind == "concurrency" {
 				slots, want = 2, 2
@@ -369,9 +378,6 @@ func TestPushWaker_ConcurrentAdmission(t *testing.T) {
 					d, token := fmt.Sprint("daemon-", i), fmt.Sprint("device-", i)
 					if kind == "daemon" {
 						d = "same"
-					}
-					if kind == "device" {
-						token = testWakeToken
 					}
 					err := w.Request(d, wakeJSON("fcm", token))
 					if err == nil {
@@ -436,4 +442,42 @@ func TestPushWaker_AdmissionRacesClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCounter(t, h, "pyrycode_relay_push_wakes_total", `outcome="send_failed"`, int(admitted.Load()))
+}
+
+// Coalescing and device refill have the same interval, so ordinary same-device
+// attempts cannot deplete its burst. Seed debt to keep this gate's proof direct.
+func TestPushWaker_DeviceDebtRefill(t *testing.T) {
+	w, s, advance := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, 32)
+	key := sha256.Sum256([]byte(testWakeToken))
+	w.mu.Lock()
+	w.devices[key] = &pushWakeBucket{refillLast: w.now(), pollLast: w.now()}
+	w.mu.Unlock()
+	advance(10*time.Second - time.Nanosecond)
+	before := budgetSnapshot(w)
+	for _, daemon := range []string{"first", "second"} {
+		if err := w.Request(daemon, wakeJSON("fcm", testWakeToken)); !errors.Is(err, ErrPushWakeRateLimited) {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(before, budgetSnapshot(w)) {
+		t.Fatal("depleted device refusal charged or inserted state")
+	}
+	advance(time.Nanosecond)
+	budgetSend(t, w, s, "first", testWakeToken)
+	w.mu.Lock()
+	credit := w.devices[key].tokens
+	w.mu.Unlock()
+	if credit != 0 {
+		t.Fatal("exact refill supplied more than one token")
+	}
+	advance(10 * time.Second)
+	budgetSend(t, w, s, "second", testWakeToken)
+	advance(time.Hour)
+	budgetSend(t, w, s, "third", testWakeToken)
+	w.mu.Lock()
+	credit = w.devices[key].tokens
+	w.mu.Unlock()
+	if credit != pushWakeDeviceBurst-1 {
+		t.Fatal("device refill exceeded burst")
+	}
 }

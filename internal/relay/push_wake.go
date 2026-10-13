@@ -22,6 +22,7 @@ const (
 	// Device budgets are shared by every daemon targeting the complete token.
 	pushWakeDeviceRefillEvery = 10 * time.Second
 	pushWakeDeviceBurst       = 6
+	pushWakeCoalesceWindow    = 10 * time.Second
 	// Global attempt rate is distinct from concurrent sends: completed or
 	// failed sends do not return tokens to this allowance.
 	pushWakeGlobalRefillEvery = time.Second
@@ -29,7 +30,8 @@ const (
 	// Keyed accounting expires only after idle state has fully refilled.
 	pushWakeEvictionInterval = 5 * time.Minute
 	pushWakeMaxBuckets       = 1024 // independently for daemons and devices
-	// pushWakeMaxInFlight caps concurrent sends across the whole relay.
+	// pushWakeMaxInFlight caps retained device jobs, including completed jobs
+	// inside their coalescing window, and concurrent sends across the relay.
 	// Each send holds one goroutine under one fcmSendTimeout deadline;
 	// the cap bounds goroutines and outbound sockets however
 	// many server-ids a set of binaries claims.
@@ -86,7 +88,9 @@ type pushSender interface {
 
 // PushWaker admits wake requests from binaries and sends each one off the
 // binary read loop, under daemon, device and global allowances and a
-// relay-wide in-flight cap. A nil *PushWaker means push is off. Safe for concurrent use.
+// relay-wide retained-job cap. Same-device requests coalesce for a fixed window
+// or until the send ends, whichever is later. A nil *PushWaker means push is off.
+// Safe for concurrent use.
 type PushWaker struct {
 	sender pushSender
 	slots  chan struct{}
@@ -97,6 +101,7 @@ type PushWaker struct {
 	daemons     map[[sha256.Size]byte]*pushWakeBucket
 	devices     map[[sha256.Size]byte]*pushWakeBucket
 	global      pushWakeBucket
+	jobs        map[[sha256.Size]byte]*pushWakeJob
 	now         func() time.Time // called only under mu
 
 	// onOutcome counts outcomes; nil is a no-op. Set once at boot by
@@ -112,6 +117,12 @@ type PushWaker struct {
 	closed  bool
 	wg      sync.WaitGroup
 	sweepWG sync.WaitGroup
+}
+
+// Completed jobs retain only bounded metadata, never a raw device token.
+type pushWakeJob struct {
+	until  time.Time
+	active bool
 }
 
 type pushWakeBucket struct {
@@ -147,6 +158,7 @@ func newPushWaker(sender pushSender, refillEvery time.Duration, burst, maxInFlig
 		refillEvery: refillEvery, burst: burst,
 		daemons: make(map[[sha256.Size]byte]*pushWakeBucket),
 		devices: make(map[[sha256.Size]byte]*pushWakeBucket),
+		jobs:    make(map[[sha256.Size]byte]*pushWakeJob),
 		global:  pushWakeBucket{tokens: pushWakeGlobalBurst, refillLast: time.Now()},
 		now:     time.Now, ctx: ctx, cancel: cancel,
 	}
@@ -176,8 +188,17 @@ func (w *PushWaker) sweep() {
 }
 
 func (w *PushWaker) sweepLocked(now time.Time) {
+	w.expireJobsLocked(now)
 	w.evictIdle(w.daemons, now, w.refillEvery, w.burst)
 	w.evictIdle(w.devices, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
+}
+
+func (w *PushWaker) expireJobsLocked(now time.Time) {
+	for key, job := range w.jobs {
+		if !job.active && !now.Before(job.until) {
+			delete(w.jobs, key)
+		}
+	}
 }
 
 func (w *PushWaker) evictIdle(buckets map[[sha256.Size]byte]*pushWakeBucket, now time.Time, every time.Duration, burst int) {
@@ -235,7 +256,8 @@ func NewPushWakerFromEnv(lookup func(string) (string, bool), logger *slog.Logger
 // Request validates the raw push_wake object from serverID's binary and,
 // if admitted, sends the wake on its own goroutine. It never blocks on the
 // send and never queues: a wake over any limit is refused with an error
-// for the caller to log. No returned error carries the token.
+// for the caller to log. A duplicate of an active or unexpired device job
+// returns nil without charging or extending that job. No error carries the token.
 func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	if w == nil {
 		return ErrPushOff
@@ -255,6 +277,14 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		return ErrPushOff
 	}
 	now := w.now()
+	if job := w.jobs[deviceKey]; job != nil && (job.active || now.Before(job.until)) {
+		return nil
+	}
+	w.expireJobsLocked(now)
+	if len(w.jobs) >= cap(w.slots) {
+		w.record(pushWakeDropped)
+		return ErrPushWakeInFlightCap
+	}
 	daemon := requestedBucket(w.daemons, daemonKey, now, w.refillEvery, w.burst)
 	device := requestedBucket(w.devices, deviceKey, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
 	w.global.refill(now, pushWakeGlobalRefillEvery, pushWakeGlobalBurst)
@@ -281,8 +311,9 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	daemon.tokens--
 	device.tokens--
 	w.global.tokens--
+	w.jobs[deviceKey] = &pushWakeJob{until: now.Add(pushWakeCoalesceWindow), active: true}
 	w.wg.Add(1)
-	go w.send(serverID, wake.Token)
+	go w.send(serverID, wake.Token, deviceKey)
 	return nil
 }
 
@@ -290,9 +321,18 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 // for it, keyed by a fingerprint of the token, never the token. It exits when Send returns,
 // which the sender's own timeout and the waker's context (cancelled by
 // Close) both bound.
-func (w *PushWaker) send(serverID, token string) {
+func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte) {
 	defer w.wg.Done()
-	defer func() { <-w.slots }()
+	defer func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		<-w.slots
+		job := w.jobs[deviceKey]
+		job.active = false
+		if !w.now().Before(job.until) {
+			delete(w.jobs, deviceKey)
+		}
+	}()
 	start := time.Now()
 	id, err := w.sender.Send(w.ctx, token)
 	duration := time.Since(start)
@@ -322,7 +362,8 @@ func (w *PushWaker) send(serverID, token string) {
 }
 
 // Close refuses further wakes, cancels in-flight sends, waits for them to
-// return and stops sweeping. Concurrent callers also join admitted work.
+// return, stops sweeping and releases retained jobs. Concurrent callers
+// also join admitted work.
 func (w *PushWaker) Close() {
 	w.mu.Lock()
 	w.closed = true
@@ -331,4 +372,7 @@ func (w *PushWaker) Close() {
 	w.cancel()
 	w.wg.Wait()
 	w.sweepWG.Wait()
+	w.mu.Lock()
+	w.jobs = nil
+	w.mu.Unlock()
 }

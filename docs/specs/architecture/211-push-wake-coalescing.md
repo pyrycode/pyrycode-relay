@@ -78,3 +78,7 @@ Pending for the documentation stage:
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-13
+
+## Revisions
+
+- 2026-10-13: The full `make check` gate exposed another duplicate-based authentication fixture in `cmd/pyrycode-relay/main_e2e_test.go` → `TestRun_ProcessSIGTERMCompleteShutdown`. Read its process helper and held OAuth transport; adapt its six requests to distinct tokens, preserving six shared-refresh waiters and phase-specific outcomes under actual SIGTERM. The cached overlap check found `origin/feature/127` in this additional file; its diff adds the separate grace-reclaim test and helpers, so the one-line push fixture change is local and independent. No production design changes; the final surface is one production file, six test files and this plan, still below 700 written lines. This process test also covers joined shared-authentication shutdown in the lifecycle table above.

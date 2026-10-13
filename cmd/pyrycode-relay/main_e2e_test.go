@@ -1030,7 +1030,7 @@ func TestRun_ProcessSIGTERMCompleteShutdown(t *testing.T) {
 	// budget prevents their ten-second expiry from substituting for SIGTERM.
 	wakeStart := time.Now()
 	for i := 0; i < 6; i++ {
-		write(binary, []byte(`{"push_wake":{"platform":"fcm","token":"synthetic-device-token"}}`))
+		write(binary, []byte(fmt.Sprintf(`{"push_wake":{"platform":"fcm","token":"synthetic-device-token-%d"}}`, i)))
 	}
 	awaitEvent("joined")
 	select {
