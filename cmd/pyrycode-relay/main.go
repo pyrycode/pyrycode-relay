@@ -139,7 +139,9 @@ func run(args []string, sigCtx context.Context) int {
 		maxListenerConnections = fs.Int("max-listener-connections", defaultMaxListenerConnections,
 			"Cap on accepted connections per public listener, including PROXY, TLS, HTTP and WebSockets. "+
 				"Additional connections wait until a socket closes. Must be positive; metrics are separate.")
-		showVersion = fs.Bool("version", false, "Print version and exit.")
+		upgradeRefillInterval = fs.Duration("upgrade-refill-interval", 6*time.Second, "Time between replenished upgrade attempts per source. Must be positive.")
+		upgradeBurst          = fs.Int("upgrade-burst", 20, "Maximum burst of upgrade attempts per source. Must be positive.")
+		showVersion           = fs.Bool("version", false, "Print version and exit.")
 	)
 	_ = fs.Parse(args)
 
@@ -178,6 +180,13 @@ func run(args []string, sigCtx context.Context) int {
 		logger.Error("refusing to start: invalid --max-listener-connections",
 			"value", *maxListenerConnections,
 			"fix", "pass a positive connection count, or omit the flag for the default")
+		return 2
+	}
+
+	if *upgradeRefillInterval <= 0 || *upgradeBurst <= 0 {
+		logger.Error("refusing to start: invalid upgrade rate limit",
+			"interval", *upgradeRefillInterval, "burst", *upgradeBurst,
+			"fix", "pass positive --upgrade-refill-interval and --upgrade-burst values")
 		return 2
 	}
 
@@ -312,19 +321,15 @@ func run(args []string, sigCtx context.Context) int {
 	// four orders of magnitude below the library's 32 MiB default).
 	const maxFrameBytes int64 = 256 * 1024
 
-	// Per-IP rate-limit policy: ~10 attempts/IP/minute steady-state, burst
+	// Default per-IP rate-limit policy: ~10 attempts/IP/minute steady-state, burst
 	// 20. Derivation: docs/threat-model.md § DoS resistance future-hardening
 	// line names ~10/min/IP and burst headroom for retry storms; the 5-min
 	// eviction sweep keeps the bucket map's resident size bounded under
 	// address-space scanning (docs/specs/architecture/50-ip-rate-limiter.md
 	// § Adversarial walk). All three values must be positive — NewIPRateLimiter
 	// panics on a zero/negative evictionInterval via time.NewTicker.
-	const (
-		rateLimitRefillEvery      = 6 * time.Second
-		rateLimitBurst            = 20
-		rateLimitEvictionInterval = 5 * time.Minute
-	)
-	limiter := relay.NewIPRateLimiter(rateLimitRefillEvery, rateLimitBurst, rateLimitEvictionInterval)
+	const rateLimitEvictionInterval = 5 * time.Minute
+	limiter := relay.NewIPRateLimiter(*upgradeRefillInterval, *upgradeBurst, rateLimitEvictionInterval)
 	// Graceful shutdown (#31) reaches limiter.Close on the clean return
 	// path: a signal or a listener-goroutine error triggers relay.Shutdown
 	// before run returns.
