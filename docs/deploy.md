@@ -120,6 +120,11 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    refuses to boot. See
    [`docs/architecture.md` § *The `PYRYCODE_RELAY_SINGLE_INSTANCE` bypass*](architecture.md#the-pyrycode_relay_single_instance-bypass)
    for the rationale.
+   The assertion does not count Machines. Disabled autostart prevents
+   automatic starts, not creation; these settings enforce no maximum of one.
+   Verify actual inventory with `flyctl machine list -a pyrycode-relay`
+   before and after rehearsals and production activation, preserving exactly
+   one active relay.
 2. **`processes = ["app"]` on each `[[services]]` block.** Fly's schema
    requires every service to name its process whenever `[processes]` is
    defined, and `[processes]` is always defined here because the
@@ -229,6 +234,19 @@ deployment (first bootstrap, re-cutover, or porting to a new app).
    Offline manifest validation does not establish the effective Machine
    policy or live recovery. Complete the operator checks below before
    production deployment.
+
+8. **Explicit complete-process stop allowance.** Top-level
+   `kill_signal = "SIGTERM"` and integer `kill_timeout = 30` (#200) allow
+   five seconds above the conservative 25-second process budget: 10s for
+   `runServers`' HTTP/WebSocket drain, 10s for subsequent concurrent push
+   cancellation/authentication join, and 5s for local limiter joins,
+   scheduling and exit. The ten-second drain alone does not cover deferred
+   cleanup. Neither the measured fast regression exit nor the two-second
+   push unit-test assertion replaces that budget. No production deadline
+   changed. Fly's [stop allowance](https://docs.fly.io/reference/configuration/#runtime-options)
+   is best-effort (maximum 300s); shorter stopping times remain possible.
+   Recheck the full call path and retain at least five seconds of margin
+   when changing shutdown behavior. See [graceful shutdown](knowledge/features/graceful-shutdown.md#contract).
 
 ## Steady-state flow
 
@@ -481,6 +499,35 @@ All #198 operator follow-ups remain **pending**; merge and hermetic tests comple
 
 ## Verify a deploy
 
+### Complete-process shutdown
+
+The #200 operator checklist remains **pending**; local tests and merge
+complete none of these operational checkboxes. Use an isolated Fly
+deployment with separate domains, clients and synthetic credentials, and
+never route rehearsal traffic through production.
+
+- [ ] Under admitted binary/phone traffic and held synthetic authentication,
+  send real SIGTERM. Record both peers' close codes (1001), whole-process
+  exit time, authentication cancellation time, one OAuth/no FCM request,
+  six `token_fetch_failed` outcomes and joined authentication cleanup.
+  Inspect `flyctl machine status <machine-id> -d -a <isolated-app>` for
+  effective `config.kill_signal`, `config.kill_timeout` and `app` restart
+  policy, and compare the observed lifecycle to the 25s budget/30s allowance.
+  Socket cancellation alone is insufficient evidence of cleanup completion.
+- [ ] Discover a current certificate snapshot and restore to a new encrypted
+  isolated volume using [Certificate snapshot recovery](#certificate-snapshot-recovery).
+  Record access, source/snapshot/destination IDs, steps, successful cache
+  recovery without key disclosure and elapsed recovery time.
+- [ ] Before and after both rehearsals and production activation, record actual
+  production Machine inventory (`flyctl machine list -a pyrycode-relay`),
+  IDs and states; preserve exactly one active production relay.
+- [ ] After isolated shutdown and [#199's eleven-crash recovery checks](#app-restart-recovery)
+  pass, deploy from clean `main` using the [steady-state flow](#steady-state-flow).
+  Verify the production Machine's effective `app`/`always` restart policy,
+  SIGTERM/30s stop settings and image digest; retain UTC observations and
+  results. Capture the prior immutable image for [rollback](#rollback).
+  Alert installation/delivery remains [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
+
 ### App restart recovery
 
 The #199 live checks remain **pending for the operator**. On an isolated
@@ -503,7 +550,8 @@ deploy the intended image and manifest before testing recovery:
   Retain UTC timestamps, Machine ID, image digest, effective config and
   exit/restart events alongside the recovery observations.
 
-After these checks pass, manually deploy from clean `main` using the
+After these recovery checks and the [isolated shutdown check](#complete-process-shutdown)
+pass, manually deploy from clean `main` using the
 [steady-state flow](#steady-state-flow). Preserve exactly one active
 production relay throughout recovery and deployment; do not add a production
 replica for testing. Re-read the production Machine's effective restart
@@ -622,17 +670,21 @@ through the daemon's backoff ladder — measured at 13 s for two binaries on
 
 ## Rollback
 
-Two paths, in increasing order of disruption.
+Before activation, capture the currently running immutable image digest
+from the Machine's detailed status and retain it with the release evidence.
+The #200 inventory observed this rollback target; refresh it if the running
+image has changed:
 
-1. **By image digest (preferred).** `flyctl releases list -a
-   pyrycode-relay` shows recent release digests. `flyctl deploy --image
-   <prior-digest> --remote-only -a pyrycode-relay` pins to the prior
-   image without rebuilding. The autocert cache persists across
-   rollbacks (it's on the volume), so no Let's Encrypt re-issuance is
-   triggered.
-2. **By release number.** `flyctl releases rollback -a pyrycode-relay`
-   rolls back the *most recent* release. Use when the prior release's
-   digest isn't to hand and a rollback is needed immediately.
+```text
+registry.fly.io/pyrycode-relay@sha256:cf2f4d979e111157ca776f771bcd2df0ea1ff7cac24a355763047249d9cde241
+```
+
+Roll back with `flyctl deploy --image <previous-immutable-image-digest>
+--remote-only -a pyrycode-relay`. This pins the previous artifact without
+rebuilding. The autocert cache persists on its volume across image rollbacks.
+Retain the explicit SIGTERM/30s settings and #199's `app`/`always` restart
+policy, verify their effective Machine values and image after rollback,
+and record actual inventory with exactly one active relay.
 
 A rollback does **not** revert the `main` commit. Because deploys are
 operator-direct, there is no auto-deploy that would re-roll a broken
@@ -640,8 +692,9 @@ release forward — but the next manual `flyctl deploy --remote-only`
 WILL rebuild from `main`'s current HEAD. Revert the offending PR on
 `main` before the next deploy, or you'll re-ship the bad change.
 
-Both rollback paths redeploy the image only — they do **not** touch the
-checked-in `fly.toml`. A rollback to a pre-#110 image while the manifest
+An image rollback does **not** edit the checked-in `fly.toml`; review its
+compatibility with the selected image. A rollback to a pre-#110 image while
+the manifest
 still carries `handlers = ["proxy_proto"]` on `443` fails `443` closed (the
 older binary has no `--https-proxy-protocol` flag and never opens the
 proxyproto-wrapped listener, so the PROXY header hits its TLS handshake as
@@ -649,3 +702,47 @@ garbage). Rolling back across the #110 boundary means also reverting
 `fly.toml`'s `443` port block and `[processes] app` line to their pre-#110
 state, then deploying that combination — see the *fly.toml gotchas* item
 above.
+
+## Certificate snapshot recovery
+
+This rehearsal is **pending**, using the operator's local Fly login
+(`flyctl auth login`), not the CI read-only scan credential. Follow
+[Fly's restore procedure](https://docs.fly.io/volumes/volume-manage/).
+The source observed for #200 is `vol_rkggyj5jel8o0xk4`, mounted at
+`/var/lib/relay/autocert`. Confirm its current identity and provisioned size
+with `fly volumes show vol_rkggyj5jel8o0xk4 --app pyrycode-relay`, then
+refresh discovery:
+
+```sh
+fly volumes snapshots list vol_rkggyj5jel8o0xk4 --app pyrycode-relay
+```
+
+The inventory observed `vs_ov9G6nK906KS2JD4ZZJ11Y`, created
+2026-10-12T14:50:17Z with five-day retention. It expires; do not pin it in a
+recovery command. Select a current completed snapshot and record its creation
+time and retention. Use the source's provisioned volume size, not the
+snapshot's compressed stored size, for the destination size.
+
+Create a new volume with a distinct recovery name and size at least as large
+as the source and at least 1 GiB:
+
+```sh
+fly volumes create <recovery-volume-name> --snapshot-id <current-snapshot-id> --size <size-in-GiB> --region <recovery-region> --app <recovery-app>
+```
+
+[Volume creation](https://docs.fly.io/flyctl/cmd/fly_volumes_create)
+encrypts contents by default; do not use `--no-encryption`, and verify
+`Encrypted: true` in the destination metadata. Attach only the new destination
+volume to an isolated recovery Machine with no production traffic, DNS or
+clients. Never replace or mount over the live volume, and never start a
+second active production relay. A restored cache contains production private
+keys even when the recovery Machine is isolated.
+
+Preserve cache ownership and permissions for the relay UID (`65532` in the
+image), with directory mode `0700` and private cache files. Validate successful
+cache recovery in isolation without printing file contents or certificate
+keys and without sending ACME requests for the production domain. Record
+local-login access success (no token), source/snapshot/destination and recovery
+Machine IDs, sizes/encryption, commands, isolation controls, permission and
+cache-read results, start/end UTC times and elapsed recovery time. Snapshot
+discovery alone does not complete the recovery checkbox.

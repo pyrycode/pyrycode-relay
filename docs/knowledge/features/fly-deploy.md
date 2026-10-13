@@ -4,7 +4,7 @@ The relay's production host is a single [Fly.io](https://fly.io) machine in one 
 
 ## What it does
 
-- **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and a single-machine hard cap.
+- **`fly.toml`** declares a Fly Apps v2 app with TCP passthrough on `:80` + `:443`, a persistent volume at `/var/lib/relay/autocert`, and explicit single-machine intent. Actual Machine count remains operator-verified.
 - **Operator-direct deploy:** from a clean checkout of `main`, run `make check` then `flyctl deploy --remote-only -a pyrycode-relay`. Fly's remote builder rebuilds the image from `Dockerfile` against `main`'s HEAD and rolls the single machine in place via the `rolling` strategy, which waits for the `internal_port = 8080` service's TCP check before finishing — a relay that refuses to boot fails the deploy rather than leaving production down ([#118](../codebase/118.md)). No GHA workflow auto-deploys.
 - **Bootstrap is one-time:** `flyctl apps create` → `flyctl ips allocate-v4` → `flyctl volumes create relay_autocert` → DNS → fill `__REGION__` / `__DOMAIN__` placeholders in `fly.toml`. The operator authenticates `flyctl` locally (`flyctl auth login` / `FLY_API_TOKEN` in the local environment). The separate daily scan uses the GitHub repository secret `FLY_READONLY_TOKEN`; provisioning and rotation are in [the bootstrap runbook](../../deploy.md#daily-security-scan-credential).
 
@@ -106,20 +106,39 @@ equivalent evidence after a watcher restart.
 
 The relay's connection registry is **in-process** (`internal/relay/registry.go`); two machines hold two disjoint registries and silently drop phones routed to the "wrong" replica. This is a correctness constraint, not a cost optimisation — `docs/architecture.md § Single-instance constraint (v1)` is canonical.
 
-Fly Apps v2 has **no `max_machines` key**. The cap is encoded via four declarative knobs:
+Fly Apps v2 has **no `max_machines` key**. Despite the historical section
+name, these knobs express intent and enforce no maximum of one:
 
 | Knob | Setting | Why |
 | --- | --- | --- |
-| `[[services]] min_machines_running` | `1` | Don't drop below one |
-| `[[services]] auto_start_machines` | `false` | Don't let Fly create new machines on demand |
-| `[[services]] auto_stop_machines` | `"off"` | Don't stop the one machine |
-| `[deploy] strategy` | `"rolling"` | Updates the one machine in place and waits for its health check; never creates a second machine |
+| `[[services]] min_machines_running` | `1` | Minimum for proxy autostop in the primary region when enabled; no upper bound |
+| `[[services]] auto_start_machines` | `false` | Prevent automatic starts of existing Machines, not creation |
+| `[[services]] auto_stop_machines` | `"off"` | Disable proxy-driven idle stops |
+| `[deploy] strategy` | `"rolling"` | Update Machines one at a time and wait for checks; no count guard |
 
-Operator discipline at `flyctl scale count` is the platform-level ceiling — Fly itself does not enforce one. The in-binary `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing backstop for an operator mistake.
+`PYRYCODE_RELAY_SINGLE_INSTANCE=1` is required on Fly to assert operator
+intent to the [startup check](single-instance-check.md). It reads environment
+variables only, not Machine inventory; all replicas can inherit the same
+assertion. Verify `flyctl machine list -a pyrycode-relay` before and after
+rehearsals and activation and preserve exactly one active production relay.
+Neither a successful boot nor the manifest proves that count.
+
+### Complete-process stop allowance
+
+Top-level `kill_signal = "SIGTERM"` and `kill_timeout = 30` (#200) cover the
+[25-second complete-process budget](graceful-shutdown.md#contract) with five
+seconds of margin. The ten-second drain precedes deferred push/limiter cleanup;
+observed fast exits do not replace that full drain in the budget. The
+allowance is [best-effort](https://docs.fly.io/reference/configuration/#runtime-options),
+not a platform guarantee or new production deadline. The hermetic real-SIGTERM
+regression checks joined authentication cleanup inside the child as well as
+wire closes and process exit. Effective settings, live shutdown and
+[certificate snapshot recovery](../../deploy.md#certificate-snapshot-recovery)
+remain [pending operator checks](../../deploy.md#complete-process-shutdown).
 
 ### Deploy health check — TCP on 8080, `rolling` waits for it ([#118](../codebase/118.md))
 
-`[deploy] strategy` is `"rolling"`, not `"immediate"`. `rolling` replaces machines one at a time and waits for each machine's checks before finishing; `immediate` replaces machines without waiting for any check, even when one exists. On this one-machine fleet `rolling` still updates in place — it creates no second machine, so the single-machine hard cap above is unaffected; only `immediate` vs. `rolling` changed, not `min_machines_running` / `auto_start_machines` / `auto_stop_machines`.
+`[deploy] strategy` is `"rolling"`, not `"immediate"`. `rolling` replaces machines one at a time and waits for each machine's checks before finishing; `immediate` replaces machines without waiting for any check, even when one exists. The intended one-machine fleet updates in place, but rolling strategy enforces no maximum count; inspect actual inventory. The #118 change left `min_machines_running` / `auto_start_machines` / `auto_stop_machines` unchanged.
 
 The `internal_port = 8080` service carries a `[[services.tcp_checks]]` block (`grace_period = "30s"`, `interval = "15s"`, `timeout = "5s"`). The `internal_port = 8443` service has no check. The check is TCP, not HTTP, and lives on 8080 rather than 8443, because no port a Fly check can reach serves `/healthz`:
 
@@ -210,17 +229,18 @@ Fly's remote builder rebuilds the image from `Dockerfile` on every deploy rather
 
 ## Rollback
 
-Two paths in `docs/deploy.md`, both operator-driven:
-
-1. **By image digest (preferred).** `flyctl releases list` → `flyctl deploy --image <prior-digest> --remote-only`. Autocert cache persists across rollbacks (it's on the volume) — no Let's Encrypt re-issuance triggered.
-2. **By release number.** `flyctl releases rollback` rolls back the most recent release. Use when the prior digest isn't to hand.
+Capture the previous immutable running image digest before activation, then
+use `flyctl deploy --image <prior-digest> --remote-only` as described in
+[the rollback runbook](../../deploy.md#rollback). The autocert cache persists
+on its volume. Retain SIGTERM/30s and `app`/`always` settings, verify their
+effective values and image, and inspect actual Machine inventory after rollback.
 
 A rollback does **not** revert the `main` commit. Because deploys are operator-direct, no auto-deploy re-rolls a broken release forward — but the next manual `flyctl deploy --remote-only` rebuilds from `main`'s current HEAD. Revert the offending PR on `main` before the next deploy, or it ships again.
 
 ## What this feature deliberately does NOT do
 
 - **No Fly-managed TLS, no Fly HTTP proxy.** Both would break autocert and silently change the rate-limiter's view of the peer IP.
-- **No platform-level enforcement of single-machine cap.** Fly has no ceiling knob; operator discipline + the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65) is the load-bearing combination.
+- **No Machine-count enforcement.** The manifest and `PYRYCODE_RELAY_SINGLE_INSTANCE` assertion do not count Machines or prevent scale-out; the operator verifies inventory.
 - **No deploy-approval gate.** Deploys are operator-direct; the gate is operator discipline (clean `main` + `make check` before `flyctl deploy`), not a CI approval step.
 - **No multi-region / multi-instance scaling.** Blocked on the in-process-registry constraint; separate prerequisite ticket.
 - **No image-reuse from the scan job.** Always `--remote-only` rebuild; privilege-minimisation over rebuild-time.

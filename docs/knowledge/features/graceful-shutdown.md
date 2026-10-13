@@ -2,7 +2,13 @@
 
 On `SIGTERM` or `SIGINT`, the relay drains in-flight WebSocket connections to a clean `1001 StatusGoingAway` close before exiting. Connected phones and binaries observe the close code on the wire and run their existing reconnect path instead of seeing a TCP reset mid-frame.
 
-Best-effort by design: the drain has a bounded deadline (default 10s). WebSocket closes run concurrently and use the underlying `github.com/coder/websocket` library's close-handshake bounds. At deadline, shutdown force-closes HTTP connections via `http.Server.Close()` and returns; hijacked WebSockets are outside that call's reach, and process exit closes any remaining sockets. Handler goroutines are not joined.
+Best-effort by design: the HTTP/WebSocket drain has a bounded deadline
+(10s), followed by deferred push and limiter cleanup before process exit.
+WebSocket closes run concurrently and use the underlying
+`github.com/coder/websocket` library's close-handshake bounds. At deadline,
+shutdown force-closes HTTP connections via `http.Server.Close()` and returns;
+hijacked WebSockets are outside that call's reach, and process exit closes
+any remaining sockets. Handler goroutines are not joined.
 
 ## Contract
 
@@ -16,6 +22,21 @@ Best-effort by design: the drain has a bounded deadline (default 10s). WebSocket
 - **Upgrade versus admission**: a successful WebSocket dial proves the HTTP upgrade, not registry admission. On these endpoints a native ping/pong round trip with a reader active proves the handler reached its post-admission read loop. This needs no relay-originated application acknowledgement; registration follows the [Binary → relay contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#binary--relay).
 - **Close code on the wire**: snapshotted connections receive concurrent `CloseWithCode(StatusGoingAway, "shutting down")` calls; late rejected upgrades receive the same call from their own handler. `closeOnce` prevents double emission if another close races it (ADR-0007); only the first close-family call chooses the code.
 - **Drain deadline**: 10 seconds by default, declared as `const drainDeadline = 10 * time.Second` at the wiring site in `cmd/pyrycode-relay/main.go`. Expiry returns `ctx.Err()` after calling `http.Server.Close()` on each server. WebSocket close goroutines and late handlers may outlive that return within the library's close bounds; process exit reaps anything remaining.
+- **Complete exit**: after `runServers` returns, `run` first closes the
+  upgrade `IPRateLimiter`, then `PushWaker` when enabled. The waker refuses
+  new wakes, cancels sends, joins their final outcomes and unfinished shared
+  authentication, then closes its own limiter. Only after these defers does
+  `main` call `os.Exit`; the drain deadline does not cover this cleanup.
+- **Configured process budget**: #200 reserves 25s = the full 10s drain +
+  10s conservative subsequent push cancellation/authentication join + 5s
+  for local limiter joins, scheduling and exit. Push sends and shared refresh
+  cleanup run concurrently, so six wakes do not multiply the allowance.
+  Both limiter joins stop local eviction workers without network I/O. The
+  existing send/refresh deadlines inform the budget; no cleanup deadline was
+  added. Runtime or transport stalls can exceed it. Fly's SIGTERM/30s
+  [best-effort allowance](../../deploy.md#flytoml-gotchas) adds five seconds;
+  fast responsive-peer tests and the two-second push unit assertion are
+  evidence, not worst-case bounds or platform guarantees.
 
 ## API
 
@@ -54,16 +75,18 @@ before any socket I/O.
 
 ## Sequence
 
-1. `main` calls `signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)` and threads the resulting context into `run`.
-2. `run` launches one goroutine per `*http.Server` (insecure: public + optional metrics; autocert: HTTPS + HTTP-01 + optional metrics) invoking `ListenAndServe` or `ListenAndServeTLS("", "")`. Each goroutine forwards non-`http.ErrServerClosed` returns to a 1-slot buffered `listenerErr` channel (first error wins, additional errors dropped).
-3. `run` `select`s on `<-sigCtx.Done()` (operator-triggered) or `<-listenerErr` (listener-triggered).
+1. `main` calls `signalContextFor(syscall.SIGTERM, syscall.SIGINT)`, which wraps `signal.NotifyContext`, and threads the resulting context into `run`.
+2. `runServers` launches one goroutine per `*http.Server` (insecure: public + optional metrics; autocert: HTTPS + HTTP-01 + optional metrics) through its `listen` closure. Each goroutine forwards non-`http.ErrServerClosed` returns to a 1-slot buffered `listenerErr` channel (first error wins, additional errors dropped).
+3. `runServers` `select`s on `<-sigCtx.Done()` (operator-triggered) or `<-listenerErr` (listener-triggered).
 4. Either branch builds `drainCtx, cancel := context.WithTimeout(context.Background(), drainDeadline)` and calls `relay.Shutdown(drainCtx, logger, reg, servers...)`.
 5. Inside `Shutdown`:
    - Call `conns := reg.beginDrain()` to close admission and snapshot registered handles atomically, before launching HTTP shutdown.
    - For each server: launch a goroutine running `srv.Shutdown(drainCtx)` — closes listeners and waits for non-hijacked handlers.
    - For each snapshotted conn: launch a goroutine running `c.CloseWithCode(StatusGoingAway, "shutting down")` (or plain `c.Close()` if the conn doesn't implement the unexported `gracefulCloser` interface). The fan-out unblocks WS handlers' reads so they unwind through their existing defers. Late upgraded handlers rejected by the registry close their own sockets outside this fan-out.
    - Wait on `done` (WaitGroup zero) or `drainCtx.Done()`. On ctx-first, iterate `servers` and call `srv.Close()` to force-close any non-WS conn or listener still pending; return `ctx.Err()`. On done-first, return `nil`.
-6. `run` returns 0 or 1 based on the trigger; `main` calls `os.Exit(run(...))`.
+6. `runServers` returns 0 or 1 based on the trigger. `run` executes its
+   deferred upgrade-limiter close and push cleanup before returning that code;
+   `main` then calls `os.Exit(run(...))`.
 
 ## Concurrency model
 
@@ -91,17 +114,36 @@ pins deadline expiry with a real unread WebSocket peer.
 
 ## Wiring (`cmd/pyrycode-relay/main.go`)
 
-Three structural seams:
+Serving entry points:
 
-1. **Process entry split**: `main` is one line — `os.Exit(run(os.Args[1:], signalContextFor(syscall.SIGTERM, syscall.SIGINT)))`. The split exists so end-to-end tests in `main_e2e_test.go` can drive `run` with a synthetic `context.Context` instead of forking a subprocess to send real signals.
+1. **Process entry split**: `main` is one line — `os.Exit(run(os.Args[1:], signalContextFor(syscall.SIGTERM, syscall.SIGINT)))`. End-to-end tests can drive `run` with synthetic cancellation; the complete-process regression re-executes the test executable and calls the same `run` and signal helper with real SIGTERM.
 2. **`run(args []string, sigCtx context.Context) int`**: builds the servers slice for the active mode (insecure: 1 + optional metrics; autocert: 2 + optional metrics) and delegates to `runServers`.
 3. **`runServers(sigCtx, logger, reg, servers, listen)`**: single sink for both modes. The `listen func(*http.Server) error` closure abstracts the per-server choice between `ListenAndServe` and `ListenAndServeTLS("", "")`.
 
-The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction goroutine) now runs on every shutdown path — previously the `os.Exit(1)` calls inside listener goroutines skipped it.
+The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction
+goroutine) runs before `defer pushWaker.Close()` in LIFO order on serving
+shutdown paths. Previously, `os.Exit(1)` calls inside listener goroutines
+skipped deferred cleanup. `PushWaker.Close` joins authentication through the
+last send's refresh-waiter cleanup; see [push concurrency](push-wake-dispatch.md#concurrency-model).
+
+Two grouped boot factories retain `relay.NewPushWakerFromEnv` and
+`relay.NewMetricsRegistry` as production defaults. Only the isolated process
+regression wraps them, delegating construction unchanged and retaining the
+waker/metrics for assertions after `run` returns. `PushWaker.RefreshState`
+snapshots the FCM refresh's joined-waiter count and completion channel under
+the cache mutex, without I/O, credentials or mutation. Retaining that channel
+allows the child to prove completion after the cache removes the attempt.
+These observations add no public endpoint or protocol acknowledgement and
+leave production deadlines unchanged.
 
 ## Threat model alignment
 
-- **DoS resistance**: shutdown's wait is context-bounded. Per-conn close goroutines are independent; one stuck peer doesn't block another's close. At deadline, `srv.Close()` force-closes HTTP connections; process exit closes remaining hijacked sockets. Late handlers cannot reopen registry admission or hold up shutdown with an unbounded join.
+- **DoS resistance**: the HTTP/WebSocket drain's wait is context-bounded;
+  deferred push cleanup follows outside that deadline. Per-conn close
+  goroutines are independent; one stuck peer doesn't block another's close.
+  At deadline, `srv.Close()` force-closes HTTP connections; process exit
+  closes remaining hijacked sockets. Late handlers cannot reopen registry
+  admission or extend the drain with an unbounded join.
 - **Information disclosure**: the close reason `"shutting down"` is hardcoded and operator-visible only on the wire to already-connected peers; no env/host/process info leaks.
 - **Log hygiene**: the shutdown-path log lines emit only `err` (the wrapped `ctx.Err()` for deadline expiry) and the static "shutdown complete" / "shutdown signal received; draining" / "listener error; draining" / "drain incomplete" messages. No attacker-influenced values.
 - **Sibling-defenses preserved**: the rate limiter, header gates and connection caps still run before endpoint admission. Once draining begins, `ErrRegistryDraining` takes precedence at registry admission, including over the phone cap. Rejected handlers release middleware reservations as they return, without installing connections or changing incumbent identities.
@@ -146,6 +188,32 @@ The `defer limiter.Close()` introduced by #47 (per-IP rate limiter eviction goro
 
 - `TestRun_SigtermClosesWSConnsWithGoingAway` — full boot via `run`, real WS dial against `/v1/server`, start the three-second read and complete a native `Ping` round trip before cancelling the synthetic sigCtx. The same read deadline must observe wire code 1001, and `run` must exit 0 within `drainDeadline + 2s`. Cancelling on dial success alone races admission; sleeps or longer timeouts would not prove the ordering.
 - `TestRun_SigtermWithNoConns` — empty-registry happy path; also asserts listener is no longer dialable after `run` returns.
+- `TestRun_ProcessSIGTERMCompleteShutdown` — hermetic re-exec child using
+  production `run` and the real signal helper. Native ping/pong and opaque
+  round trips prove binary/phone admission; traffic continues in both
+  directions while six cold-cache wakes join one held local OAuth request.
+  A final guarded snapshot proves all six remain joined and refresh is
+  unfinished; signal occurs within five seconds of the first wake, before
+  natural ten-second deadlines. The test requires zero exit within the 25s
+  process budget, both wire closes 1001, one cancelled OAuth/no FCM request,
+  and all six `token_fetch_failed` outcomes with refresh completion checked
+  inside the child after `run` returns. It logs signal-to-exit and
+  signal-to-authentication-cancellation durations. Synthetic credentials,
+  an exact-loopback-only outbound transport, bounded waits and unconditional
+  peer/process cleanup keep it local.
+- `TestFlyCompleteShutdownAllowance` — pins top-level SIGTERM/30s settings,
+  the five-second process-budget margin and Fly's 300s maximum. Full offline
+  TOML parsing/baseline comparison evidence is retained in [PR #203](https://github.com/pyrycode/pyrycode-relay/pull/203).
+
+**Cancellation is not cleanup completion.** A server-side socket cancellation
+could still pass if the last send stopped joining authentication. The process
+test holds the cancelled transport's return for a 100ms negative assertion:
+`run` must not return until released, and the retained refresh completion
+channel must then be closed inside the child. Also allow the existing
+frameless phone-close notice with code 1001 at the still-closing binary;
+concurrent drain can deliver it before the binary close handshake finishes.
+Ordinary forwarded inner frames remain byte-exact; the [close-notice contract](routing-envelope.md#close-notice-relay-to-binary-152)
+is unchanged.
 
 `internal/relay/shutdown_admission_test.go`:
 
