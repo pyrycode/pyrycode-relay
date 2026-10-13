@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -72,28 +73,44 @@ func reserveCapAddrs(t *testing.T, count int) ([]string, func()) {
 }
 
 func TestReserveCapAddrs(t *testing.T) {
-	addrs, release := reserveCapAddrs(t, 3)
-	if len(addrs) != 3 {
-		t.Fatalf("listener address count = %d, want 3", len(addrs))
-	}
-	seen := make(map[string]bool)
-	for _, addr := range addrs {
-		if seen[addr] {
-			t.Fatalf("duplicate listener address: %s", addr)
-		}
-		seen[addr] = true
-		if ln, err := net.Listen("tcp", addr); err == nil {
-			ln.Close()
-			t.Errorf("listener address is not reserved: %s", addr)
-		}
-	}
-	release()
-	for _, addr := range addrs {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			t.Fatalf("listener address was not released: %v", err)
-		}
-		ln.Close()
+	for _, count := range []int{2, 3} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			addrs, release := reserveCapAddrs(t, count)
+			if len(addrs) != count {
+				t.Fatalf("listener address count = %d, want %d", len(addrs), count)
+			}
+			seen := make(map[string]bool)
+			for _, addr := range addrs {
+				if seen[addr] {
+					t.Fatalf("duplicate listener address: %s", addr)
+				}
+				seen[addr] = true
+			}
+			assertReserved := func() {
+				t.Helper()
+				for _, addr := range addrs {
+					ln, err := net.Listen("tcp", addr)
+					if err == nil {
+						ln.Close()
+						t.Errorf("listener address is not reserved: %s", addr)
+					} else if !errors.Is(err, syscall.EADDRINUSE) {
+						t.Errorf("checking reservation %s: %v", addr, err)
+					}
+				}
+			}
+			assertReserved()
+			release()
+			for _, addr := range addrs {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					t.Fatalf("listener address was not released: %v", err)
+				}
+				t.Cleanup(func() { ln.Close() })
+			}
+			// Releasing the old reservations again must not close the new owners.
+			release()
+			assertReserved()
+		})
 	}
 }
 
