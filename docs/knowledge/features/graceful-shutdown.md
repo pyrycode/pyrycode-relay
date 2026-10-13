@@ -1,6 +1,6 @@
 # Graceful shutdown on SIGTERM
 
-On `SIGTERM` or `SIGINT`, the relay drains in-flight WebSocket connections to a clean `1001 StatusGoingAway` close before exiting. Connected phones and binaries observe the close code on the wire and run their existing reconnect path instead of seeing a TCP reset mid-frame.
+On `SIGTERM` or `SIGINT`, the relay attempts a `1001 StatusGoingAway` close on registered WebSocket connections before exiting. Responsive, reading phones and binaries can observe that code even with traffic in flight and run their existing reconnect path.
 
 Best-effort by design: the HTTP/WebSocket drain has a bounded deadline
 (10s), followed by deferred push and limiter cleanup before process exit.
@@ -21,6 +21,7 @@ any remaining sockets. Handler goroutines are not joined.
 - **Late upgrades**: HTTP shutdown runs asynchronously after the boundary and closes listeners, but neither it nor `http.Server.Close()` waits for or closes hijacked WebSockets. An already-upgraded binary or phone reaching admission after the boundary closes itself with `1001 StatusGoingAway`, reason `"shutting down"`, before starting forwarders, heartbeats or success cleanup. A failed conflict probe also reaches the guard through `TakeoverServer`.
 - **Upgrade versus admission**: a successful WebSocket dial proves the HTTP upgrade, not registry admission. On these endpoints a native ping/pong round trip with a reader active proves the handler reached its post-admission read loop. This needs no relay-originated application acknowledgement; registration follows the [Binary → relay contract](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#binary--relay).
 - **Close code on the wire**: snapshotted connections receive concurrent `CloseWithCode(StatusGoingAway, "shutting down")` calls; late rejected upgrades receive the same call from their own handler. `closeOnce` prevents double emission if another close races it (ADR-0007); only the first close-family call chooses the code.
+- **Writes at close-start**: `WSConn` marks closing before requesting the library handshake. A `Send` that observes this marker under `writeMu` returns `net.ErrClosed` without calling the library. An already-admitted write keeps its independent ten-second deadline; close-start does not cancel it. The library serialises the close control frame against active data-frame writes within its existing handshake bounds. Failed or stalled peers may still lose frames or miss the close code.
 - **Drain deadline**: 10 seconds by default, declared as `const drainDeadline = 10 * time.Second` at the wiring site in `cmd/pyrycode-relay/main.go`. Expiry returns `ctx.Err()` after calling `http.Server.Close()` on each server. WebSocket close goroutines and late handlers may outlive that return within the library's close bounds; process exit reaps anything remaining.
 - **Complete exit**: after `runServers` returns, `run` first closes the
   upgrade `IPRateLimiter`, then `PushWaker` when enabled. The waker refuses
@@ -101,6 +102,16 @@ During a drain, the relay holds:
 
 **Why concurrent fan-out is load-bearing**: a WebSocket close can block for 5s waiting for the peer's reciprocal close (see [historical close-handshake constraint](../../lessons.md)). Serial iteration would scale linearly in conn count. Independent close goroutines let reading peers receive 1001 while another peer's close is stalled; the context bounds how long shutdown waits for the group.
 
+**Close-start is a send-rejection marker, not an active-write cancellation.**
+`CloseWithCode` cancels `WSConn.closeCtx` but never takes `writeMu`. `Send`
+checks that marker under the mutex and gives an admitted write a timeout
+derived from `context.Background()`. If close starts just after the check,
+the library orders the data and close frames and refuses data after a sent
+close. Its bounded handshake owns socket termination; waiting on the
+adapter mutex would put the active write ahead of those close bounds.
+Registered phones reach this same adapter through `phoneOutbox.CloseWithCode`.
+See the [adapter context strategy](ws-conn-adapter.md#context-strategy).
+
 ## Force-close vs graceful close
 
 `http.Server.Shutdown(ctx)` closes listeners and idle HTTP connections, then
@@ -163,7 +174,7 @@ leave production deadlines unchanged.
 
 - **Reconnect / resume protocol coordination with peers** — the relay sends `1001` and exits; phones and binaries handle reconnect per the [wire protocol](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md).
 - **Wait for handler goroutines to finish** — the helper unblocks handlers via `CloseWithCode` but does not join them. The handler unwind path is fast (existing defers) and any goroutine still alive at process exit is reaped by the kernel.
-- **Persist in-flight frames** — the relay is stateless. Frames mid-write at drain time are lost; the peer's reconnect path re-establishes state.
+- **Persist in-flight frames** — the relay is stateless. An active write may finish before the close, but pending outbox frames are not drained and delivery is not guaranteed; the peer's reconnect path re-establishes state.
 - **Special-case the metrics listener** — `metricsSrv` joins the same `servers` slice as the public listener(s) and goes through the same `srv.Shutdown` / `srv.Close` path. Loopback scrapers see the same `ECONNREFUSED` after drain as any other client.
 - **Configurable deadline via CLI flag** — 10s is a wiring-site constant. A future ticket can promote it to a flag if operational experience demands it; the helper takes `context.Context` so the change is localised.
 - **Drain on `SIGHUP`** — `SIGHUP` is typically a config-reload signal; the relay has no runtime-reloadable config (everything is flags or build-time), so handling it would have no caller. Add when needed.
@@ -176,6 +187,35 @@ leave production deadlines unchanged.
 - `TestShutdown_ClosesAllConnsWithGoingAway` — 1 binary + 2 phones; all three observe `CloseWithCode(StatusGoingAway, …)`; server's listener closes.
 - `TestShutdown_DeadlineExpiryReturnsCtxErr` — stuck conn + 50ms deadline; `errors.Is(err, context.DeadlineExceeded)`; wall-clock < 300ms; `Serve` returns `http.ErrServerClosed` (force-close path).
 - `TestShutdown_CloseIdempotentOnRealWSConn` — races `CloseWithCode(StatusGoingAway)` + `Close()` on the same real `*WSConn`; both return.
+
+`internal/relay/shutdown_write_test.go`:
+
+- `TestShutdown_InFlightWriteGoingAway` — exercises both a registered binary
+  adapter and a registered phone outbox against a real local WebSocket peer.
+  A transport gate holds the first post-upgrade write after the library has
+  armed its write-context cancellation callback. Channels confirm transport
+  entry and close-start before release. A 100ms negative assertion checks
+  that close-start does not destroy the held transport; it establishes no
+  readiness. On release, the test requires intact in-flight bytes, actual
+  wire 1001, active-write and shutdown completion, and rejection of queued
+  and post-close sends. Cleanup unblocks and joins the workers and peer.
+
+The diagnosed ordering in [PR #208](https://github.com/pyrycode/pyrycode-relay/pull/208)
+was active `Send` → library `setupWriteTimeout` → `CloseWithCode` cancels
+the write's parent `closeCtx` → cancellation callback closes the transport
+before the 1001 handshake can write. The verifier's pre-fix comparison
+reproduced phone EOF with this gate; both subtests detected transport
+destruction and an undelivered frame. Both passed on the repaired adapter.
+The old strategy confused library concurrency safety with graceful write
+cancellation: cancelling a library write destroys its socket.
+
+A passing traffic stress run can miss that ordering. Keep the transport
+barrier and real close-code assertion: EOF acceptance, readiness sleeps or
+retry-until-pass would hide the failure. This regression proves the held
+write/close ordering for responsive local peers, alongside the unchanged
+SIGTERM process test below. It does not guarantee shutdown delivery for
+independently failed or stalled peers, and no Fly deployment or live check
+was performed for this repair.
 
 `internal/relay/registry_test.go`:
 

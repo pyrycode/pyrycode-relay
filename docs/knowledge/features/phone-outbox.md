@@ -63,8 +63,12 @@ binary" contract as every other per-frame drop.
 ## Why `Close`/`CloseWithCode` stay immediate, not queued
 
 Eviction (`4404`), grace expiry, and `Shutdown` (`1001`) must cut the
-connection now, not after a backlog drains — and closing the underlying conn
-is what aborts a write `run` has in flight (`WSConn`'s `closeCtx` cancel).
+connection without waiting for a backlog to drain. Delegation starts the
+underlying `WSConn` handshake immediately: its close marker rejects later
+writes, while an active write retains its own deadline and may finish before
+the close frame. The library's bounded handshake terminates the socket;
+the marker does not cancel that active write. See the
+[adapter context strategy](ws-conn-adapter.md#context-strategy).
 The registry's `closeWithCode` helper and `Shutdown` type-assert the private
 `gracefulCloser` interface (`CloseWithCode(websocket.StatusCode, string)`); a
 wrapper that implemented only `Conn` would silently downgrade both closes to
@@ -229,7 +233,8 @@ end. Left as an open question for whoever next touches this path.
 - `run` exits either because `done` is already closed when it next selects,
   or because a `deliver` call returns `false` (write failure or close
   directive). An in-flight `conn.Send` is always bounded — by `writeTimeout`,
-  or sooner if anything closes the underlying `WSConn` (`closeCtx` cancel).
+  or sooner by transport termination, including the library's bounded close
+  handshake. Close-start alone does not cancel the active write.
 - The overflow-close goroutine spawned from `Enqueue` exits once
   `CloseWithCode` returns, bounded by the library's close-handshake
   timeouts — the same shape `evictPhones`'s per-conn goroutines already use.
@@ -257,7 +262,7 @@ Once registration succeeds, `run` starts on its own goroutine that closes an
 ```go
 defer func() {
     reg.UnregisterPhone(serverID, connID)
-    wsconn.Close()   // aborts any in-flight Send
+    wsconn.Close()   // rejects later writes; bounded handshake closes socket
     phone.stop()     // idempotent; releases run, fails later Enqueue
     <-outboxDone     // wait for run to actually exit
     logger.Info("phone_unregistered", ...)
