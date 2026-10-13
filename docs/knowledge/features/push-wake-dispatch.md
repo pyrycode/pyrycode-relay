@@ -5,7 +5,10 @@ envelope from a binary turns into: a bounded, asynchronous FCM send. It sits
 between [`StartBinaryForwarder`](binary-forwarder.md#push_wake-handling) (the
 caller) and [`FCMSender`](fcm-push-sender.md) (the thing that actually talks
 to Google), and owns daemon, device and global attempt allowances plus a
-concurrent-send cap. Introduced by #133; shared allowances added by #172.
+retained-device-job cap. Introduced by #133; shared allowances added by
+[#172](https://github.com/pyrycode/pyrycode-relay/issues/172), bounded
+coalescing by #211 and joined cancellation by
+[#169](https://github.com/pyrycode/pyrycode-relay/issues/169).
 
 ## Why a waker, not a direct call
 
@@ -13,8 +16,10 @@ concurrent-send cap. Introduced by #133; shared allowances added by #172.
 still blocking). The binary read loop (`StartBinaryForwarder`) must not stall
 on it — a slow or hung FCM send would delay every subsequent frame the
 binary sends, including ordinary phone traffic. `PushWaker.Request` never
-blocks on `Send`: it either admits the wake and returns immediately (the
-send runs on its own goroutine) or refuses it immediately.
+blocks on `Send`: it either starts one asynchronous job, accepts a duplicate
+without another send, or refuses new work immediately. Delivery is
+payload-free and best-effort; there is no retry, daemon reply or durable
+delivery guarantee.
 
 The relay also cannot verify that a binary's claimed device token belongs to
 one of its own phones. In [daemon admission enforce](server-endpoint.md#daemon-admission-before-upgrade),
@@ -74,6 +79,10 @@ call with an error and no send:
    [Routing envelope § `push_wake` shape](routing-envelope.md#push_wake-shape-relay-addressed).
 3. **Admission, under `w.mu`:**
    - closed (`Close` already called) → `ErrPushOff`
+   - an active job for the complete device token, or one less than ten
+     seconds after its first admission → return `nil` without another send
+   - reclaim expired completed jobs; retained jobs at capacity →
+     `ErrPushWakeInFlightCap`
    - refill existing daemon/device buckets and the global bucket; touch each
      existing requested key's idle timestamp, including on refusals
    - a missing daemon/device key starts as a temporary full bucket; sweep
@@ -82,16 +91,27 @@ call with an error and no send:
    - any allowance has no token → `ErrPushWakeRateLimited`
    - a non-blocking acquire of a `slots` token fails → `ErrPushWakeInFlightCap`
    - otherwise: reserve the slot, insert missing buckets, subtract one token
-     from all three allowances, `wg.Add(1)`, spawn the send goroutine, return `nil`
+     from all three allowances, insert the active job with a fixed ten-second
+     expiry, `wg.Add(1)`, spawn the send goroutine, return `nil`
 
-A rate, state-capacity or concurrency refusal spends no tokens, reserves no
-slot and inserts no new bucket. Refills, idle timestamp updates and eligible
-reclamation can still occur. An admitted attempt stays charged even if
-authentication or FCM delivery fails; completing a send returns only its slot.
+Coalescing crosses daemon identities and applies regardless of the send's
+success or failure. Duplicates never extend the admission window or send
+deadline, touch accounting timestamps, charge allowances, create daemon
+buckets or emit outcomes. They succeed even when allowances, accounting maps
+or retained-job capacity would refuse new work. No requester list is kept.
+At the exact ten-second boundary a completed job becomes eligible for
+ordinary admission; an active job still suppresses duplicates beyond it.
+Different complete device tokens remain independent.
+
+A rate, state-capacity or retained-capacity refusal spends no tokens, reserves
+no slot and inserts no new bucket. Refills, idle timestamp updates and eligible
+reclamation can still occur after the retained-capacity check. An admitted
+attempt stays charged even if authentication or FCM delivery fails;
+completion frees its send slot but retains the job until the window expires.
 A refused wake is never queued or retried — the caller logs it and moves on.
 An admitted wake's send runs on its own goroutine against `w.ctx` (cancelled
-by `Close`, not the binary connection's context), so a wake requested just
-before the binary disconnects still goes out.
+by `Close`, not the binary connection's context), so disconnecting the
+requesting binary does not cancel delivery.
 
 ## Allowances and concurrency cap
 
@@ -105,19 +125,25 @@ preserves elapsed-time remainder and stops at burst capacity:
 | `pushWakeDeviceBurst` / `pushWakeDeviceRefillEvery` | 6 | one token per 10s | per complete device token, across all daemons |
 | `pushWakeGlobalBurst` / `pushWakeGlobalRefillEvery` | 32 | one token per second | all daemons and devices in the relay process |
 
-`pushWakeMaxInFlight` separately retains the 32-send concurrency cap via a
-buffered channel. Freed slots do not replenish attempt allowances. Without
-clock advance, the seventh wake to one device is refused even across fresh
-daemon identities, and the 33rd wake to distinct devices across identities is
-refused even if previous sends have completed. Reconnecting resets neither
+`pushWakeMaxInFlight` caps retained device jobs at 32, including completed
+jobs still inside their window, and bounds active sends via a buffered
+channel. Tests can supply a smaller constructor capacity. At capacity a new
+distinct device returns `ErrPushWakeInFlightCap`, charges nothing, queues
+nothing and counts one `dropped` outcome; an existing coalesced device still
+returns `nil`. Expired completed jobs are reclaimed before capacity checks,
+on completion after expiry and by the existing periodic sweep. Job expiry
+never removes allowance debt. Freed send slots do not replenish allowances
+or free completed jobs still in their window. Reconnecting resets neither
 daemon, device nor global credit.
 
 With full production allowances and an available sender, four daemons can
 each issue two back-to-back wakes to each of three paired devices (devices
-distinct across daemons): 24 wakes, charging six per daemon, two per device
-and 24 globally. The burst accommodates a finished turn and a waiting prompt
-for three devices; sustained daemon/device refill remains one per 10s, while
-aggregate refill is one per second.
+distinct across daemons): 24 accepted requests produce 12 actual sends,
+charging three per daemon, one per device and 12 globally. A finished turn
+and a waiting prompt for the same device within the window share a wake.
+Sustained daemon/device refill remains one per 10s, while aggregate refill
+is one per second. Coalescing and device refill both take ten seconds, so
+ordinary same-device attempts cannot exhaust production device credit.
 
 Push accounting is local to `PushWaker`, rather than successive
 [`IPRateLimiter.Allow`](rate-limit-middleware.md) calls: separate calls cannot
@@ -126,21 +152,25 @@ at most `pushWakeMaxBuckets` (1,024) buckets keyed by full 32-byte SHA-256
 digests of the complete inputs. Accounting-key size is independent of input
 length. The truncated `tokenFingerprint` used in logs is unsuitable for
 accounting because distinct tokens can share it. Raw tokens do not enter
-accounting state; admitted sends retain them for delivery. Accounting digests
-are never logged.
+accounting state; active sends retain them for delivery. Device jobs use the
+same full digest and contain only a fixed expiry and active flag; completed
+jobs retain no raw token or daemon identity. Accounting and job digests are
+never logged.
 
-Keyed state becomes eligible for expiry after five minutes without a request,
-including refused requests touching existing keys. It is reclaimed by the
-following five-minute sweep (`pushWakeEvictionInterval`) or when a request
-needs a new key, and only if fully refilled at that time. Depleted or active
-state is never evicted to make room, so removal cannot erase debt. At either
-map's capacity, requests needing a new key are refused unless eligible state
+Accounting state becomes eligible for expiry after five minutes without a
+request reaching allowance checks; refusals at that stage touch existing
+keys, while duplicates and retained-capacity refusals do not. It is reclaimed
+by the following five-minute sweep (`pushWakeEvictionInterval`) or when a
+request needs a new key, and only if fully refilled at that time. Depleted
+accounting state is never evicted to make room, so removal cannot erase debt.
+At either map's capacity, requests needing a new key are refused unless eligible state
 can first be reclaimed; existing keys remain usable within their allowances.
 The global bucket never expires.
 
 All modes (off, observe and enforce) receive these limits when push is
-configured. Budgets are in-memory for the single relay process and reset on
-restart; multiple replicas would need shared accounting. Only enforce
+configured. Budgets and coalescing are in-memory for the single relay process
+and reset on restart; multiple replicas would need shared accounting and
+coalescing. There is no durable or exactly-once guarantee. Only enforce
 authenticates daemon identities. Device-token ownership remains unverified,
 and wakes remain payload-free under the
 [wire protocol](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md).
@@ -153,16 +183,17 @@ and wakes remain payload-free under the
 | `ErrMalformedPushWake` / `ErrUnsupportedPushPlatform` / `ErrEmptyPushToken` | `parsePushWake` rejection | nothing (see [Routing envelope](routing-envelope.md)) |
 | `ErrPushWakeRateLimited` | daemon, device or global allowance exhausted | nothing — not even which allowance |
 | `ErrPushWakeStateCap` | a new daemon/device key cannot fit after safe reclamation | nothing |
-| `ErrPushWakeInFlightCap` | relay-wide 32 in-flight sends already running | nothing |
+| `ErrPushWakeInFlightCap` | retained-device-job capacity reached (32 in production), or no send slot available | nothing |
 
 No sentinel here, and no `FCMSender` error surfaced by the send goroutine,
 ever carries the device token or the service-account credential. The
 forwarder logs a refusal as `binary_forwarder_push_wake_dropped`, using only
 `server_id` (or `binary_conn_id`) and `err`.
 
-Every wake *admitted* by `Request` logs exactly one outcome line from `send`
-(#160), including a send cancelled by `Close` — the cancelled context makes
-`Send` return an error, so it takes the failure branch with no special case:
+Every actual dispatched job logs exactly one outcome line from `send`
+(#160), attributed to its first admitting daemon. Accepted duplicates log
+nothing. A send cancelled by `Close` also logs its outcome — the cancelled
+context makes `Send` return an error, so it takes the failure branch:
 
 | Line | Level | Keys |
 |---|---|---|
@@ -189,12 +220,13 @@ incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
 
 - **`dropped`** — increments exactly once when `Request` refuses a wake for
   any daemon/device/global allowance (`ErrPushWakeRateLimited`), either keyed
-  map's capacity (`ErrPushWakeStateCap`) or concurrency (`ErrPushWakeInFlightCap`).
+  map's capacity (`ErrPushWakeStateCap`) or retained-job/send capacity
+  (`ErrPushWakeInFlightCap`).
   A malformed `push_wake` object and a push-off refusal (nil or closed
   waker) count nothing — they never reach admission, so they are not a
   "drop" in this counter's sense.
 - **`sent` / `unregistered` / `send_failed` / `token_fetch_failed`** — exactly
-  one increments per admitted wake, once its `send` goroutine's call to
+  one increments per actual dispatched job, once its `send` goroutine's call to
   `Send` returns. `classifyPushWake(err)` maps the result by error identity,
   never by matching text: `nil` → `sent` (with or without a message id in
   the reply); `errors.Is(err, ErrFCMUnregistered)` → `unregistered`;
@@ -204,6 +236,10 @@ incident where server-id `d12a1a37` got `UNREGISTERED` from FCM four times in
   after token lookup or during FCM delivery) → `send_failed`. Cancellation
   by `Close` follows the phase where it is observed, rather than always
   counting as `send_failed`.
+
+Accepted duplicate requests increment none of these counters. Outcome counts
+measure actual sends and refused new work, rather than all `nil` returns
+from `Request`; each send's log uses only its first admitting daemon.
 
 [`ErrFCMUnregistered`](fcm-push-sender.md) is the sentinel `FCMSender.Send`
 now also wraps, alongside the existing `ErrFCMSend`, when FCM's reply's
@@ -222,8 +258,9 @@ zero.
 
 ## Concurrency model
 
-- One goroutine per admitted wake, capped at `pushWakeMaxInFlight` by the
-  buffered `slots` channel. Each goroutine exits when `Send` returns —
+- One goroutine per actual dispatched job, with at most 32 retained jobs
+  and active sends. Duplicates spawn no goroutine. Each send exits when `Send`
+  returns —
   using one whole-send `fcmSendTimeout` budget in production, and honouring
   `w.ctx` cancellation on `Close`. Token waiting consumes delivery time;
   authentication does not grant the FCM POST a fresh budget. Shared refresh
@@ -231,18 +268,24 @@ zero.
   [FCM sender concurrency](fcm-push-sender.md#concurrency)). Each send logs
   its one outcome line before `wg.Done`
   (deferred first, so it runs last) — `Close` returning therefore means
-  every admitted wake's outcome line has already been written (#160).
-- `w.mu` owns all buckets, their refill/idle timestamps, sweeping and the
-  admission commit. The closure check, all three charges, non-blocking slot
-  reservation and `wg.Add` are atomic against other requests and `Close`.
+  every dispatched job's outcome line has already been written (#160).
+  Completion releases the slot and marks the job completed under `w.mu`,
+  removing it immediately if its fixed window has expired, before `wg.Done`.
+- `w.mu` owns all buckets, their refill/idle timestamps, job lookup/expiry,
+  sweeping and the admission commit. The closure check, duplicate check,
+  all three charges, job/slot reservation and `wg.Add` are atomic against
+  other requests and `Close`.
   Concurrent requests cannot overspend, and none is admitted after the closed
   transition. No mutex is held across the blocking `Send` call.
 - One sweep goroutine runs every five minutes, exits on `w.ctx` cancellation
-  and has its own `sweepWG`. The injected clock used by budget tests is read
-  under `w.mu`, as are the timestamps it supplies.
+  and has its own `sweepWG`. It also reclaims expired completed jobs; new-job
+  admission reclaims them before capacity checks, so no extra cleanup timer
+  or goroutine is needed. Active jobs never expire. The injected clock used
+  by budget tests is read under `w.mu`, as are the timestamps it supplies.
 - `Close` is idempotent: set `closed` under `w.mu`, cancel `w.ctx`,
   `wg.Wait()` for every admitted send to return and `sweepWG.Wait()` for the
-  sweep goroutine. Repeated and concurrent callers all join admitted work;
+  sweep goroutine, then clear retained jobs under `w.mu`, releasing their
+  device identities. Repeated and concurrent callers all join admitted work;
   none returns early merely because another caller marked the waker closed.
   With `FCMSender`, the last waiter cancels and joins unfinished token
   refresh work before its send returns, so the wait group joins cancellable
@@ -251,8 +294,8 @@ zero.
   forwarder can still call `Request` after `Close` — it gets `ErrPushOff`
   rather than a panic or a send racing shutdown.
 
-`TestPushWaker_CloseCancelsAuthentication` uses a real sender and six admitted
-wakes sharing a held-open local authentication request. Its two-second
+`TestPushWaker_CloseCancelsAuthentication` uses a real sender and six distinct
+device jobs sharing a held-open local authentication request. Its two-second
 push-cleanup budget starts at entry to `Close`: it checks joined refresh
 completion, endpoint cancellation, six outcome lines, no further
 authentication/FCM requests and `ErrPushOff` after close. This is a regression
@@ -301,8 +344,8 @@ serves, so no `Request` can reach the waker before its hook is in place.
 ## Testing
 
 `push_wake_budget_test.go` uses a controlled clock and fake sender for shared
-device/global exhaustion after slots free, exact refill boundaries and capped
-credit, the 24-wake paired-device burst, state saturation and safe idle
+allowance exhaustion, exact refill boundaries and capped credit, the
+24-request/12-send paired-device burst, state saturation and safe idle
 reclamation, failed-send charging, concurrent admission and admission racing
 concurrent `Close`. Refusals must preserve all token balances, map keys and
 slots (apart from time-based refill/reclamation). Zero sender calls alone would
@@ -311,16 +354,33 @@ complete-token fixture deliberately includes
 two distinct tokens sharing a log fingerprint; ordinary distinct-token tests
 would also pass with the incorrect truncated accounting key.
 
+Because the coalescing window equals device refill, repeated same-token
+requests cannot prove device-budget exhaustion: duplicates spend nothing,
+and each eligible new attempt has had time to refill. Controlled depleted
+device buckets prove exhaustion and exact refill instead. Global/daemon
+exhaustion fixtures use distinct devices so they still count actual attempts.
+Held-authentication shutdown fixtures likewise need distinct device tokens:
+six duplicate requests would join only one send, losing the shared-refresh
+waiter proof. Both `TestPushWaker_CloseCancelsAuthentication` and
+`TestRun_ProcessSIGTERMCompleteShutdown` use six distinct jobs.
+
+`push_wake_coalesce_test.go` holds sends and controls time to cover concurrent
+same/cross-daemon duplicates, successful and failed early completion,
+just-before/exact window boundaries, active jobs past expiry, retained active
+and completed capacity, expiry without erased debt and shutdown races.
+Duplicate tests assert unchanged accounting, no outcomes and first-daemon
+log attribution even with exhausted allowances and full state.
+
 `daemon_admission_test.go` retains the pre-upgrade rejection proof and checks
-initial admitted wakes plus reconnects without resetting allowances. These
+initial admitted wakes plus reconnects using a distinct device without clock
+advance, so duplicate acceptance cannot hide reset daemon debt. These
 tests are hermetic; repository checks establish neither deployment nor live
 admission enforcement. Later retries (#173) must consume these same attempt
 budgets.
 
 `push_wake_test.go`: burst exhausted for one server-id → `ErrPushWakeRateLimited`
-while a different server-id is still admitted; a blocking fake sender fills
-`maxInFlight` → the next `Request` → `ErrPushWakeInFlightCap`, and releasing
-one send readmits the next; a nil `*PushWaker` → `ErrPushOff`; `Close`
+using distinct devices while a different server-id is still admitted;
+a nil `*PushWaker` → `ErrPushOff`; `Close`
 cancels a blocked send, waits for it, and a `Request` afterward →
 `ErrPushOff`; `NewPushWakerFromEnv` returns `(nil, nil)` when unset and a
 non-nil waker for a valid key. Since #160: exactly one outcome line for each
@@ -344,7 +404,7 @@ contain the token string.
 `metrics_push_test.go` (#161) scrapes a fresh registry per case and asserts
 all five outcome cells together (the one expected, the rest at 0), plus that
 the scrape body contains no server id or token. A real `FCMSender` against
-in-test OAuth and FCM servers drives the four admitted-wake outcomes off the
+in-test OAuth and FCM servers drives the four actual-send outcomes off the
 errors `Send` actually returns (2xx with and without an id, `UNREGISTERED`,
 another FCM error, a failed token fetch); a fake sender covers
 cancellation-by-`Close` (→ `send_failed`), rate-limit and in-flight-cap
@@ -366,6 +426,7 @@ round trip, still scrape right after `Close`.
 - [Routing envelope](routing-envelope.md#push_wake-shape-relay-addressed) —
   the wire shape and `parsePushWake`'s structural checks.
 - [FCM push sender](fcm-push-sender.md) — what `Send` actually does.
+- [ADR-0013](../decisions/0013-push-wake-async-dispatch-bounded-not-verified.md) — bounded asynchronous attempts, coalescing and unverified device ownership.
 - [Connection registry](connection-registry.md) — `SetPushWaker` / the
   `pushWaker` field's lifecycle rules.
 - [Rate-limit middleware](rate-limit-middleware.md) — separate upgrade-path

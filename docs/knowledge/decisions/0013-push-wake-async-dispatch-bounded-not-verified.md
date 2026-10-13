@@ -1,6 +1,6 @@
 # ADR-0013: Push wakes dispatch async off the read loop, bounded attempts, token unverified
 
-**Status:** Accepted (#133), extended with shared allowances (#172)
+**Status:** Accepted (#133), extended with shared allowances (#172) and bounded coalescing (#211)
 **Date:** 2026-09-24
 **Updated:** 2026-10-13
 
@@ -30,10 +30,18 @@ loop.
 
 ## Decision
 
-Dispatch every admitted wake on its own goroutine ([`PushWaker.Request`](../features/push-wake-dispatch.md)),
-never blocking the binary read loop. Accept that the relay cannot verify a
-wake's token, and bound the resulting abuse surface with three initially full
-attempt allowances and a separate concurrency cap:
+Dispatch each new device job on its own goroutine ([`PushWaker.Request`](../features/push-wake-dispatch.md)),
+never blocking the binary read loop. Coalesce structurally valid requests for
+the complete same device token across daemon identities for a fixed ten
+seconds from first admission, or until its active send ends, whichever is
+later. Duplicates return `nil` without another send, charge, bucket or outcome,
+even when new work would be refused. They extend neither the window nor send
+deadline, regardless of success or failure. A completed job is eligible for
+ordinary admission at the exact window boundary.
+
+Accept that the relay cannot verify a wake's token, and bound the resulting
+abuse surface with three initially full
+attempt allowances and a separate retained-job cap:
 
 - **Per-daemon allowance** (`pushWakeBurst` / `pushWakeRefillEvery`) — burst
   6, refill one token per 10s, across all devices requested by that server-id.
@@ -42,22 +50,35 @@ attempt allowances and a separate concurrency cap:
   complete same device token.
 - **Global allowance** (`pushWakeGlobalBurst` / `pushWakeGlobalRefillEvery`)
   — burst 32, refill one token per second, across all daemons and devices.
-- **Relay-wide in-flight cap** (`pushWakeMaxInFlight`, a buffered-channel
-  semaphore) — bounds concurrent goroutines and outbound sockets across
-  every binary regardless of how many server-ids they claim.
+- **Relay-wide retained-job cap** (`pushWakeMaxInFlight`, 32) — counts active
+  sends and completed jobs still inside the window. A buffered-channel
+  semaphore also bounds concurrent send goroutines and outbound sockets.
+  Tests retain the constructor's configurable smaller capacity.
 
 Burst capacity is stored credit, distinct from sustained refill rate; refills
 stop at capacity. Under one `PushWaker` mutex, admission charges one token
 from each allowance and reserves a slot atomically. A rate, keyed-capacity or
-concurrency refusal spends nothing and queues nothing. A dispatched failure
-remains charged. Each daemon/device map is capped at 1,024 full SHA-256 keys;
-only fully refilled state idle for five minutes, counting refusals as
-activity, may be reclaimed by periodic sweep or new-key admission.
+retained-capacity refusal spends nothing and queues nothing. A dispatched
+failure remains charged. Full SHA-256 device keys distinguish complete tokens;
+job records contain only fixed expiry/active metadata, no requester list, and
+completed jobs retain no raw token. Expired completed jobs are reclaimed before
+capacity checks without erasing allowance debt. At capacity new distinct work
+returns the existing static `ErrPushWakeInFlightCap` while coalesced requests
+still succeed. Each daemon/device accounting map is capped at 1,024 full
+SHA-256 keys; only fully refilled state idle for five minutes may be reclaimed
+by periodic sweep or new-key admission. Requests reaching allowance checks,
+including refusals, touch existing keys; duplicates and retained-capacity
+refusals do not.
 
-These budgets apply in every admission mode, live in the single relay
-process's memory and reset on restart. Reconnects and identity churn cannot
+These budgets and coalescing apply in every admission mode, live in the
+single relay process's memory and reset on restart. Reconnects and identity churn cannot
 reset the shared device/global allowances. Only enforce authenticates daemon
 identity; device-token ownership remains unverified and wakes carry no payload.
+Delivery is best-effort with no retry, daemon reply, durability or exactly-once
+guarantee. Each actual send retains the existing whole-send ten-second budget
+through authentication and delivery. `Close` refuses subsequent structurally
+valid requests, cancels and joins sends/shared authentication and the sweep,
+then releases retained jobs; concurrent closes join the same work.
 
 ## Rationale
 
@@ -73,6 +94,12 @@ identity; device-token ownership remains unverified and wakes carry no payload.
   fresh daemon credit, so a daemon-only allowance cannot bound shared-device
   pressure or aggregate throughput. Shared device/global allowances address
   those paths, while the semaphore still bounds simultaneous send work.
+- **Fixed bounded coalescing.** Duplicate events for one device need only one
+  wake. Keeping completed jobs until a fixed first-admission boundary also
+  suppresses duplicates after early success or failure; extending on every
+  duplicate could indefinitely postpone new work. The retained-job cap bounds
+  this memory independently of send completion, and active suppression keeps
+  one job per complete token. Allowance debt survives job expiry.
 - **Drop, don't queue.** A bounded queue would still need its own size limit
   and would turn "the relay is under wake pressure" into growing memory
   instead of an immediate, logged refusal. Dropping keeps the failure mode
@@ -100,13 +127,17 @@ identity; device-token ownership remains unverified and wakes carry no payload.
   Admission grants neither Noise keys nor phone authorization. A binary can
   still request arbitrary-device wakes within its daemon allowance and the
   shared device/global budgets. Colluding holders can exhaust those budgets
-  or saturate the 32 slots, denying legitimate wakes. Restart grants fresh
-  credit; multiple replicas would need shared accounting.
+  or saturate the 32 retained jobs, denying legitimate new wakes. Restart
+  grants fresh credit and clears coalescing; multiple replicas would need
+  shared accounting and coalescing. Payload-free best-effort delivery offers
+  no durable or exactly-once guarantee.
 - Since #161, `pyrycode_relay_push_wakes_total{outcome="dropped"}` records
   refusals with fixed aggregate labels. Each rate, state-capacity or
-  concurrency refusal increments it exactly once; malformed and push-off
-  requests still count nothing. Labels contain no identities, device tokens
-  or fingerprints; errors remain static and token-free. See
+  retained-capacity refusal increments it exactly once; accepted duplicates,
+  malformed and push-off requests count nothing. Each actual dispatched job
+  records one outcome and log line attributed to its first admitting daemon.
+  Labels contain no identities, device tokens or fingerprints; errors remain
+  static and token-free. See
   [push metrics](../features/push-wake-dispatch.md#metrics).
 - Deployment from clean `main` and production admission activation remain
   [manual operator follow-ups](../../deploy.md#daemon-admission-activation).

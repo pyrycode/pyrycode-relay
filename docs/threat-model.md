@@ -116,49 +116,74 @@ Daemon admission adds only standard-library parsing and constant-time equality p
 
 **Severity:** `medium`. Trips the "new outbound network call" re-review trigger below (#133).
 
-**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the trigger for an outbound push call. In enforce, only a daemon admitted for its exact identity can reach this path; rejected requests never upgrade or gain push access. Off/observe still allow anonymous daemon admission. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then checks three initially full attempt allowances and a concurrency cap before dispatch:
+**v1 mitigation:** A `push_wake` routing envelope from a connected binary (`{"push_wake":{"platform":"fcm","token":"…"}}`, no `conn_id` — see [Push wake dispatch](knowledge/features/push-wake-dispatch.md)) is the trigger for an outbound push call. In enforce, only a daemon admitted for its exact identity can reach this path; rejected requests never upgrade or gain push access. Off/observe still allow anonymous daemon admission. `parsePushWake` (`internal/relay/envelope.go`) validates the object structurally before anything is dispatched: platform must be exactly `fcm` (`apns` and anything else is dropped), token must be non-empty. `PushWaker.Request` (`internal/relay/push_wake.go`) then checks closure, coalesces existing device jobs, and checks retained capacity and three initially full attempt allowances before dispatch:
 
 - **Per-daemon allowance** — burst 6, refill one token per 10s, across all devices requested by the same server-id.
 - **Per-device allowance** — burst 6, refill one token per 10s, shared across all daemons requesting the complete same device token.
 - **Global allowance** — burst 32, refill one token per second, shared across all daemons and devices in the relay process.
-- **Relay-wide in-flight cap** — `pushWakeMaxInFlight` (32), a buffered channel. Bounds concurrent goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
+- **Relay-wide retained-job cap** — `pushWakeMaxInFlight` (32), counting active sends and completed jobs still inside the coalescing window. A buffered channel also bounds active send goroutines and outbound sockets across every binary regardless of how many server-ids they claim.
+
+The complete device token coalesces across daemon identities for a fixed ten
+seconds from first admission, regardless of success or failure; an active job
+suppresses duplicates even beyond expiry. At the exact boundary a completed
+job is eligible for ordinary admission. After structural validation and the
+closed check, duplicates return `nil` before capacity or allowance checks,
+extend neither window nor deadline, spend nothing, create no daemon bucket
+and emit no outcome. Distinct complete tokens remain independent. Full
+SHA-256 job keys retain only fixed expiry and active metadata, no requester
+list; completed jobs retain no raw token. Expired completed jobs are reclaimed
+before capacity checks without erasing accounting debt. A new distinct device
+at retained capacity is refused without charge or queue; an existing
+coalesced device still succeeds.
 
 Burst capacity is maximum stored credit; sustained refill is one per 10s for
 each daemon/device and one per second globally, never six per 10s indefinitely.
 Admission charges all three allowances and reserves a slot atomically under
-one mutex. Rate, state-capacity and concurrency refusals spend nothing and
+one mutex. Rate, state-capacity and retained-capacity refusals spend nothing and
 queue nothing; dispatched failures remain charged. Completing sends frees
-slots without restoring tokens. Changing daemon identity or reconnecting
-cannot reset the device or global budget.
+slots without restoring tokens or freeing jobs still inside their window.
+Changing daemon identity or reconnecting cannot reset the device or global
+budget.
 
 Daemon and device maps each retain at most 1,024 buckets with full 32-byte
 SHA-256 keys independent of input length, rather than raw tokens or truncated
-logging fingerprints. Five-minute idle expiry counts refused requests to
-existing keys as activity. Periodic sweeps or new-key admission reclaim only
-fully refilled idle buckets; capacity pressure never deletes debt. If a new
+logging fingerprints. Five-minute idle expiry counts requests reaching
+allowance checks, including refusals, as activity on existing keys; duplicates
+and retained-capacity refusals do not touch them. Periodic sweeps or new-key
+admission reclaim only fully refilled idle buckets; capacity pressure never
+deletes debt. If a new
 key still cannot fit, it is refused, while existing keys remain usable within
-budget. All modes receive these single-process in-memory budgets; restart
-resets them. Multiple replicas would need shared accounting.
+budget. All modes receive these single-process in-memory budgets and
+coalescing; restart resets both. Multiple replicas would need shared accounting
+and coalescing. Delivery remains payload-free and best-effort: there is no
+retry, daemon reply, durable or exactly-once guarantee. Each actual send keeps
+one whole-send ten-second deadline through authentication and delivery.
+`Close` refuses subsequent structurally valid requests, cancels and joins
+sends/shared authentication and the cleanup sweep, then releases retained
+jobs. Repeated and concurrent closes join the same work.
 
-A refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every *admitted* wake logs exactly one outcome line — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
+A refused wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every actual dispatched job logs exactly one outcome line attributed to its first admitting daemon — `push_wake_sent` or `push_wake_send_failed`, including a send cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the send's `duration`; a successful send additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed send carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status plus FCM's enum-shaped `error.status` and `errorCode` (#150), never free text or the token (see [FCM push sender](knowledge/features/fcm-push-sender.md) § Error handling). The wake itself carries no payload, so even a successful send tells the phone only to reconnect.
 
 **Residual risk:** Device-token ownership remains unverified. Enforce alone
 authenticates daemon identity, including a holder of a stolen credential;
 off/observe retain anonymous push abuse. Admission grants no Noise keys or
 phone authorization. A holder can still cause arbitrary devices to reconnect
 within the shared device/global budgets, and colluding holders can exhaust
-those budgets or the 32 slots, denying legitimate wakes. Because wakes carry
-no payload, this exposes no session data. Restart grants fresh credit, and
-the budgets are not shared across processes. Every rate, state-capacity or
-concurrency refusal increments
+those budgets or the 32 retained jobs, denying legitimate new wakes. Because
+wakes carry no payload, this exposes no session data. Restart grants fresh
+credit, and the budgets are not shared across processes. Every rate, state-capacity or
+retained-capacity refusal increments
 `pyrycode_relay_push_wakes_total{outcome="dropped"}` exactly once; its five fixed
 labels carry no identities, tokens or fingerprints — see
 [push metrics](knowledge/features/push-wake-dispatch.md#metrics).
+Accepted duplicates count no outcome and produce no send log line; each
+actual send is attributed only to its first admitting daemon.
 
 **Future hardening:** Telling the daemon a token is dead remains out of scope
 (no dead-token callback, despite `ErrFCMUnregistered` distinguishing it — see
-[FCM push sender](knowledge/features/fcm-push-sender.md)). #173 owns later
-retry/coalescing behavior; retries must consume the same attempt budgets.
+[FCM push sender](knowledge/features/fcm-push-sender.md)). Bounded coalescing
+is implemented by #211, split from #173; later retries must consume the same
+attempt budgets.
 Manual deployment and production admission activation remain
 [operator follow-ups](deploy.md#daemon-admission-activation); repository checks
 establish neither deployment nor live enforcement.
