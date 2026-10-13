@@ -83,10 +83,26 @@ send to `https://fcm.googleapis.com/v1/projects/pyrycode-mobile/messages:send`.
 The wake carries no payload — no `notification`, no `data` field — so a
 successful send tells the phone only to reconnect, never what happened in
 the session. See [Push wake dispatch](knowledge/features/push-wake-dispatch.md)
-for the dispatch path (async off the binary read loop, per-server-id rate
-limit, relay-wide in-flight cap) and
+for the dispatch path (async off the binary read loop) and
 [`docs/threat-model.md` § Outbound network calls](threat-model.md#outbound-network-calls--fcm-push-wake)
 for the abuse accounting.
+
+Every admitted attempt atomically consumes one token each from initially full
+daemon, device and global allowances and reserves a send slot. Daemon and
+device bursts are 6, refilling one token per 10s; the global burst is 32,
+refilling one per second. Burst capacity is stored credit, distinct from
+sustained refill rate. The separate 32-send concurrency cap remains. Refusals
+queue nothing and charge nothing; failed attempts remain charged. Local push
+accounting retains at most 1,024 daemon and 1,024 device buckets using full
+SHA-256 keys, reclaiming only fully refilled state idle for five minutes.
+
+These single-process in-memory budgets apply in off, observe and enforce modes
+and reset on relay restart. Reconnects and new daemon identities do not reset
+device or global allowances. Only daemon admission enforce authenticates the
+requesting identity; device-token ownership remains unverified. Deployment
+and production enforcement activation remain
+[manual operator work](deploy.md#daemon-admission-activation); passing
+repository checks establishes neither.
 
 Each send uses one 10s deadline from entry through token waiting,
 authentication and delivery, respecting earlier caller deadlines. Concurrent
@@ -153,8 +169,8 @@ Top-level `kill_signal = "SIGTERM"` and `kill_timeout = 30` reserve a
 best-effort stop allowance five seconds above the conservative 25-second
 complete-process budget (#200). The ten-second HTTP/WebSocket drain is
 followed by deferred upgrade-limiter and push cleanup, including joined
-authentication and the push limiter. This is a configured budget, not a new
-production deadline or platform guarantee. Effective settings and isolated
+authentication and the push accounting sweep. This is a configured budget,
+not a new production deadline or platform guarantee. Effective settings and isolated
 shutdown evidence remain [operator follow-up](deploy.md#complete-process-shutdown).
 
 Exactly one active production relay must be preserved through recovery and

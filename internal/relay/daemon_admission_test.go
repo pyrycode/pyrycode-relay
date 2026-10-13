@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net/http"
@@ -386,13 +387,17 @@ func TestDaemonAdmission_SnapshotRestart(t *testing.T) {
 
 func TestDaemonAdmission_ReconnectForwardPush(t *testing.T) {
 	reg := NewRegistry()
-	sender := newFakePushSender()
-	waker := NewPushWaker(sender, discardLogger())
+	waker, sender, _ := budgetWaker(t, pushWakeRefillEvery, pushWakeBurst, pushWakeMaxInFlight)
 	defer waker.Close()
 	reg.SetPushWaker(waker)
 	url := admissionServer(t, admissionFixture(t, "enforce"), reg)
 	first := admissionDial(t, url, "s1", admissionOld)
 	awaitBinary(t, reg, "s1")
+	wake := `{"push_wake":{"platform":"fcm","token":"` + testWakeToken + `"}}`
+	if err := first.Write(context.Background(), websocket.MessageText, []byte(wake)); err != nil {
+		t.Fatal(err)
+	}
+	sender.waitStarted(t, 1)
 	phoneSrv := httptest.NewServer(ClientHandler(reg, discardLogger(), 256*1024, 16, nil))
 	defer phoneSrv.Close()
 	phoneURL := "ws" + strings.TrimPrefix(phoneSrv.URL, "http")
@@ -441,11 +446,18 @@ func TestDaemonAdmission_ReconnectForwardPush(t *testing.T) {
 	if err != nil || string(got) != string(opaque) {
 		t.Fatalf("opaque forward: %q, %v", got, err)
 	}
-	wake := `{"push_wake":{"platform":"fcm","token":"` + testWakeToken + `"}}`
 	if err := second.Write(ctx, websocket.MessageText, []byte(wake)); err != nil {
 		t.Fatal(err)
 	}
 	sender.waitStarted(t, 1)
+	waker.mu.Lock()
+	globalTokens := waker.global.tokens
+	daemonTokens := waker.daemons[sha256.Sum256([]byte("s1"))].tokens
+	deviceTokens := waker.devices[sha256.Sum256([]byte(testWakeToken))].tokens
+	waker.mu.Unlock()
+	if globalTokens != 30 || daemonTokens != 4 || deviceTokens != 4 {
+		t.Fatal("reconnect reset push allowances")
+	}
 }
 
 func TestDaemonAdmission_OffObserveKeepLegacyHandler(t *testing.T) {

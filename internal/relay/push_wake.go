@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,12 +19,19 @@ const (
 	// above that while bounding how fast one binary can push at Google.
 	pushWakeRefillEvery = 10 * time.Second
 	pushWakeBurst       = 6
-	// pushWakeEvictionInterval sweeps idle server-id buckets so the
-	// limiter's memory stays bounded as server-ids come and go.
+	// Device budgets are shared by every daemon targeting the complete token.
+	pushWakeDeviceRefillEvery = 10 * time.Second
+	pushWakeDeviceBurst       = 6
+	// Global attempt rate is distinct from concurrent sends: completed or
+	// failed sends do not return tokens to this allowance.
+	pushWakeGlobalRefillEvery = time.Second
+	pushWakeGlobalBurst       = 32
+	// Keyed accounting expires only after idle state has fully refilled.
 	pushWakeEvictionInterval = 5 * time.Minute
+	pushWakeMaxBuckets       = 1024 // independently for daemons and devices
 	// pushWakeMaxInFlight caps concurrent sends across the whole relay.
-	// Each send holds one goroutine for at most two fcmSendTimeout-bounded
-	// HTTP calls; the cap bounds goroutines and outbound sockets however
+	// Each send holds one goroutine under one fcmSendTimeout deadline;
+	// the cap bounds goroutines and outbound sockets however
 	// many server-ids a set of binaries claims.
 	pushWakeMaxInFlight = 32
 )
@@ -32,9 +40,11 @@ var (
 	// ErrPushOff is returned when push is not configured or the waker is
 	// closed.
 	ErrPushOff = errors.New("relay: push is off")
-	// ErrPushWakeRateLimited is returned when a server-id is over its
-	// wake rate. The wake is dropped, not queued.
-	ErrPushWakeRateLimited = errors.New("relay: push_wake rate-limited for server-id")
+	// ErrPushWakeRateLimited is returned when any wake allowance is depleted.
+	// The wake is dropped, not queued.
+	ErrPushWakeRateLimited = errors.New("relay: push_wake rate-limited")
+	// ErrPushWakeStateCap refuses a new accounting key at retained capacity.
+	ErrPushWakeStateCap = errors.New("relay: push_wake accounting capacity reached")
 	// ErrPushWakeInFlightCap is returned when pushWakeMaxInFlight sends are
 	// already running. The wake is dropped, not queued.
 	ErrPushWakeInFlightCap = errors.New("relay: push_wake in-flight cap reached")
@@ -49,7 +59,7 @@ const (
 	pushWakeUnregistered                            // FCM errorCode UNREGISTERED
 	pushWakeSendFailed                              // any other send failure, including cancel by Close
 	pushWakeTokenFetchFailed                        // access-token fetch failed
-	pushWakeDropped                                 // refused by the rate limit or the in-flight cap
+	pushWakeDropped                                 // refused by rate, state capacity or in-flight cap
 	pushWakeOutcomeCount
 )
 
@@ -75,13 +85,19 @@ type pushSender interface {
 }
 
 // PushWaker admits wake requests from binaries and sends each one off the
-// binary read loop, under a per-server-id rate and a relay-wide in-flight
-// cap. A nil *PushWaker means push is off. Safe for concurrent use.
+// binary read loop, under daemon, device and global allowances and a
+// relay-wide in-flight cap. A nil *PushWaker means push is off. Safe for concurrent use.
 type PushWaker struct {
-	sender  pushSender
-	limiter *IPRateLimiter
-	slots   chan struct{}
-	logger  *slog.Logger
+	sender pushSender
+	slots  chan struct{}
+	logger *slog.Logger
+
+	refillEvery time.Duration // daemon allowance; device/global use fixed limits
+	burst       int
+	daemons     map[[sha256.Size]byte]*pushWakeBucket
+	devices     map[[sha256.Size]byte]*pushWakeBucket
+	global      pushWakeBucket
+	now         func() time.Time // called only under mu
 
 	// onOutcome counts outcomes; nil is a no-op. Set once at boot by
 	// setOutcomeHook. It must not call back into the waker.
@@ -90,29 +106,102 @@ type PushWaker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// mu makes admission atomic with Close: no wg.Add races wg.Wait, and
-	// limiter.Allow is never called after limiter.Close.
-	mu     sync.Mutex
-	closed bool
-	wg     sync.WaitGroup
+	// mu owns all accounting and makes admission atomic with Close.
+	// No wg.Add can race wg.Wait after the closed transition.
+	mu      sync.Mutex
+	closed  bool
+	wg      sync.WaitGroup
+	sweepWG sync.WaitGroup
+}
+
+type pushWakeBucket struct {
+	tokens     int
+	refillLast time.Time
+	pollLast   time.Time // every request, including refusals
+}
+
+// refill preserves the remainder of elapsed time while capping credit at burst.
+func (b *pushWakeBucket) refill(now time.Time, every time.Duration, burst int) {
+	steps := now.Sub(b.refillLast) / every
+	if steps <= 0 {
+		return
+	}
+	if steps >= time.Duration(burst-b.tokens) {
+		b.tokens = burst
+	} else {
+		b.tokens += int(steps)
+	}
+	b.refillLast = b.refillLast.Add(steps * every)
 }
 
 // NewPushWaker builds a waker around sender with the production limits.
-// Close must be called to stop the limiter and cancel in-flight sends.
+// Close must be called to stop sweeping and cancel in-flight sends.
 func NewPushWaker(sender pushSender, logger *slog.Logger) *PushWaker {
 	return newPushWaker(sender, pushWakeRefillEvery, pushWakeBurst, pushWakeMaxInFlight, logger)
 }
 
 func newPushWaker(sender pushSender, refillEvery time.Duration, burst, maxInFlight int, logger *slog.Logger) *PushWaker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &PushWaker{
-		sender:  sender,
-		limiter: NewIPRateLimiter(refillEvery, burst, pushWakeEvictionInterval),
-		slots:   make(chan struct{}, maxInFlight),
-		logger:  logger,
-		ctx:     ctx,
-		cancel:  cancel,
+	w := &PushWaker{
+		sender: sender, slots: make(chan struct{}, maxInFlight), logger: logger,
+		refillEvery: refillEvery, burst: burst,
+		daemons: make(map[[sha256.Size]byte]*pushWakeBucket),
+		devices: make(map[[sha256.Size]byte]*pushWakeBucket),
+		global:  pushWakeBucket{tokens: pushWakeGlobalBurst, refillLast: time.Now()},
+		now:     time.Now, ctx: ctx, cancel: cancel,
 	}
+	w.sweepWG.Add(1)
+	go w.sweepLoop()
+	return w
+}
+
+func (w *PushWaker) sweepLoop() {
+	defer w.sweepWG.Done()
+	ticker := time.NewTicker(pushWakeEvictionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			w.sweep()
+		}
+	}
+}
+
+func (w *PushWaker) sweep() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sweepLocked(w.now())
+}
+
+func (w *PushWaker) sweepLocked(now time.Time) {
+	w.evictIdle(w.daemons, now, w.refillEvery, w.burst)
+	w.evictIdle(w.devices, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
+}
+
+func (w *PushWaker) evictIdle(buckets map[[sha256.Size]byte]*pushWakeBucket, now time.Time, every time.Duration, burst int) {
+	for key, b := range buckets {
+		if now.Sub(b.pollLast) < pushWakeEvictionInterval {
+			continue
+		}
+		b.refill(now, every, burst)
+		// Never erase debt, even with slow test limits or capacity pressure.
+		if b.tokens == burst {
+			delete(buckets, key)
+		}
+	}
+}
+
+// requestedBucket touches existing state even if a different limit refuses.
+// Missing state remains temporary until all admission checks succeed.
+func requestedBucket(buckets map[[sha256.Size]byte]*pushWakeBucket, key [sha256.Size]byte, now time.Time, every time.Duration, burst int) *pushWakeBucket {
+	if b := buckets[key]; b != nil {
+		b.refill(now, every, burst)
+		b.pollLast = now
+		return b
+	}
+	return &pushWakeBucket{tokens: burst, refillLast: now, pollLast: now}
 }
 
 // setOutcomeHook installs the outcome hook. Call once at boot, before any
@@ -145,7 +234,7 @@ func NewPushWakerFromEnv(lookup func(string) (string, bool), logger *slog.Logger
 
 // Request validates the raw push_wake object from serverID's binary and,
 // if admitted, sends the wake on its own goroutine. It never blocks on the
-// send and never queues: a wake over either limit is refused with an error
+// send and never queues: a wake over any limit is refused with an error
 // for the caller to log. No returned error carries the token.
 func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	if w == nil {
@@ -155,13 +244,29 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	// Full digests keep accounting keys bounded without retaining raw tokens
+	// or conflating complete tokens through the truncated log fingerprint.
+	daemonKey := sha256.Sum256([]byte(serverID))
+	deviceKey := sha256.Sum256([]byte(wake.Token))
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrPushOff
 	}
-	if !w.limiter.Allow(serverID) {
+	now := w.now()
+	daemon := requestedBucket(w.daemons, daemonKey, now, w.refillEvery, w.burst)
+	device := requestedBucket(w.devices, deviceKey, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
+	w.global.refill(now, pushWakeGlobalRefillEvery, pushWakeGlobalBurst)
+	newDaemon, newDevice := w.daemons[daemonKey] == nil, w.devices[deviceKey] == nil
+	if newDaemon || newDevice {
+		w.sweepLocked(now)
+	}
+	if (newDaemon && len(w.daemons) >= pushWakeMaxBuckets) || (newDevice && len(w.devices) >= pushWakeMaxBuckets) {
+		w.record(pushWakeDropped)
+		return ErrPushWakeStateCap
+	}
+	if daemon.tokens == 0 || device.tokens == 0 || w.global.tokens == 0 {
 		w.record(pushWakeDropped)
 		return ErrPushWakeRateLimited
 	}
@@ -171,6 +276,11 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		w.record(pushWakeDropped)
 		return ErrPushWakeInFlightCap
 	}
+	// Commit all charges only after the non-blocking slot reservation.
+	w.daemons[daemonKey], w.devices[deviceKey] = daemon, device
+	daemon.tokens--
+	device.tokens--
+	w.global.tokens--
 	w.wg.Add(1)
 	go w.send(serverID, wake.Token)
 	return nil
@@ -212,17 +322,13 @@ func (w *PushWaker) send(serverID, token string) {
 }
 
 // Close refuses further wakes, cancels in-flight sends, waits for them to
-// return and stops the limiter. Idempotent.
+// return and stops sweeping. Concurrent callers also join admitted work.
 func (w *PushWaker) Close() {
 	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
-		return
-	}
 	w.closed = true
 	w.mu.Unlock()
 
 	w.cancel()
 	w.wg.Wait()
-	w.limiter.Close()
+	w.sweepWG.Wait()
 }
