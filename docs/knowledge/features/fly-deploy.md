@@ -55,7 +55,52 @@ The [operator runbook](../../deploy.md#app-restart-recovery) keeps effective
 policy verification, at least eleven consecutive isolated crashes and
 lifecycle evidence pending before manual production deployment. Recovery
 must preserve exactly one active production relay. Alert installation and
-delivery remain [#198](https://github.com/pyrycode/pyrycode-relay/issues/198).
+delivery remain [operator follow-up](../../deploy.md#restart-incident-response).
+
+### Restart incident watcher
+
+[`operations/relay_health.py`](../../../operations/relay_health.py) (#198) is
+an independent one-shot Python poller for one explicitly configured app/Machine.
+The operator owns its one-minute pyrybox schedule, private configuration/state,
+dedicated expiring org-scoped read-only token and trusted notification argv.
+Pyry receives incidents in **Pyrybox board watch**, investigates read-only and
+escalates to Juhana; this tool grants no production mutation authority. Its
+installation, delivered rehearsal and production activation remain pending in
+the [operator runbook](../../deploy.md#restart-incident-monitoring).
+[#170](https://github.com/pyrycode/pyrycode-relay/issues/170) owns secure-exchange,
+certificate, capacity and push-outcome monitoring separately.
+
+`fetch` makes one bounded, redirect-free GET for the selected Machine;
+`normalize`/`merge` project lifecycle evidence, `evaluate` proves coverage and
+updates the incident, and `poll` holds a nonblocking file lock through durable
+state and `notify`. Five automatic exits in the current ten-minute UTC window
+or a valid stopped observation outside finite maintenance latch one incident.
+Delivery remains pending until sending and saving succeed; a delivered latch
+survives watcher restarts and restart-to-stopped transitions. Ten continuous
+minutes of valid started observations below threshold rearm it. Poll failures
+or gaps greater than 90s interrupt recovery. Configuration, bounds and the
+offline test command are in [Restart incident monitoring](../../deploy.md#restart-incident-monitoring).
+
+Exit identity and history coverage answer different questions. Equivalent
+wrappers can have different platform timestamps for the same nanosecond
+`exited_at`; deduplicate by that normalized exit identity, count by exit time,
+and assess the earliest incoming platform timestamp **before** deduplication.
+When relying on persisted overlap, prior coverage must reach the current
+window boundary and incoming history must reach the prior successful observation.
+Identity overlap alone can hide a retained-history gap and wrongly complete
+recovery. Incomplete history fails monitoring without advancing coverage or
+clearing the incident; a local history marker is not an API pagination cursor.
+
+A derived automatic boolean cannot establish evidence consistency: different
+restarting/requested-stop flags can both produce false, and conflicting exit
+codes would disappear. Version 2 state therefore retains normalized nanosecond
+exit time, all three flags and all four exit/signal codes. `merge` compares the
+full evidence across records and polls; `load_state` validates types and
+identity/time/classification agreement. Omitted false/zero fields and equivalent
+wrappers remain valid. Version 1 is rejected unchanged because its discarded
+evidence cannot be reconstructed. The hermetic regressions cover a duplicate
+wrapper after nine recovery minutes, conflicts across saved polls, and
+equivalent evidence after a watcher restart.
 
 ### Single-machine hard cap
 
@@ -129,6 +174,13 @@ to the owning organization and its resources, including other apps; it is not
 app-scoped even though the helper queries only `pyrycode-relay`. It cannot deploy
 or mutate Fly resources. Authentication failures must be resolved with the
 read-only token, never by substituting a deploy or personal token.
+
+The restart watcher has its own local read-only token with the same org-wide
+exposure. It is not a deploy credential or a reuse of the CI scan secret.
+Only the fixed Fly HTTPS request receives it; trusted notification argv and
+the allowlisted child environment exclude it. Private operational state stays
+on pyrybox, outside the stateless relay runtime. See the
+[operational boundary review](../../threat-model.md#deploy-security--vps-compromise).
 
 The deployed job runs only for `schedule` or `workflow_dispatch` on
 `refs/heads/main` and checks out `main`. Only discovery and download receive the

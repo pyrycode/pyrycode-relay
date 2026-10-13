@@ -168,6 +168,17 @@ what `main` would ship; the deployed result describes its digest at its UTC
 observation time. See [CI image scanning](knowledge/features/docker-image.md#ci-image-scanning)
 and [deploy privileges](knowledge/features/fly-deploy.md#deploy-privilege-model--operator-direct).
 
+The repository also supplies an independent pyrybox
+[restart incident watcher](deploy.md#restart-incident-monitoring) (#198).
+An operator-scheduled process reads one selected Machine's lifecycle through
+the fixed Fly Machines API, keeps private app/Machine-scoped incident state
+on pyrybox, and invokes the trusted assistant-channel command to notify Pyry.
+Pyry investigates read-only and escalates to Juhana. This operational outbound
+Fly/notification boundary adds no relay endpoint, payload access or relay
+deployment target; relay routing remains stateless and content-blind.
+Installation, delivered verification and production activation are
+[pending operator work](deploy.md#restart-incident-response).
+
 ## Threat model
 
 Wire-protocol threats live in the protocol spec's [Security model](https://github.com/pyrycode/pyrycode/blob/main/docs/protocol-mobile.md#security-model). Operational threats specific to the relay binary as a deployed process — deploy, supply chain, DoS, log hygiene, cert handling, TLS config, error-leakage — live in [`docs/threat-model.md`](./threat-model.md).
