@@ -115,11 +115,11 @@ def exit_evidence(value):
 def merge(rows):
     unique = {}
     for row in rows:
-        key, at, automatic, recorded = row
+        key, at, automatic, recorded, evidence = row
         if key in unique:
-            require(unique[key][:3] == row[:3])
+            require(unique[key][:3] == row[:3] and unique[key][4] == evidence)
             recorded = max(recorded, unique[key][3])
-        unique[key] = [key, at, automatic, recorded]
+        unique[key] = [key, at, automatic, recorded, evidence]
     return sorted(unique.values(), key=lambda row: (row[1], row[0]))
 
 
@@ -139,13 +139,13 @@ def normalize(events):
             evidence = [exit_evidence(v) for v in (request.get('exit_event'), monitor.get('exit_event')) if v is not None]
             require(evidence and all(v == evidence[0] for v in evidence))
             at, restarting, planned, *_ = evidence[0]
-            rows.append([f'exit|{at}', at // 1000000, restarting and not planned, recorded])
+            rows.append([f'exit|{at}', at // 1000000, restarting and not planned, recorded, list(evidence[0])])
         else:
             status, source = event.get('status', ''), event.get('source', '')
             require(all(isinstance(v, str) and len(v) <= 128 for v in (status, source)))
             key = kind + '|' + json.dumps([recorded, status, source])
             require(len(key) <= 512)
-            rows.append([key, recorded, False, recorded])
+            rows.append([key, recorded, False, recorded, None])
     return merge(rows)
 
 
@@ -175,27 +175,33 @@ def load_state(config, directory):
     try:
         state = json.loads(read_private(state_name(config), directory))
     except FileNotFoundError:
-        return {'v': 1, 'app': config['app'], 'machine': config['machine'], 'events': [],
+        return {'v': 2, 'app': config['app'], 'machine': config['machine'], 'events': [],
                 'coverage': None, 'last_ok': None, 'recovery': None, 'incident': None}
     require(isinstance(state, dict) and set(state) == {'v', 'app', 'machine', 'events', 'coverage', 'last_ok', 'recovery', 'incident'})
-    require(type(state['v']) is int and state['v'] == 1)
+    require(type(state['v']) is int and state['v'] == 2)
     require(state.get('app') == config['app'] and state.get('machine') == config['machine'])
     for key in ('coverage', 'last_ok', 'recovery'):
         require(key in state and (state[key] is None or type(state[key]) is int and state[key] >= 0))
     require(isinstance(state.get('events'), list) and len(state['events']) <= 10001)
     for row in state['events']:
-        require(isinstance(row, list) and len(row) == 4 and isinstance(row[0], str) and len(row[0]) <= 512)
+        require(isinstance(row, list) and len(row) == 5 and isinstance(row[0], str) and len(row[0]) <= 512)
         require(type(row[1]) is int and row[1] >= 0 and type(row[2]) is bool and type(row[3]) is int and row[3] >= 0)
         kind, separator, evidence = row[0].partition('|')
         require(separator and re.fullmatch(r'[a-z_]{1,32}', kind))
         if kind == 'exit':
             require(evidence.isdecimal() and int(evidence) // 1000000 == row[1])
+            lifecycle = row[4]
+            require(isinstance(lifecycle, list) and len(lifecycle) == 8)
+            require(type(lifecycle[0]) is int and lifecycle[0] == int(evidence))
+            require(all(type(v) is bool for v in lifecycle[1:4]) and all(type(v) is int for v in lifecycle[4:]))
+            require(row[2] == (lifecycle[1] and not lifecycle[2]))
         else:
             anchor = json.loads(evidence)
             require(isinstance(anchor, list) and len(anchor) == 3 and type(anchor[0]) is int)
-            require(anchor[0] == row[1] == row[3] and not row[2])
+            require(anchor[0] == row[1] == row[3] and not row[2] and row[4] is None)
             require(all(isinstance(v, str) and len(v) <= 128 for v in anchor[1:]))
         require(state['last_ok'] is not None and max(row[1], row[3]) <= state['last_ok'])
+    merge(state['events'])  # Reject conflicting evidence in persisted duplicate rows too.
     require('incident' in state)
     incident = state['incident']
     if incident is not None:
@@ -238,12 +244,12 @@ def evaluate(config, prior, observation, now):
     incoming = normalize(observation.get('events'))
     require(incoming and all(0 < row[1] <= now and row[3] <= now for row in incoming))
     cutoff = now - WINDOW
-    oldest = min(row[3] for row in incoming)
+    oldest = min(event['timestamp'] for event in observation['events'])
     launched = any(row[0].startswith('launch|') and row[3] == oldest for row in incoming)
     birth = instant(observation.get('created_at')) // 1000000
     overlap = {row[0] for row in incoming} & {row[0] for row in prior['events']}
     require(oldest <= cutoff or launched and birth <= oldest <= birth + 1000 or
-            overlap and prior['coverage'] is not None and prior['coverage'] <= cutoff)
+            overlap and prior['coverage'] is not None and prior['coverage'] <= cutoff and oldest <= prior['last_ok'])
     rows = merge(prior['events'] + incoming)
     require(len(rows) <= 10001)
     count = sum(row[2] and cutoff < row[1] <= now for row in rows)

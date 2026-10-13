@@ -63,7 +63,7 @@ class WatcherTests(unittest.TestCase):
         return send
 
     def state_path(self):
-        return self.root / 'state' / f'pyrycode-relay-{MACHINE}.json'
+        return Path(self.cfg['state_dir']) / f'pyrycode-relay-{MACHINE}.json'
 
     def state(self):
         return json.loads(self.state_path().read_text())
@@ -167,6 +167,62 @@ class WatcherTests(unittest.TestCase):
             with patch.object(watch, 'fetch', return_value=obs), self.assertRaises(ValueError):
                 watch.poll(self.cfg, NOW)
             self.assertEqual(self.state()['incident'], before)
+
+    def test_duplicate_exit_cannot_bridge_history_gap_or_rearm(self):
+        self.poll(observation([event(NOW - 1500000)], state='stopped'), NOW - 600000)
+        for minute in range(10):
+            self.poll(observation(crashes(4) if minute == 9 else []), NOW - (9 - minute) * 60000)
+        before = self.state()
+        self.assertEqual(before['recovery'], NOW - 540000)
+        duplicate = event(NOW, 'exit', restarting=True)
+        duplicate['timestamp'] = NOW + 60000
+        gap = observation([duplicate, event(NOW + 60001)], anchor=False)
+        with patch.object(watch, 'fetch', return_value=gap), patch.object(watch, 'notify') as send:
+            with self.assertRaises(ValueError):
+                watch.poll(self.cfg, NOW + 60001)
+        self.assertEqual(self.state(), dict(before, recovery=None))
+        send.assert_not_called()
+        gap['events'].append(event(NOW, 'exit', restarting=True))
+        self.assertEqual(self.poll(gap, NOW + 60001).call_count, 0)
+        self.assertIsNotNone(self.state()['incident'])
+
+    def test_conflicting_exit_evidence_same_and_persisted_polls(self):
+        for field, value in [('restarting', True), ('requested_stop', True), ('oom_killed', True),
+                             ('exit_code', 1), ('guest_exit_code', 1), ('guest_signal', 9), ('signal', 9)]:
+            for persisted in (False, True):
+                with self.subTest(field=field, persisted=persisted):
+                    self.cfg['state_dir'] = str(self.root / f'{field}-{persisted}')
+                    self.config.write_text(json.dumps(self.cfg))
+                    original = event(NOW, 'exit')
+                    duplicate = event(NOW, 'exit', **{field: value})
+                    if field == 'restarting':
+                        duplicate['request']['exit_event']['requested_stop'] = True
+                    duplicate['request']['MonitorEvent'] = {'exit_event': duplicate['request'].pop('exit_event')}
+                    self.poll(observation([original] if persisted else [], state='stopped'))
+                    before = self.state()
+                    obs = observation([duplicate] if persisted else [original, duplicate])
+                    current = datetime.datetime.fromtimestamp((NOW + 60000) / 1000, datetime.timezone.utc)
+                    with patch.object(watch, 'fetch', return_value=obs), patch('builtins.print') as log, \
+                            patch.object(watch.datetime, 'datetime', wraps=datetime.datetime) as clock:
+                        clock.now.return_value = current
+                        self.assertEqual(watch.main([str(self.config)]), 2)
+                    self.assertEqual(self.state(), dict(before, recovery=None))
+                    self.assertIn('relay monitoring failure', str(log.call_args_list))
+
+    def test_equivalent_exit_evidence_survives_restart_and_validates_state(self):
+        original = event(NOW, 'exit')
+        self.poll(observation([original], state='stopped'))
+        equivalent = event(NOW, 'exit', restarting=False, requested_stop=False, oom_killed=False,
+                           exit_code=0, guest_exit_code=0, guest_signal=0, signal=0)
+        equivalent['request']['MonitorEvent'] = {'exit_event': equivalent['request'].pop('exit_event')}
+        self.assertEqual(self.poll(observation([equivalent]), NOW + 60000).call_count, 0)
+        before = self.state()
+        for bad in (dict(before, v=1, events=[row[:4] for row in before['events']]),
+                    dict(before, events=[[f'exit|{NOW * 1000000}', NOW, False, NOW, [NOW * 1000000, True, False, False, 0, 0, 0, 0]]])):
+            self.state_path().write_text(json.dumps(bad))
+            with self.assertRaises(ValueError):
+                self.poll(now=NOW + 120000)
+            self.assertEqual(self.state(), bad)
 
     def test_private_storage_and_scope(self):
         self.poll(observation(state='stopped'))
