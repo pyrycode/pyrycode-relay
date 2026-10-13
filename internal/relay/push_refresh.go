@@ -2,10 +2,13 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/jwt"
@@ -56,7 +59,7 @@ func (c *fcmTokenCache) token(ctx context.Context) (*oauth2.Token, error) {
 	c.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("%w: %w", ErrFCMTokenFetch, err)
+		return nil, fcmTransportFailure(ErrFCMTokenFetch, err)
 	}
 	if c.cached.Valid() {
 		tok := c.cached
@@ -78,10 +81,10 @@ func (c *fcmTokenCache) token(ctx context.Context) (*oauth2.Token, error) {
 
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("%w: %w", ErrFCMTokenFetch, ctx.Err())
+		return nil, fcmTransportFailure(ErrFCMTokenFetch, ctx.Err())
 	case <-r.done:
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrFCMTokenFetch, err)
+			return nil, fcmTransportFailure(ErrFCMTokenFetch, err)
 		}
 		return r.token, r.err
 	}
@@ -109,17 +112,33 @@ func (c *fcmTokenCache) fetch(ctx context.Context, r *fcmTokenRefresh) {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	client.Transport = fcmRefreshTransport{ctx: ctx, base: base}
+	var received time.Time
+	var failure error
+	client.Transport = fcmRefreshTransport{ctx: ctx, base: base, received: &received, failure: &failure}
 	tokenCtx := context.WithValue(ctx, oauth2.HTTPClient, &client)
 	tok, err := c.cfg.TokenSource(tokenCtx).Token()
+	if failure != nil {
+		err = failure
+	}
+	if err == nil && !tok.Valid() {
+		err = ErrFCMTokenFetch
+	}
 	if err != nil {
 		// RetrieveError embeds the endpoint body, and other JWT errors
-		// may contain a credential-bearing URL. Publish only the status.
+		// may contain a credential-bearing URL. Publish only safe classification.
 		var reply *oauth2.RetrieveError
 		if errors.As(err, &reply) && reply.Response != nil {
-			err = fmt.Errorf("%w: status %d", ErrFCMTokenFetch, reply.Response.StatusCode)
-		} else {
-			err = ErrFCMTokenFetch
+			err = fcmHTTPFailure(fmt.Errorf("%w: status %d", ErrFCMTokenFetch, reply.Response.StatusCode), reply.Response.StatusCode, reply.Response.Header.Get("Retry-After"), received, true)
+			var rejection struct {
+				Code string `json:"error"`
+			}
+			_ = json.Unmarshal(reply.Body, &rejection)
+			switch rejection.Code {
+			case "invalid_client", "invalid_grant", "unauthorized_client":
+				err.(*fcmRetryError).retry = false
+			}
+		} else if failure == nil {
+			err = fcmTransportFailure(ErrFCMTokenFetch, err)
 		}
 	}
 	r.cancel()
@@ -139,10 +158,35 @@ func (c *fcmTokenCache) fetch(ctx context.Context, r *fcmTokenRefresh) {
 // jwtSource.Token uses http.Client.PostForm, which does not attach the source
 // context to its request. Bind it here so cancellation reaches the network.
 type fcmRefreshTransport struct {
-	ctx  context.Context
-	base http.RoundTripper
+	ctx      context.Context
+	base     http.RoundTripper
+	received *time.Time
+	failure  *error
 }
 
 func (t fcmRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return t.base.RoundTrip(req.Clone(t.ctx))
+	resp, err := t.base.RoundTrip(req.Clone(t.ctx))
+	if err != nil {
+		*t.failure = fcmTransportFailure(ErrFCMTokenFetch, err)
+	}
+	if resp != nil {
+		*t.received = time.Now()
+		resp.Body = fcmRefreshBody{ReadCloser: resp.Body, failure: t.failure}
+	}
+	return resp, err
+}
+
+// The JWT source formats transport and read errors with %v, losing identity.
+// Capture sanitised classification before that boundary, never parse its text.
+type fcmRefreshBody struct {
+	io.ReadCloser
+	failure *error
+}
+
+func (b fcmRefreshBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		*b.failure = fcmTransportFailure(ErrFCMTokenFetch, err)
+	}
+	return n, err
 }

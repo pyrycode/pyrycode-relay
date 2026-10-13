@@ -80,3 +80,13 @@ Pending documentation stage:
 
 **Reviewer:** builder (self-review per checklist)
 **Date:** 2026-10-13
+
+## Revisions
+
+- 2026-10-13: Keep scheduling on private `jobNow` separately from allowance `now`; existing allowance tests use historical dates that must not expire real contexts. Both default to real time and are read under `w.mu`. Ordinary backoff anchors immediately after call return, before outcome logging. OAuth credential rejection codes (`invalid_client`, `invalid_grant`, `unauthorized_client`) override even transient HTTP statuses; `TestFCMSender_RetryPermanentReplies` caught the invalid-grant/503 case before its fix. Shared guidance receipt is proved by `TestFCMSender_RetrySharedReceipt`; own-call timeout and later guidance by `TestPushWaker_RetryGuidanceAndCallTimeout`.
+
+- 2026-10-13: The pinned JWT implementation formats network/read errors with `%v` and does not populate `RetrieveError.ErrorCode`. Capture sanitised transport/read classification inside `fcmRefreshTransport`/`fcmRefreshBody`, parse only the bounded OAuth rejection field, and reject invalid successful tokens before sending. `TestFCMSender_RetryTransportBoundary` also exposed an outer `url.Error` hiding a wrapped temporary cause; walk wrappers for positive net.Error evidence. Final work is approximately 845 inserted lines including tests and plan, exceeding 800. Per `builder/handoffs.md`'s floor rule, classification has exactly this one retry consumer and cannot be split into an independently verifiable sibling; keep this inseparable deliverable together. No new public type, dependency, call-site migration or acceptance criterion.
+
+- 2026-10-13: `FCMSender.Send` checks UNREGISTERED before the HTTP success branch, so permanent identity overrides even a contradictory 2xx reply; the permanent-replies test covers both 503 and 200.
+
+- 2026-10-13: Full race checks caught reordered fresh slot refusal skipping `requestedBucket` idle timestamps. Keep slot reservation after accounting checks and before charging in the shared helper; retries reuse their job's slot. Existing `TestPushWaker_StateBoundsAndExpiry` verifies this preserved refusal contract.

@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,6 +67,57 @@ type fcmUnregisteredError struct{ err error }
 
 func (e fcmUnregisteredError) Error() string   { return e.err.Error() }
 func (e fcmUnregisteredError) Unwrap() []error { return []error{e.err, ErrFCMUnregistered} }
+
+// fcmRetryError contains only sanitised causes and parsed guidance. Neither
+// endpoint text nor the original transport error is retained in its chain.
+type fcmRetryError struct {
+	err       error
+	retry     bool
+	notBefore time.Time
+}
+
+func (e *fcmRetryError) Error() string { return e.err.Error() }
+func (e *fcmRetryError) Unwrap() error { return e.err }
+
+func fcmHTTPFailure(err error, status int, guidance string, received time.Time, oauth bool) error {
+	retry := status == 429 || status == 500 || status == 503 || oauth && (status == 502 || status == 504)
+	notBefore := received
+	if guidance != "" && strings.IndexFunc(guidance, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+		seconds, parseErr := strconv.ParseUint(guidance, 10, 64)
+		delay := time.Duration(1<<63 - 1)
+		if parseErr == nil && seconds <= uint64(delay/time.Second) {
+			delay = time.Duration(seconds) * time.Second
+		}
+		notBefore = received.Add(delay)
+	} else if date, parseErr := http.ParseTime(guidance); parseErr == nil && date.After(received) {
+		notBefore = date
+	}
+	if status == 429 && notBefore.Before(received.Add(time.Minute)) {
+		notBefore = received.Add(time.Minute)
+	}
+	return &fcmRetryError{err: err, retry: retry, notBefore: notBefore}
+}
+
+func fcmTransportFailure(phase, cause error) error {
+	retry := false
+	// A url.Error can hide a temporary cause behind another wrapping error.
+	for current := cause; current != nil; current = errors.Unwrap(current) {
+		var network net.Error
+		if errors.As(current, &network) && (network.Timeout() || network.Temporary()) {
+			retry = true
+			break
+		}
+	}
+	safe := phase
+	switch {
+	case errors.Is(cause, context.Canceled):
+		safe = fmt.Errorf("%w: %w", phase, context.Canceled)
+		retry = false
+	case errors.Is(cause, context.DeadlineExceeded):
+		safe = fmt.Errorf("%w: %w", phase, context.DeadlineExceeded)
+	}
+	return &fcmRetryError{err: safe, retry: retry}
+}
 
 // FCMSender sends data-only, high-priority FCM messages that wake the
 // Android app. It holds no logger and is safe for concurrent use.
@@ -196,22 +249,24 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		// *url.Error carries only sendURL and the transport error; the
-		// device token travels in the body.
-		return "", fmt.Errorf("%w: %w", ErrFCMSend, err)
+		return "", fcmTransportFailure(ErrFCMSend, err)
 	}
+	received := time.Now()
 	defer resp.Body.Close()
-	reply, _ := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
+	reply, readErr := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
+	if readErr != nil {
+		return "", fcmTransportFailure(ErrFCMSend, readErr)
+	}
 
+	reason, unregistered := fcmErrorReason(reply)
+	if unregistered {
+		return "", fcmUnregisteredError{fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		reason, unregistered := fcmErrorReason(reply)
-		if unregistered {
-			return "", fcmUnregisteredError{fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)}
-		}
 		if reason != "" {
-			return "", fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
+			return "", fcmHTTPFailure(fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason), resp.StatusCode, resp.Header.Get("Retry-After"), received, false)
 		}
-		return "", fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
+		return "", fcmHTTPFailure(fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode), resp.StatusCode, resp.Header.Get("Retry-After"), received, false)
 	}
 	return fcmMessageID(reply), nil
 }
