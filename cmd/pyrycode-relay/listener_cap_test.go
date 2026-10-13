@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,16 +49,86 @@ func capAddr(t *testing.T) string {
 	return a
 }
 
+// Keep every port bound during fixture setup so the OS cannot reuse one for
+// another listener. Release the reservations immediately before relay startup.
+func reserveCapAddrs(t *testing.T, count int) ([]string, func()) {
+	t.Helper()
+	var listeners []net.Listener
+	release := func() {
+		for _, ln := range listeners {
+			ln.Close()
+		}
+	}
+	t.Cleanup(release)
+	addrs := make([]string, count)
+	for i := range addrs {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, ln)
+		addrs[i] = ln.Addr().String()
+	}
+	return addrs, release
+}
+
+func TestReserveCapAddrs(t *testing.T) {
+	for _, count := range []int{2, 3} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			addrs, release := reserveCapAddrs(t, count)
+			if len(addrs) != count {
+				t.Fatalf("listener address count = %d, want %d", len(addrs), count)
+			}
+			seen := make(map[string]bool)
+			for _, addr := range addrs {
+				if seen[addr] {
+					t.Fatalf("duplicate listener address: %s", addr)
+				}
+				seen[addr] = true
+			}
+			assertReserved := func() {
+				t.Helper()
+				for _, addr := range addrs {
+					ln, err := net.Listen("tcp", addr)
+					if err == nil {
+						ln.Close()
+						t.Errorf("listener address is not reserved: %s", addr)
+					} else if !errors.Is(err, syscall.EADDRINUSE) {
+						t.Errorf("checking reservation %s: %v", addr, err)
+					}
+				}
+			}
+			assertReserved()
+			release()
+			for _, addr := range addrs {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					t.Fatalf("listener address was not released: %v", err)
+				}
+				t.Cleanup(func() { ln.Close() })
+			}
+			// Releasing the old reservations again must not close the new owners.
+			release()
+			assertReserved()
+		})
+	}
+}
+
 func startCappedRelay(t *testing.T, secure, proxy bool, cap int) *cappedRelay {
 	t.Helper()
-	r := &cappedRelay{public: capAddr(t), metrics: capAddr(t), secure: secure, proxy: proxy, exit: make(chan int, 1)}
+	count := 2
+	if secure {
+		count++
+	}
+	addrs, release := reserveCapAddrs(t, count)
+	r := &cappedRelay{public: addrs[0], metrics: addrs[1], secure: secure, proxy: proxy, exit: make(chan int, 1)}
 	args := []string{"--metrics-listen", r.metrics}
 	if cap > 0 {
 		args = append(args, "--max-listener-connections", strconv.Itoa(cap))
 	}
 	tr := &http.Transport{DisableKeepAlives: true}
 	if secure {
-		r.http01 = capAddr(t)
+		r.http01 = addrs[2]
 		cache := t.TempDir() + "/certs"
 		mgr, err := relay.NewAutocertManager("relay.invalid", cache)
 		if err != nil {
@@ -107,6 +178,7 @@ func startCappedRelay(t *testing.T, secure, proxy bool, cap int) *cappedRelay {
 	r.client = &http.Client{Transport: tr, Timeout: 7 * time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	release()
 	go func() { r.exit <- run(args, ctx) }()
 	t.Cleanup(func() {
 		cancel()
