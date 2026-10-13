@@ -83,3 +83,7 @@ Pending for the documentation stage:
 
 **Reviewer:** builder (self-review per the security-review checklist)
 **Date:** 2026-10-13
+
+## Revisions
+
+2026-10-13 implementation review: use `python3 -B -m unittest discover -s operations -p 'test_relay_health.py'` as the local command so checks create no bytecode artifacts. The lifecycle contract is unchanged. Normalized exit identity retains nanosecond `exited_at` precision; counting uses its millisecond event time, while outer platform timestamps provide history anchors. Row and serialized-state caps also bound persisted merges; malformed/deeply nested JSON and failed initial saves interrupt recovery with sanitized diagnostics. Final size is about 710 lines, with no new exported types/interfaces or updated consumers; the same four acceptance criteria and lifecycle failure categories hold.
