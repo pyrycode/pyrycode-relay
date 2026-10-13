@@ -79,6 +79,22 @@ type fcmRetryError struct {
 func (e *fcmRetryError) Error() string { return e.err.Error() }
 func (e *fcmRetryError) Unwrap() error { return e.err }
 
+// withReadFailure preserves received HTTP decisions and guidance. Only a
+// successful status defers retryability to the read failure; cancellation
+// always stops. Both errors have already discarded unsafe transport details.
+func (e *fcmRetryError) withReadFailure(failure *fcmRetryError, status int) {
+	if status >= 200 && status <= 299 {
+		e.retry = failure.retry
+	}
+	switch {
+	case errors.Is(failure, context.Canceled):
+		e.err = fmt.Errorf("%w: %w", e.err, context.Canceled)
+		e.retry = false
+	case errors.Is(failure, context.DeadlineExceeded):
+		e.err = fmt.Errorf("%w: %w", e.err, context.DeadlineExceeded)
+	}
+}
+
 func fcmHTTPFailure(err error, status int, guidance string, received time.Time, oauth bool) error {
 	retry := status == 429 || status == 500 || status == 503 || oauth && (status == 502 || status == 504)
 	notBefore := received
@@ -254,19 +270,21 @@ func (s *FCMSender) Send(ctx context.Context, deviceToken string) (string, error
 	received := time.Now()
 	defer resp.Body.Close()
 	reply, readErr := io.ReadAll(io.LimitReader(resp.Body, fcmMaxDrainBytes))
-	if readErr != nil {
-		return "", fcmTransportFailure(ErrFCMSend, readErr)
-	}
-
 	reason, unregistered := fcmErrorReason(reply)
-	if unregistered {
-		return "", fcmUnregisteredError{fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if unregistered || readErr != nil || resp.StatusCode < 200 || resp.StatusCode > 299 {
+		statusErr := fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode)
 		if reason != "" {
-			return "", fcmHTTPFailure(fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason), resp.StatusCode, resp.Header.Get("Retry-After"), received, false)
+			statusErr = fmt.Errorf("%w: status %d (%s)", ErrFCMSend, resp.StatusCode, reason)
 		}
-		return "", fcmHTTPFailure(fmt.Errorf("%w: status %d", ErrFCMSend, resp.StatusCode), resp.StatusCode, resp.Header.Get("Retry-After"), received, false)
+		failure := fcmHTTPFailure(statusErr, resp.StatusCode, resp.Header.Get("Retry-After"), received, false).(*fcmRetryError)
+		if readErr != nil {
+			failure.withReadFailure(fcmTransportFailure(ErrFCMSend, readErr).(*fcmRetryError), resp.StatusCode)
+		}
+		if unregistered {
+			failure.retry = false
+			return "", fcmUnregisteredError{failure}
+		}
+		return "", failure
 	}
 	return fcmMessageID(reply), nil
 }

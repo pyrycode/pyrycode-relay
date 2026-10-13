@@ -543,3 +543,140 @@ func TestFCMSender_RetryTransportBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestFCMSender_RetryResponseReadFailure(t *testing.T) {
+	for _, phase := range []string{"oauth", "fcm"} {
+		for _, tc := range []struct {
+			name, guidance, body string
+			status               int
+			cause                error
+			retry, permanent     bool
+			minimum              time.Duration
+		}{
+			{"quota", "", "", 429, retryNetError{timeout: true}, true, false, time.Minute},
+			{"unavailable", "60", "", 503, retryNetError{timeout: true}, true, false, time.Minute},
+			{"unauthorized", "60", "", 401, retryNetError{timeout: true}, false, false, time.Minute},
+			{"success-body-timeout", "60", "", 200, retryNetError{timeout: true}, true, false, time.Minute},
+			{"overflow", strings.Repeat("9", 100), "", 503, retryNetError{timeout: true}, true, false, pushWakeJobTimeout},
+			{"deadline-identity", "60", "", 503, context.DeadlineExceeded, true, false, time.Minute},
+			{"cancelled", "60", "", 503, context.Canceled, false, false, time.Minute},
+			{"unclassified-read", "60", "", 503, errors.New("secret-read-error"), true, false, time.Minute},
+			{"permanent-503", "60", "permanent", 503, retryNetError{timeout: true}, false, true, time.Minute},
+			{"permanent-200", "60", "permanent", 200, retryNetError{timeout: true}, false, true, time.Minute},
+			{"permanent-429", "60", "permanent", 429, retryNetError{timeout: true}, false, true, time.Minute},
+		} {
+			t.Run(phase+"/"+tc.name, func(t *testing.T) {
+				s, err := newFCMSender(testServiceAccountJSON(t, "https://synthetic.invalid/secret"), "https://synthetic.invalid/secret")
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := tc.body
+				if tc.permanent {
+					body = `{"error":"invalid_grant","error_description":"secret-reply"}`
+					if phase == "fcm" {
+						body = fcmErrorBody("NOT_FOUND", fcmErrorType, "UNREGISTERED")
+					}
+				}
+				s.client.Transport = retryTransport(func(r *http.Request) (*http.Response, error) {
+					if phase == "fcm" && !strings.Contains(r.URL.Path, "messages:send") {
+						return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"synthetic","token_type":"Bearer"}`))}, nil
+					}
+					reader := io.MultiReader(strings.NewReader(body), retryReadError{tc.cause})
+					return &http.Response{StatusCode: tc.status, Header: http.Header{"Retry-After": []string{tc.guidance}}, Body: io.NopCloser(reader)}, nil
+				})
+				before := time.Now()
+				_, err = s.Send(context.Background(), testWakeToken)
+				after := time.Now()
+				info := retryInfo(err)
+				wantPhase := ErrFCMSend
+				if phase == "oauth" {
+					wantPhase = ErrFCMTokenFetch
+				}
+				if !errors.Is(err, wantPhase) || info == nil || info.retry != tc.retry {
+					t.Fatalf("error=%v classification=%+v want retry=%v", err, info, tc.retry)
+				}
+				if info.notBefore.Before(before.Add(tc.minimum)) || tc.name != "overflow" && info.notBefore.After(after.Add(tc.minimum)) {
+					t.Fatalf("lost response guidance: %v", info.notBefore)
+				}
+				if tc.permanent && phase == "fcm" && !errors.Is(err, ErrFCMUnregistered) {
+					t.Fatal("lost UNREGISTERED identity")
+				}
+				for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
+					if errors.Is(err, sentinel) != errors.Is(tc.cause, sentinel) {
+						t.Fatalf("lost context identity: %v", err)
+					}
+				}
+				if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "synthetic.invalid") {
+					t.Fatalf("leaked response/read error: %v", err)
+				}
+			})
+		}
+	}
+}
+
+type retryReadError struct{ err error }
+
+func (r retryReadError) Read([]byte) (int, error) { return 0, r.err }
+
+func TestFCMSender_RetrySharedReceiptReadFailure(t *testing.T) {
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	s, err := newFCMSender(testServiceAccountJSON(t, "https://synthetic.invalid/token"), "https://synthetic.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.client.Transport = retryTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 503, Header: http.Header{"Retry-After": []string{"15"}}, Body: retryHeldReadFailure{started, release}}, nil
+	})
+	before := time.Now()
+	first := asyncFCMSend(s, context.Background())
+	awaitRefreshSignal(t, started)
+	received := time.Now()
+	second := asyncFCMSend(s, context.Background())
+	awaitFCMWaiters(t, s, 2)
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	a, b := retryInfo(awaitFCMSend(t, first)), retryInfo(awaitFCMSend(t, second))
+	if a == nil || a != b || !a.retry || a.notBefore.Before(before.Add(15*time.Second)) || a.notBefore.After(received.Add(15*time.Second)) {
+		t.Fatalf("shared response receipt lost on read failure: %+v / %+v", a, b)
+	}
+}
+
+type retryHeldReadFailure struct{ started, release chan struct{} }
+
+func (b retryHeldReadFailure) Read([]byte) (int, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return 0, retryNetError{timeout: true}
+}
+func (retryHeldReadFailure) Close() error { return nil }
+
+func TestFCMSender_RetryRealBodyTimeout(t *testing.T) {
+	for _, phase := range []string{"oauth", "fcm"} {
+		t.Run(phase, func(t *testing.T) {
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(429)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			}))
+			defer peer.Close()
+			oauth, _ := fakeOAuth(t, 0)
+			tokenURL := oauth.URL
+			if phase == "oauth" {
+				tokenURL = peer.URL
+			}
+			s, err := newFCMSender(testServiceAccountJSON(t, tokenURL), peer.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.client.Timeout = 100 * time.Millisecond
+			before := time.Now()
+			_, err = s.Send(context.Background(), testWakeToken)
+			info := retryInfo(err)
+			if info == nil || !info.retry || info.notBefore.Before(before.Add(time.Minute)) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("real body timeout lost quota floor or deadline identity: %v / %+v", err, info)
+			}
+		})
+	}
+}

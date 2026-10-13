@@ -3,7 +3,6 @@ package relay
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -112,32 +111,34 @@ func (c *fcmTokenCache) fetch(ctx context.Context, r *fcmTokenRefresh) {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	var received time.Time
-	var failure error
-	client.Transport = fcmRefreshTransport{ctx: ctx, base: base, received: &received, failure: &failure}
+	transport := &fcmRefreshTransport{ctx: ctx, base: base}
+	client.Transport = transport
 	tokenCtx := context.WithValue(ctx, oauth2.HTTPClient, &client)
 	tok, err := c.cfg.TokenSource(tokenCtx).Token()
-	if failure != nil {
-		err = failure
+	if transport.failure != nil {
+		err = transport.failure
 	}
 	if err == nil && !tok.Valid() {
 		err = ErrFCMTokenFetch
 	}
 	if err != nil {
-		// RetrieveError embeds the endpoint body, and other JWT errors
-		// may contain a credential-bearing URL. Publish only safe classification.
-		var reply *oauth2.RetrieveError
-		if errors.As(err, &reply) && reply.Response != nil {
-			err = fcmHTTPFailure(fmt.Errorf("%w: status %d", ErrFCMTokenFetch, reply.Response.StatusCode), reply.Response.StatusCode, reply.Response.Header.Get("Retry-After"), received, true)
+		// The JWT source loses status and body on a read error. Use the
+		// response captured before reading, never its unsafe error text.
+		if transport.response != nil {
+			failure := transport.response
+			if transport.body.failure != nil {
+				failure.withReadFailure(transport.body.failure, transport.status)
+			}
 			var rejection struct {
 				Code string `json:"error"`
 			}
-			_ = json.Unmarshal(reply.Body, &rejection)
+			_ = json.Unmarshal(transport.body.reply, &rejection)
 			switch rejection.Code {
 			case "invalid_client", "invalid_grant", "unauthorized_client":
-				err.(*fcmRetryError).retry = false
+				failure.retry = false
 			}
-		} else if failure == nil {
+			err = failure
+		} else if transport.failure == nil {
 			err = fcmTransportFailure(ErrFCMTokenFetch, err)
 		}
 	}
@@ -160,18 +161,22 @@ func (c *fcmTokenCache) fetch(ctx context.Context, r *fcmTokenRefresh) {
 type fcmRefreshTransport struct {
 	ctx      context.Context
 	base     http.RoundTripper
-	received *time.Time
-	failure  *error
+	status   int
+	response *fcmRetryError
+	body     *fcmRefreshBody
+	failure  error
 }
 
-func (t fcmRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *fcmRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req.Clone(t.ctx))
 	if err != nil {
-		*t.failure = fcmTransportFailure(ErrFCMTokenFetch, err)
+		t.failure = fcmTransportFailure(ErrFCMTokenFetch, err)
 	}
 	if resp != nil {
-		*t.received = time.Now()
-		resp.Body = fcmRefreshBody{ReadCloser: resp.Body, failure: t.failure}
+		t.status = resp.StatusCode
+		t.response = fcmHTTPFailure(fmt.Errorf("%w: status %d", ErrFCMTokenFetch, resp.StatusCode), resp.StatusCode, resp.Header.Get("Retry-After"), time.Now(), true).(*fcmRetryError)
+		t.body = &fcmRefreshBody{ReadCloser: resp.Body, clientCtx: req.Context()}
+		resp.Body = t.body
 	}
 	return resp, err
 }
@@ -180,13 +185,24 @@ func (t fcmRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error
 // Capture sanitised classification before that boundary, never parse its text.
 type fcmRefreshBody struct {
 	io.ReadCloser
-	failure *error
+	clientCtx context.Context
+	failure   *fcmRetryError
+	reply     []byte // private to fetch; bounded by the JWT source's 1 MiB read cap
 }
 
-func (b fcmRefreshBody) Read(p []byte) (int, error) {
+func (b *fcmRefreshBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
+	// Retain complete rejection JSON even when a later read fails. The
+	// buffer is discarded after fetch; only sanitised decisions are shared.
+	keep := min(n, (1<<20)-len(b.reply))
+	b.reply = append(b.reply, p[:keep]...)
 	if err != nil && err != io.EOF {
-		*b.failure = fcmTransportFailure(ErrFCMTokenFetch, err)
+		// Client.Timeout annotates errors outside this body, after JWT
+		// loses their identity. Preserve its context signal here instead.
+		if ctxErr := b.clientCtx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		b.failure = fcmTransportFailure(ErrFCMTokenFetch, err).(*fcmRetryError)
 	}
 	return n, err
 }
