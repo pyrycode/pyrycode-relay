@@ -141,7 +141,20 @@ The operator must [verify forwarding at saturation and recovery on an isolated a
 before production deployment. Port 80 passthrough, 443 PROXY v2 and the 8080
 TCP health check retain their existing wiring.
 
-The single-machine cap is platform-enforced via `min_machines_running = 1`, `auto_start_machines = false`, and `auto_stop_machines = "off"` in `fly.toml`, and binary-enforced via the `PYRYCODE_RELAY_SINGLE_INSTANCE` self-check (#65). Multi-instance scaling is out of scope for v1 — see § *Single-instance constraint* above.
+The manifest declares `[[restart]]` with `processes = ["app"]` and
+`policy = "always"`, omitting `retries` (#199). Fly attempts restart
+recovery regardless of exit code; the effective Machine policy and isolated
+recovery/lifecycle checks remain [operator follow-up](deploy.md#app-restart-recovery)
+before manual production deployment. Merge alone does not establish live
+recovery.
+
+Exactly one active production relay must be preserved through recovery and
+deployment. `min_machines_running = 1`, `auto_start_machines = false`, and
+`auto_stop_machines = "off"` in `fly.toml` express single-machine intent;
+Fly has no maximum-machine ceiling. Operator discipline enforces the count,
+and `PYRYCODE_RELAY_SINGLE_INSTANCE=1` asserts that intent to the startup
+self-check (#65). Multi-instance scaling is out of scope for v1 — see
+§ *Single-instance constraint* above.
 
 Bootstrap and rollback procedures: [`docs/deploy.md`](deploy.md). The manifest itself: [`fly.toml`](../fly.toml). Deploys are operator-direct from clean `main` (`flyctl deploy --remote-only`); see [`docs/deploy.md`](deploy.md).
 
