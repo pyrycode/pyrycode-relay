@@ -124,6 +124,12 @@ the operator performs the initial manual run after provisioning the secret.
 
 ### Go source scanning
 
+The `govulncheck` job checks out `main` and selects Go through
+`actions/setup-go` with `go-version-file: go.mod`. The module's minimum is
+Go 1.26.9 (#186), so source scanning follows the patched module requirement
+independently of the Docker builder digest. Refreshing that digest alone does
+not change the source scanner's Go selection.
+
 The `govulncheck` job uses pinned `govulncheck@v1.1.4` with `-json ./...`, then runs [`cmd/vulngate`](../../../cmd/vulngate/main.go) to gate the result (#175). JSON mode alone is not an exit-status gate: a successful scan exits 0 even with findings. The gate fails on a `finding` whose first trace frame has a non-empty `function`, providing source call-path evidence that the code calls a vulnerable function. This is the same symbol-level rule that makes text-mode `govulncheck ./...` exit 3. Bare `osv` records and module/package findings describing required or imported code do not qualify; a valid scan with only those records passes without an artifact.
 
 The gate groups relevant findings by OSV id and joins their matching `osv` summaries. Each advisory is listed once with its module/version, fixed version (or `no fix`) and distinct called symbols. Sorted ids and symbols keep rendering deterministic; the title names the first sorted id and its Go module. The body displays at most 100 advisories and five symbols per advisory, with omitted counts, since a single stdlib advisory can have dozens of called symbols. `cmd/vulngate` is a separate standard-library-only command; the Dockerfile still builds only `cmd/pyrycode-relay`.
@@ -142,7 +148,13 @@ The `file-issue` job (added in #73, scoped to `issues: write` at the job level o
 
 ## Responding to a scan regression
 
-A red `security-scan` finding against stdlib is cleared by refreshing the build-stage digest (Trivy reads the stdlib version from the *builder's* toolchain, not from `go.mod`'s `go` directive), and a finding against a module by `go get <module>@<version>` + `go mod tidy` — the same two-edit shape in #103, #122, #126 and #165.
+A stdlib finding in `govulncheck` requires patched Go selected through `go.mod`;
+validate with text-mode `govulncheck ./...` under that toolchain, then confirm
+the next completed source-scan job on `main` after merge. A stdlib finding in
+`image-scan` requires a patched Docker builder digest: Trivy reads the version
+embedded in the built binary. Verify both selections independently. A finding
+against a module is cleared by `go get <module>@<version>` + `go mod tidy` —
+the same two-edit shape in #103, #122, #126 and #165.
 
 Clearing the repository result does not clear a deployed-image finding. The
 operator must deploy the patched build, then check a completed deployed-image

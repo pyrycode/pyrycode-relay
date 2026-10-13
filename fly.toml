@@ -16,6 +16,11 @@
 app = "pyrycode-relay"
 primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
 
+# Complete-process budget: 10s drain + 10s push cleanup + 5s local
+# cleanup/exit headroom. Fly's best-effort stop allowance adds 5s margin.
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
 [env]
   # Asserts single-instance intent to the #65 self-check, which would
   # otherwise refuse to boot on Fly's multi-instance-capable substrate.
@@ -39,7 +44,11 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   # `--https-proxy-protocol` pairs with the `proxy_proto` handler on the
   # 443 port below (#110): the relay reads Fly's PROXY v2 header before
   # TLS so the per-IP rate limiter keys on the real client IP.
-  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443 --https-proxy-protocol"
+  app = "--domain pyrycode-relay.pyryco.de --cert-cache /var/lib/relay/autocert --http-listen=:8080 --https-listen=:8443 --https-proxy-protocol --max-connections=64 --max-connections-per-source=48 --max-listener-connections=128 --upgrade-refill-interval=10ms --upgrade-burst=200"
+
+[[restart]]
+  processes = ["app"]
+  policy = "always"
 
 [[mounts]]
   source = "relay_autocert"
@@ -58,10 +67,10 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   auto_start_machines = false
   min_machines_running = 1
 
-  # Match --max-listener-connections (default: 32) for this listener.
+  # Match the configured raw listener allowance of 128.
   [services.concurrency]
     type = "connections"
-    hard_limit = 32
+    hard_limit = 128
 
   [[services.ports]]
     port = 80
@@ -91,10 +100,10 @@ primary_region = "arn"   # operator fills at bootstrap; see docs/deploy.md.
   auto_start_machines = false
   min_machines_running = 1
 
-  # Match --max-listener-connections (default: 32) for this listener.
+  # Match the configured raw listener allowance of 128.
   [services.concurrency]
     type = "connections"
-    hard_limit = 32
+    hard_limit = 128
 
   [[services.ports]]
     port = 443
