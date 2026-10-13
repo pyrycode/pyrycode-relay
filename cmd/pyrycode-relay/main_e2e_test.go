@@ -2,17 +2,31 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/pyrycode/pyrycode-relay/internal/relay"
 )
 
 // TestRun_SigtermClosesWSConnsWithGoingAway boots the relay via run()
@@ -631,5 +645,526 @@ func TestRun_ConnCapGatesUpgradesNotHealthz(t *testing.T) {
 		}
 	case <-time.After(drainDeadline + 2*time.Second):
 		t.Fatal("run did not return after shutdown")
+	}
+}
+
+// This budget covers the configured drain, conservative subsequent push
+// cleanup, and local limiter/scheduling/exit headroom. It is not a new deadline
+// in production; Fly's best-effort stop allowance must exceed it by five seconds.
+const completeProcessBudget = drainDeadline + 10*time.Second + 5*time.Second
+
+type shutdownProcessEvent struct {
+	Stage    string             `json:"stage"`
+	Waiters  int                `json:"waiters,omitempty"`
+	OAuth    int64              `json:"oauth,omitempty"`
+	Other    int64              `json:"other,omitempty"`
+	Outcomes map[string]float64 `json:"outcomes,omitempty"`
+}
+
+// shutdownOAuthTransport allows only the local synthetic OAuth URL. Holding
+// its return AFTER network cancellation tests the in-child authentication join.
+type shutdownOAuthTransport struct {
+	url      string
+	base     *http.Transport
+	release  chan struct{}
+	finished chan struct{}
+	hits     atomic.Int64
+	other    atomic.Int64
+	report   func(shutdownProcessEvent)
+}
+
+func (s *shutdownOAuthTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.String() != s.url {
+		s.other.Add(1)
+		return nil, errors.New("unexpected outbound request refused")
+	}
+	s.hits.Add(1)
+	resp, err := s.base.RoundTrip(r)
+	if !errors.Is(r.Context().Err(), context.Canceled) {
+		s.report(shutdownProcessEvent{Stage: "authentication-not-cancelled"})
+		return resp, err
+	}
+	s.report(shutdownProcessEvent{Stage: "authentication-cancelled"})
+	<-s.release
+	close(s.finished)
+	return resp, err
+}
+
+// TestRun_ProcessSIGTERMHelper runs only in the re-executed test process. All
+// observation happens around production run; nothing closes its waker for it.
+func TestRun_ProcessSIGTERMHelper(t *testing.T) {
+	if os.Getenv("RELAY_SHUTDOWN_CHILD") != "1" {
+		return
+	}
+	var reportMu sync.Mutex
+	encoder := json.NewEncoder(os.Stdout)
+	report := func(e shutdownProcessEvent) {
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		if encoder.Encode(e) != nil {
+			os.Exit(3)
+		}
+	}
+	transport := &shutdownOAuthTransport{
+		url:     os.Getenv("RELAY_SHUTDOWN_OAUTH"),
+		base:    &http.Transport{Proxy: nil},
+		release: make(chan struct{}), finished: make(chan struct{}), report: report,
+	}
+	http.DefaultTransport = transport
+	type bootState struct {
+		w       *relay.PushWaker
+		metrics *prometheus.Registry
+	}
+	boot := make(chan bootState, 1)
+	var waker *relay.PushWaker
+	newPushWakerFromEnv = func(lookup func(string) (string, bool), logger *slog.Logger) (*relay.PushWaker, error) {
+		w, err := relay.NewPushWakerFromEnv(lookup, logger)
+		waker = w
+		return w, err
+	}
+	newMetricsRegistry = func() *prometheus.Registry {
+		r := relay.NewMetricsRegistry()
+		boot <- bootState{waker, r}
+		return r
+	}
+	ready := make(chan (<-chan struct{}), 1)
+	observed := make(chan bootState, 1)
+	go func() {
+		b := <-boot
+		observed <- b
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			n, done := b.w.RefreshState()
+			if n == 6 && done != nil {
+				report(shutdownProcessEvent{Stage: "joined", Waiters: n})
+				break
+			}
+			select {
+			case <-ticker.C:
+			case <-timer.C:
+				report(shutdownProcessEvent{Stage: "waiters-timeout"})
+				os.Exit(3)
+			}
+		}
+		control := json.NewDecoder(os.Stdin)
+		for {
+			var command string
+			if control.Decode(&command) != nil {
+				close(transport.release)
+				return
+			}
+			switch command {
+			case "check":
+				n, done := b.w.RefreshState()
+				if n != 6 || done == nil {
+					report(shutdownProcessEvent{Stage: "not-held"})
+					os.Exit(3)
+				}
+				select {
+				case <-done:
+					report(shutdownProcessEvent{Stage: "not-held"})
+					os.Exit(3)
+				default:
+				}
+				ready <- done
+				report(shutdownProcessEvent{Stage: "ready", Waiters: n})
+			case "release":
+				close(transport.release)
+				return
+			}
+		}
+	}()
+	code := run([]string{"--insecure-listen", os.Getenv("RELAY_SHUTDOWN_ADDR"), "--metrics-listen", ""},
+		signalContextFor(syscall.SIGTERM, syscall.SIGINT))
+	// Sending this first makes an early return observable even if assertions fail.
+	report(shutdownProcessEvent{Stage: "run-returned"})
+	var refreshDone <-chan struct{}
+	select {
+	case refreshDone = <-ready:
+	default:
+		os.Exit(3)
+	}
+	select {
+	case <-transport.finished:
+	default:
+		os.Exit(3)
+	}
+	select {
+	case <-refreshDone:
+	default:
+		os.Exit(3)
+	}
+	b := <-observed
+	families, err := b.metrics.Gather()
+	if err != nil {
+		os.Exit(3)
+	}
+	outcomes := make(map[string]float64)
+	for _, family := range families {
+		if family.GetName() == "pyrycode_relay_push_wakes_total" {
+			for _, metric := range family.Metric {
+				for _, label := range metric.Label {
+					if label.GetName() == "outcome" {
+						outcomes[label.GetValue()] = metric.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	report(shutdownProcessEvent{Stage: "cleanup-complete", OAuth: transport.hits.Load(), Other: transport.other.Load(), Outcomes: outcomes})
+	os.Exit(code)
+}
+
+func TestRun_ProcessSIGTERMCompleteShutdown(t *testing.T) {
+	if completeProcessBudget != 25*time.Second {
+		t.Fatal("review the complete-process budget and Fly margin")
+	}
+	addr, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oauthHits atomic.Int64
+	authStarted := make(chan struct{}, 8)
+	authCancelled := make(chan struct{}, 8)
+	unblockOAuth := make(chan struct{})
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		oauthHits.Add(1)
+		authStarted <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			authCancelled <- struct{}{}
+		case <-unblockOAuth:
+		}
+	}))
+	defer oauth.Close()
+	defer close(unblockOAuth)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := json.Marshal(map[string]string{
+		"type": "service_account", "client_email": "synthetic@example.invalid",
+		"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})),
+		"token_uri":   oauth.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestRun_ProcessSIGTERMHelper$")
+	cmd.Env = []string{"RELAY_SHUTDOWN_CHILD=1", "RELAY_SHUTDOWN_ADDR=" + addr,
+		"RELAY_SHUTDOWN_OAUTH=" + oauth.URL, "PYRYCODE_RELAY_FCM_CREDENTIALS=" + string(credentials)}
+	stderr, err := os.CreateTemp(t.TempDir(), "child-stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	cmd.Stderr = stderr
+	// Own the pipe so cmd.Wait cannot close it before final events are read.
+	output, childOutput, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	defer childOutput.Close()
+	cmd.Stdout = childOutput
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childOutput.Close()
+	decoderDone := make(chan struct{})
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	defer func() {
+		input.Close()
+		cancel()
+		select {
+		case <-exited:
+		case <-time.After(3 * time.Second):
+			t.Error("child was not reaped")
+		}
+		<-decoderDone
+		if t.Failed() {
+			data, _ := os.ReadFile(stderr.Name())
+			t.Logf("child diagnostics:\n%s", data)
+		}
+	}()
+	events := make(chan shutdownProcessEvent, 16)
+	go func() {
+		defer close(decoderDone)
+		defer close(events)
+		d := json.NewDecoder(output)
+		for {
+			var e shutdownProcessEvent
+			if d.Decode(&e) != nil {
+				return
+			}
+			events <- e
+		}
+	}()
+	awaitEvent := func(stage string) shutdownProcessEvent {
+		t.Helper()
+		select {
+		case e, ok := <-events:
+			if !ok || e.Stage != stage {
+				t.Fatalf("child event = %+v (open %v), want %s", e, ok, stage)
+			}
+			return e
+		case <-time.After(3 * time.Second):
+			t.Fatalf("child event timeout: %s", stage)
+		}
+		return shutdownProcessEvent{}
+	}
+	control := json.NewEncoder(input)
+	if err := waitForDial(addr, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	binary := dialServer(t, addr, "s-process-200")
+	defer binary.CloseNow()
+	phone := dialPhone(t, addr, "s-process-200")
+	defer phone.CloseNow()
+	// Own and join the readers; responsive peers keep processing close frames
+	// while traffic writers race the signal and drain.
+	peerCtx, peerCancel := context.WithCancel(ctx)
+	var readers sync.WaitGroup
+	defer func() { peerCancel(); binary.CloseNow(); phone.CloseNow(); readers.Wait() }()
+	binaryFrames := make(chan string, 1)
+	phoneFrames := make(chan struct{}, 1)
+	binaryClose, phoneClose := make(chan error, 1), make(chan error, 1)
+	var binaryCount, phoneCount atomic.Int64
+	const frame = `{"v":2,"opaque":"synthetic ciphertext remains opaque"}`
+	startReader := func(c *websocket.Conn, isBinary bool, ended chan<- error) {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				_, data, err := c.Read(peerCtx)
+				if err != nil {
+					ended <- err
+					return
+				}
+				if isBinary {
+					var envelope struct {
+						ConnID    string          `json:"conn_id"`
+						Frame     json.RawMessage `json:"frame"`
+						CloseCode int             `json:"close_code"`
+					}
+					if json.Unmarshal(data, &envelope) != nil {
+						ended <- errors.New("invalid binary routing envelope")
+						return
+					}
+					// A phone's drain cleanup can notify its still-closing binary
+					// before the binary's concurrent 1001 handshake finishes.
+					if len(envelope.Frame) == 0 && envelope.ConnID != "" && envelope.CloseCode == 1001 {
+						continue
+					}
+					if string(envelope.Frame) != frame || envelope.ConnID == "" {
+						ended <- errors.New("binary opaque frame mismatch")
+						return
+					}
+					binaryCount.Add(1)
+					select {
+					case binaryFrames <- envelope.ConnID:
+					default:
+					}
+				} else {
+					if string(data) != frame {
+						ended <- errors.New("phone opaque frame mismatch")
+						return
+					}
+					phoneCount.Add(1)
+					select {
+					case phoneFrames <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}()
+	}
+	startReader(binary, true, binaryClose)
+	startReader(phone, false, phoneClose)
+	write := func(c *websocket.Conn, data []byte) {
+		t.Helper()
+		if err := c.Write(peerCtx, websocket.MessageText, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(phone, []byte(frame))
+	var connID string
+	select {
+	case connID = <-binaryFrames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("phone not admitted")
+	}
+	envelope, _ := json.Marshal(struct {
+		ConnID string          `json:"conn_id"`
+		Frame  json.RawMessage `json:"frame"`
+	}{connID, json.RawMessage(frame)})
+	write(binary, envelope)
+	select {
+	case <-phoneFrames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("binary-to-phone forwarding failed")
+	}
+	admitCtx, admitCancel := context.WithTimeout(peerCtx, 2*time.Second)
+	defer admitCancel()
+	for _, c := range []*websocket.Conn{binary, phone} {
+		if err := c.Ping(admitCtx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first wake starts the natural send/refresh clocks. A short readiness
+	// budget prevents their ten-second expiry from substituting for SIGTERM.
+	wakeStart := time.Now()
+	for i := 0; i < 6; i++ {
+		write(binary, []byte(`{"push_wake":{"platform":"fcm","token":"synthetic-device-token"}}`))
+	}
+	awaitEvent("joined")
+	select {
+	case <-authStarted:
+	case <-time.After(time.Second):
+		t.Fatal("no local OAuth request")
+	}
+	// Continue BOTH directions while OAuth is held, and through signalling.
+	var writers sync.WaitGroup
+	for _, pair := range []struct {
+		c    *websocket.Conn
+		data []byte
+	}{{phone, []byte(frame)}, {binary, envelope}} {
+		writers.Add(1)
+		go func(c *websocket.Conn, data []byte) {
+			defer writers.Done()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-peerCtx.Done():
+					return
+				case <-ticker.C:
+					if c.Write(peerCtx, websocket.MessageText, data) != nil {
+						return
+					}
+				}
+			}
+		}(pair.c, pair.data)
+	}
+	defer func() { peerCancel(); writers.Wait() }()
+	trafficDeadline := time.Now().Add(time.Second)
+	for binaryCount.Load() < 3 || phoneCount.Load() < 3 {
+		if time.Now().After(trafficDeadline) {
+			t.Fatal("traffic did not continue during held authentication")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := control.Encode("check"); err != nil {
+		t.Fatal(err)
+	}
+	awaitEvent("ready")
+	if time.Since(wakeStart) >= 5*time.Second {
+		t.Fatal("signal too late to rule out natural push deadlines")
+	}
+	if oauthHits.Load() != 1 {
+		t.Fatalf("OAuth requests before signal = %d", oauthHits.Load())
+	}
+	select {
+	case <-authCancelled:
+		t.Fatal("authentication not held before signal")
+	default:
+	}
+	signalled := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	awaitEvent("authentication-cancelled")
+	authElapsed := time.Since(signalled)
+	select {
+	case <-authCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("local OAuth did not observe cancellation")
+	}
+	// No child return is allowed while its cancelled transport is still held.
+	select {
+	case e := <-events:
+		t.Fatalf("child returned before authentication join: %+v", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := control.Encode("release"); err != nil {
+		t.Fatal(err)
+	}
+	awaitEvent("run-returned")
+	cleanup := awaitEvent("cleanup-complete")
+	if cleanup.OAuth != 1 || cleanup.Other != 0 || oauthHits.Load() != 1 {
+		t.Fatalf("request counts: %+v, local OAuth %d", cleanup, oauthHits.Load())
+	}
+	if len(cleanup.Outcomes) != 5 || cleanup.Outcomes["token_fetch_failed"] != 6 {
+		t.Fatalf("outcomes: %v", cleanup.Outcomes)
+	}
+	for outcome, count := range cleanup.Outcomes {
+		if outcome != "token_fetch_failed" && count != 0 {
+			t.Errorf("outcome %s = %v", outcome, count)
+		}
+	}
+	for name, closed := range map[string]<-chan error{"binary": binaryClose, "phone": phoneClose} {
+		select {
+		case err := <-closed:
+			if websocket.CloseStatus(err) != websocket.StatusGoingAway {
+				t.Errorf("%s close = %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("%s did not observe close", name)
+		}
+	}
+	select {
+	case err := <-exited:
+		exited <- err // Leave the completed result for unconditional cleanup.
+		if err != nil {
+			t.Fatalf("child exit: %v", err)
+		}
+	case <-time.After(completeProcessBudget - time.Since(signalled)):
+		t.Fatal("child exceeded complete process budget")
+	}
+	exitElapsed := time.Since(signalled)
+	if exitElapsed > completeProcessBudget {
+		t.Fatalf("signal-to-exit %s exceeds %s", exitElapsed, completeProcessBudget)
+	}
+	t.Logf("budget=%s signal-to-exit=%s signal-to-authentication-cancellation=%s OAuth=1 FCM=0 token_fetch_failed=6; both peers closed 1001; authentication cleanup joined", completeProcessBudget, exitElapsed, authElapsed)
+}
+
+// Full TOML parsing and baseline comparison is also performed offline for the
+// PR. This test pins the two top-level scalar settings to the process budget.
+func TestFlyCompleteShutdownAllowance(t *testing.T) {
+	manifest, err := os.ReadFile("../../fly.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := make(map[string]string)
+	for _, line := range strings.Split(string(manifest), "\n") {
+		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if key, value, ok := strings.Cut(line, "="); ok {
+			settings[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	if settings["kill_signal"] != `"SIGTERM"` {
+		t.Errorf("top-level kill_signal = %q, want SIGTERM", settings["kill_signal"])
+	}
+	seconds, err := strconv.Atoi(settings["kill_timeout"])
+	if err != nil || seconds != 30 || time.Duration(seconds)*time.Second < completeProcessBudget+5*time.Second || seconds > 300 {
+		t.Fatalf("top-level kill_timeout = %q; want 30 seconds, budget %s + 5s margin, within 300s", settings["kill_timeout"], completeProcessBudget)
 	}
 }
