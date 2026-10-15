@@ -435,13 +435,16 @@ func TestPushWaker_AdmissionRacesClose(t *testing.T) {
 	}
 	close(start)
 	work.Wait()
-	if len(s.sentTokens()) != int(admitted.Load()) {
-		t.Fatal("admitted work not joined")
+	invoked := len(s.sentTokens())
+	if invoked < 1 || invoked > int(admitted.Load()) {
+		t.Fatal("provider calls exceeded admitted work")
 	}
 	if err := w.Request("late", wakeJSON("fcm", testWakeToken)); !errors.Is(err, ErrPushOff) {
 		t.Fatal(err)
 	}
-	assertCounter(t, h, "pyrycode_relay_push_wakes_total", `outcome="send_failed"`, int(admitted.Load()))
+	// Close also joins jobs cancelled before their invocation gate; those
+	// consume admission credit but create no provider-attempt outcome.
+	assertCounter(t, h, "pyrycode_relay_push_wakes_total", `outcome="send_failed"`, invoked)
 }
 
 // Coalescing and device refill have the same interval, so ordinary same-device

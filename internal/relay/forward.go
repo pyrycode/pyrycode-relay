@@ -175,6 +175,17 @@ func StartBinaryForwarder(
 	binary binarySource,
 	logger *slog.Logger,
 ) error {
+	var origin *pushWakeOrigin
+	if writer, ok := binary.(pushResultWriter); ok {
+		originCtx, cancel := context.WithCancel(writer.pushResultContext())
+		stop := context.AfterFunc(ctx, cancel)
+		origin = &pushWakeOrigin{ctx: originCtx, writer: writer}
+		defer func() {
+			cancel()
+			stop()
+			origin.wg.Wait()
+		}()
+	}
 	for {
 		wrapped, err := binary.Read(ctx)
 		if err != nil {
@@ -198,7 +209,7 @@ func StartBinaryForwarder(
 		// push_wake envelope, which addresses the relay, not a phone. The
 		// waker sends off this loop; a refused wake is logged and dropped.
 		if env.ConnID == "" {
-			if err := reg.pushWaker.Request(serverID, env.PushWake); err != nil {
+			if err := reg.pushWaker.request(serverID, env.PushWake, origin); err != nil {
 				logger.Warn("binary_forwarder_push_wake_dropped",
 					"server_id", serverID,
 					"binary_conn_id", binary.ConnID(),

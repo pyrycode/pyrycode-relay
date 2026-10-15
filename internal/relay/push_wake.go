@@ -99,16 +99,18 @@ type PushWaker struct {
 	slots  chan struct{}
 	logger *slog.Logger
 
-	refillEvery time.Duration // daemon allowance; device/global use fixed limits
-	burst       int
-	daemons     map[[sha256.Size]byte]*pushWakeBucket
-	devices     map[[sha256.Size]byte]*pushWakeBucket
-	global      pushWakeBucket
-	jobs        map[[sha256.Size]byte]*pushWakeJob
-	now         func() time.Time // called only under mu
-	jobNow      func() time.Time // scheduling clock, called only under mu
-	wait        func(context.Context, time.Duration) bool
-	jitter      func() time.Duration
+	refillEvery     time.Duration // daemon allowance; device/global use fixed limits
+	burst           int
+	daemons         map[[sha256.Size]byte]*pushWakeBucket
+	devices         map[[sha256.Size]byte]*pushWakeBucket
+	global          pushWakeBucket
+	jobs            map[[sha256.Size]byte]*pushWakeJob
+	feedbackOrigins map[*pushWakeOrigin]int
+	feedbackCount   int
+	now             func() time.Time // called only under mu
+	jobNow          func() time.Time // scheduling clock, called only under mu
+	wait            func(context.Context, time.Duration) bool
+	jitter          func() time.Duration
 
 	// onOutcome counts outcomes; nil is a no-op. Set once at boot by
 	// setOutcomeHook. It must not call back into the waker.
@@ -127,8 +129,12 @@ type PushWaker struct {
 
 // Completed jobs retain only bounded metadata, never a raw device token.
 type pushWakeJob struct {
-	until  time.Time
-	active bool
+	until    time.Time
+	active   bool
+	done     chan struct{}
+	evicted  chan struct{}
+	invalid  bool
+	feedback map[pushWakeFeedbackKey]*pushWakeFeedback
 }
 
 type pushWakeBucket struct {
@@ -162,11 +168,12 @@ func newPushWaker(sender pushSender, refillEvery time.Duration, burst, maxInFlig
 	w := &PushWaker{
 		sender: sender, slots: make(chan struct{}, maxInFlight), logger: logger,
 		refillEvery: refillEvery, burst: burst,
-		daemons: make(map[[sha256.Size]byte]*pushWakeBucket),
-		devices: make(map[[sha256.Size]byte]*pushWakeBucket),
-		jobs:    make(map[[sha256.Size]byte]*pushWakeJob),
-		global:  pushWakeBucket{tokens: pushWakeGlobalBurst, refillLast: time.Now()},
-		now:     time.Now, jobNow: time.Now, wait: waitPushRetry,
+		daemons:         make(map[[sha256.Size]byte]*pushWakeBucket),
+		devices:         make(map[[sha256.Size]byte]*pushWakeBucket),
+		jobs:            make(map[[sha256.Size]byte]*pushWakeJob),
+		feedbackOrigins: make(map[*pushWakeOrigin]int),
+		global:          pushWakeBucket{tokens: pushWakeGlobalBurst, refillLast: time.Now()},
+		now:             time.Now, jobNow: time.Now, wait: waitPushRetry,
 		jitter: func() time.Duration { return time.Duration(rand.Int64N(int64(time.Second) + 1)) }, ctx: ctx, cancel: cancel,
 	}
 	w.sweepWG.Add(1)
@@ -195,6 +202,7 @@ func (w *PushWaker) sweep() {
 }
 
 func (w *PushWaker) sweepLocked(now time.Time) {
+	w.expireFeedbackLocked(w.jobNow())
 	w.expireJobsLocked(now)
 	w.evictIdle(w.daemons, now, w.refillEvery, w.burst)
 	w.evictIdle(w.devices, now, pushWakeDeviceRefillEvery, pushWakeDeviceBurst)
@@ -203,6 +211,7 @@ func (w *PushWaker) sweepLocked(now time.Time) {
 func (w *PushWaker) expireJobsLocked(now time.Time) {
 	for key, job := range w.jobs {
 		if !job.active && !now.Before(job.until) {
+			close(job.evicted)
 			delete(w.jobs, key)
 		}
 	}
@@ -266,6 +275,10 @@ func NewPushWakerFromEnv(lookup func(string) (string, bool), logger *slog.Logger
 // for the caller to log. A duplicate of an active or unexpired device job
 // returns nil without charging or extending that job. No error carries the token.
 func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
+	return w.request(serverID, raw, nil)
+}
+
+func (w *PushWaker) request(serverID string, raw json.RawMessage, origin *pushWakeOrigin) error {
 	if w == nil {
 		return ErrPushOff
 	}
@@ -285,6 +298,7 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 	}
 	now := w.now()
 	if job := w.jobs[deviceKey]; job != nil && (job.active || now.Before(job.until)) {
+		w.bindFeedbackLocked(job, origin, wake.RequestID)
 		return nil
 	}
 	w.expireJobsLocked(now)
@@ -296,7 +310,10 @@ func (w *PushWaker) Request(serverID string, raw json.RawMessage) error {
 		return err
 	}
 	deadline := w.jobNow().Add(pushWakeJobTimeout)
-	w.jobs[deviceKey] = &pushWakeJob{until: now.Add(pushWakeCoalesceWindow), active: true}
+	job := &pushWakeJob{until: now.Add(pushWakeCoalesceWindow), active: true,
+		done: make(chan struct{}), evicted: make(chan struct{}), feedback: make(map[pushWakeFeedbackKey]*pushWakeFeedback)}
+	w.jobs[deviceKey] = job
+	w.bindFeedbackLocked(job, origin, wake.RequestID)
 	w.wg.Add(1)
 	go w.send(serverID, wake.Token, deviceKey, deadline)
 	return nil
@@ -349,19 +366,30 @@ func waitPushRetry(ctx context.Context, delay time.Duration) bool {
 // Its reserved slot bounds active work through backoff as well as delivery.
 func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte, deadline time.Time) {
 	defer w.wg.Done()
+	invalid := false
 	defer func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		<-w.slots
 		job := w.jobs[deviceKey]
 		job.active = false
-		if !w.now().Before(job.until) {
-			delete(w.jobs, deviceKey)
+		job.invalid = invalid && !w.closed
+		delivery := w.jobNow().Add(pushFeedbackWriteTimeout)
+		for _, r := range job.feedback {
+			r.delivery = delivery
 		}
+		close(job.done)
+		w.expireJobsLocked(w.now())
 	}()
 	ctx, cancel := context.WithDeadline(w.ctx, deadline)
 	defer cancel()
 	for attempt := 1; attempt <= pushWakeMaxAttempts; attempt++ {
+		w.mu.Lock()
+		stopped := w.closed || ctx.Err() != nil
+		w.mu.Unlock()
+		if stopped {
+			return
+		}
 		start := time.Now()
 		id, err := w.sender.Send(ctx, token)
 		duration := time.Since(start)
@@ -392,6 +420,8 @@ func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte, de
 				"duration", duration)
 		}
 		var failure *fcmRetryError
+		invalid = errors.Is(err, ErrFCMUnregistered) && ctx.Err() == nil &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 		if attempt == pushWakeMaxAttempts || ctx.Err() != nil || errors.Is(err, ErrFCMUnregistered) || !errors.As(err, &failure) || !failure.retry {
 			return
 		}
@@ -424,9 +454,9 @@ func (w *PushWaker) send(serverID, token string, deviceKey [sha256.Size]byte, de
 func (w *PushWaker) Close() {
 	w.mu.Lock()
 	w.closed = true
+	w.cancel()
 	w.mu.Unlock()
 
-	w.cancel()
 	w.wg.Wait()
 	w.sweepWG.Wait()
 	w.mu.Lock()

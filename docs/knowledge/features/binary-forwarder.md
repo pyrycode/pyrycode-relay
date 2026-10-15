@@ -45,12 +45,26 @@ The relay neither parses nor canonicalises the inner bytes; `env.Frame` is forwa
 
 ## `push_wake` handling
 
-A `push_wake` envelope addresses the relay itself, not a phone, so it never reaches the `PhonesFor` lookup. `StartBinaryForwarder` hands `env.PushWake` straight to `reg.pushWaker.Request(serverID, env.PushWake)` (`internal/relay/registry.go`'s `pushWaker` field, set once at boot via `SetPushWaker` — nil means push is off, same "optional collaborator" shape as `SetForwarderHooks`). See [Push wake dispatch](push-wake-dispatch.md) for what `Request` does: structural validation, atomic daemon/device/global attempt allowances and slot reservation, bounded keyed state, and an async send off this loop so a blocking `FCMSender.Send` never stalls frame forwarding.
+A `push_wake` envelope addresses the relay itself, so it bypasses phone lookup.
+`StartBinaryForwarder` calls `reg.pushWaker.request(serverID, env.PushWake, origin)`.
+The registry's `pushWaker` is set once at boot via `SetPushWaker`; nil means
+push is off. See [Push wake dispatch](push-wake-dispatch.md) for structural
+validation, atomic allowances/slot reservation, coalescing and asynchronous sends.
+The public `Request` API remains available without a feedback destination.
+
+When the binary supports the private `pushResultWriter` capability (production
+`*WSConn` does), the forwarder captures its writer and feedback lifetime in one
+origin. Valid optional correlations can receive bounded invalid-token results
+asynchronously while this loop keeps reading. Teardown cancels and joins its
+origin workers; disconnect/replacement discards them without cancelling the
+shared provider job. Results never resolve a destination by current server-id
+holder and never reach phones. See the
+[routing contract](routing-envelope.md#push_wake-shape-relay-addressed).
 
 Every refusal — bad platform, empty token, malformed object, rate/state-capacity/concurrency limit, or push off — comes back from `Request` as an error and is logged as a single line, same as any other per-frame drop:
 
 ```go
-if err := reg.pushWaker.Request(serverID, env.PushWake); err != nil {
+if err := reg.pushWaker.request(serverID, env.PushWake, origin); err != nil {
     logger.Warn("binary_forwarder_push_wake_dropped", "server_id", …, "binary_conn_id", …, "err", err)
 }
 continue

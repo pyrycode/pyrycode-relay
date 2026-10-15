@@ -97,7 +97,7 @@ identities for a fixed ten seconds from first admission, or until the active
 job finishes, including backoff, whichever is later. Accepted duplicates
 start no send, spend no allowance and emit no outcome. They extend neither
 the window nor the 45s job deadline, reset no attempts and schedule no
-follow-on work, regardless of success or failure. At the exact boundary a
+follow-on provider work, regardless of success or failure. At the exact boundary a
 completed job becomes eligible for ordinary admission.
 
 At most 32 device jobs are retained, including completed jobs still inside
@@ -110,11 +110,12 @@ partial charge, refund or refill queue. Local push accounting retains at most
 1,024 daemon and 1,024 device buckets using full
 SHA-256 keys, reclaiming only fully refilled state idle for five minutes.
 
-Jobs use full SHA-256 device keys and store only expiry/active metadata;
-completed jobs retain no raw device token or requester list. Each sender
-invocation records one outcome and log line attributed to its first admitting
+Jobs use full SHA-256 device keys and store expiry/completion state, a
+sanitised outcome and bounded correlation records; completed jobs retain no
+raw device token. Each sender invocation records one outcome and log line
+attributed to its first admitting
 daemon.
-Delivery is payload-free and best-effort, with no daemon reply, durability or
+Wake delivery is payload-free and best-effort, without durability or an
 exactly-once guarantee. Each job permits at most three sender invocations
 within one immutable 45s deadline from first admission, covering authentication,
 sends and waiting. Transient failures use 10s/20s backoff from call completion
@@ -125,6 +126,40 @@ A next attempt at or beyond the deadline is never sent early. See
 for the status/transport allowlists, permanent-stop precedence and sanitisation.
 Outcomes/logs count each invocation once, not each job; ending between calls
 adds no synthetic outcome. Duplicates emit none.
+
+An optional valid `push_wake.request_id` opts into the published
+[correlated result contract](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result).
+Only terminal, uncancelled `ErrFCMUnregistered` permits
+`{"push_wake_result":{"request_id":"wake-A-1","code":"invalid_token"}}`.
+The ID must be 1–64 ASCII bytes from `[A-Za-z0-9_-]`; an invalid or omitted
+ID disables only feedback. Results contain no token, hash, provider text,
+`conn_id`, `frame` or Noise sealing and never reach phones. Each distinct
+accepted `(original connection, request_id)` gets at most one attempt per
+retained job, including after write failure. Equal IDs on separate connections
+are independent. New eligible IDs may use a sanitised cached invalid outcome
+inside the original ten-second window without a provider call; late completion
+opens no new window. Other outcomes/cancellation produce no invalid result.
+
+Pending, queued and seen records share hard caps of 128/original connection,
+64/job and 2048/process, expiring no later than 60s after acceptance without
+renewal. Overflow declines only new feedback. Queued original delivery keeps
+its job/connection charges after cache eviction until completion/cancellation,
+without restoring the cache or accepting subscribers. Delivery runs off the
+read loop and has five seconds total including scheduling/writer wait, limited
+sooner by subscription expiry or cancellation. `StartBinaryForwarder` captures
+the origin writer/lifetime; no current-holder lookup routes results. Disconnect
+and replacement cancel that origin, including a synchronous registry feedback
+fence before publishing a replacement whose old socket may still be open.
+Reconnect/eviction/restart grants no replay.
+
+Feedback adds no logs or metric labels and discards a static transport-failure
+sentinel; existing sanitised provider-attempt diagnostics remain separate.
+It is advisory relay testimony, with device ownership still unverified. The
+[Core #3423 family](https://github.com/pyrycode/pyrycode/issues/3423) owns
+consumption and atomic removal of only a matching registration snapshot,
+preserving pairings and replacements. Keep coordinated activation off until
+the [operator release check](deploy.md#coordinated-push-result-release-check)
+records compatible revisions and real-daemon evidence.
 
 These single-process in-memory budgets and coalescing apply in off, observe
 and enforce modes and reset on relay restart. Reconnects and new daemon
@@ -140,9 +175,10 @@ authentication and delivery, respecting the earlier job deadline. Concurrent
 token waiters share a refresh's success or sanitised failure. The last
 departing waiter cancels and joins unfinished authentication, so
 `PushWaker.Close` refuses subsequent structurally valid requests, cancels and
-joins sends, retry timers, shared authentication and the existing cleanup
-sweep, then releases retained jobs. Repeated and concurrent closes join the
-same work.
+joins sends, retry timers, shared authentication, feedback workers/writes and
+the existing cleanup sweep, then releases retained jobs and feedback accounting.
+It starts no new provider sends or result writes after shutdown begins.
+Repeated and concurrent closes join the same work.
 Push cleanup runs after `runServers`' separate 10s HTTP/WebSocket drain;
 see [push concurrency](knowledge/features/push-wake-dispatch.md#concurrency-model).
 
