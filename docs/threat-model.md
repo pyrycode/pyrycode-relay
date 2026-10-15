@@ -129,10 +129,10 @@ suppresses duplicates through sending/backoff even beyond expiry. At the
 exact boundary a completed job is eligible for ordinary admission. After structural validation and the
 closed check, duplicates return `nil` before capacity or allowance checks,
 extend neither window nor the immutable 45s job deadline, reset no attempts,
-schedule no follow-on work, spend nothing, create no daemon bucket
+schedule no follow-on provider work, spend nothing, create no daemon bucket
 and emit no outcome. Distinct complete tokens remain independent. Full
-SHA-256 job keys retain only fixed expiry and active metadata, no requester
-list; completed jobs retain no raw token. Expired completed jobs are reclaimed
+SHA-256 job keys retain expiry/completion state, a sanitised outcome and bounded
+correlation records; completed jobs retain no raw token. Expired completed jobs are reclaimed
 before capacity checks without erasing accounting debt. A new distinct device
 at retained capacity is refused without charge or queue; an existing
 coalesced device still succeeds.
@@ -159,8 +159,8 @@ deletes debt. If a new
 key still cannot fit, it is refused, while existing keys remain usable within
 budget. All modes receive these single-process in-memory budgets and
 coalescing; restart resets both. Multiple replicas would need shared accounting
-and coalescing. Delivery remains payload-free and best-effort, without a
-daemon reply, durable or exactly-once guarantee. Each job is limited to three
+and coalescing. Wake delivery remains payload-free and best-effort, without a
+durable or exactly-once guarantee. Each job is limited to three
 sender invocations within one immutable 45s deadline from admission,
 covering authentication, delivery and waiting. Each call retains the earlier
 of its own ten-second deadline and the job deadline. Transient failures wait
@@ -179,8 +179,46 @@ own timeout may retry if the job remains live. Receipt time and sanitised
 classification survive shared OAuth publication; a trailing read failure
 cannot erase status/guidance or turn a permanent rejection into a retry.
 `Close` refuses subsequent structurally valid requests, cancels and joins
-sends, retry timers, shared authentication and the cleanup sweep, then
-releases retained jobs. Repeated and concurrent closes join the same work.
+sends, retry timers, shared authentication, feedback delivery and the cleanup
+sweep, then releases retained jobs and feedback records. Repeated and concurrent
+closes join the same work; no new provider send or result write starts after
+shutdown begins.
+
+Optional correlation follows the pinned
+[protocol contract](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result).
+Only terminal, uncancelled `ErrFCMUnregistered` can yield
+`{"push_wake_result":{"request_id":"wake-A-1","code":"invalid_token"}}`.
+The ID is 1–64 ASCII bytes from `[A-Za-z0-9_-]`, generated independently of
+tokens/content by the daemon. Invalid/omitted IDs disable only feedback;
+ordinary validation, admission and coalescing remain. Results contain no
+`conn_id`, `frame`, token, hash, provider text or Noise sealing and never reach
+phones. Success, other failures, exhaustion, cancellation and admission rejection
+yield no invalid result. A trailing-read cancellation/deadline sentinel suppresses
+feedback even alongside UNREGISTERED, without changing provider diagnostics.
+
+Same-token coalescing attaches eligible IDs to captured original connections,
+not server-id lookups. Each accepted connection/ID gets at most one attempt in
+the retained job, including failed writes; equal IDs on different connections
+are independent. Repeats extend nothing. New IDs may receive cached invalid
+feedback during the original ten-second window without another provider call;
+late completion serves only existing subscribers and starts no new window.
+Cache metadata is sanitised and holds no raw token. No replay survives eviction,
+disconnect or restart; already-queued original delivery may finish within budget.
+
+Pending, queued and seen records share hard caps of 128/original connection,
+64/job and 2048/relay, with no accounting gap between states. Overflow refuses
+only the new binding and preserves ordinary wakes and existing bindings.
+Subscriptions expire within 60s of acceptance without renewal, independently
+of the five-minute sweep. Queued writes stay charged to their original job and
+connection after cache eviction until completion/cancellation; they neither
+restore the cache nor accept new subscribers. Each bounded worker delivers
+asynchronously from reads, with five seconds total including scheduling and
+writer wait, or earlier expiry/disconnect/replacement/shutdown. The WS writer
+uses a cancellable gate; ordinary active writes keep their independent ten-second
+deadline. Registry replacement cancels the old feedback lifetime before exposing
+the new holder, without waiting for asynchronous socket close. Origin teardown
+and waker close cancel/join workers and release records. A same-server-id
+reconnect receives no stale feedback.
 
 A refused fresh wake's log line carries only `server_id` / `binary_conn_id` / `err`, and every sender invocation logs exactly one outcome line attributed to its first admitting daemon — `push_wake_sent` or `push_wake_send_failed`, including a call cancelled by relay shutdown — carrying `server_id`, a one-way `token_fp` fingerprint of the device token, and the call's `duration`; a successful call additionally carries FCM's message id (`fcm_message_id`) when the reply carried a valid one, and a failed call carries `err` (#160). Raw device/admission tokens and service-account credentials remain absent from logs and errors; accounting digests are not logged. `FCMSender`'s errors carry at most an HTTP status, FCM's validated enum reasons and safe phase/context identities, never raw transport causes, endpoint bodies, credential-bearing URLs or Retry-After text (see [FCM push sender](knowledge/features/fcm-push-sender.md#error-handling--nothing-leaks)). The high-priority wake itself carries no payload, so even a successful send tells the phone only to reconnect.
 
@@ -201,10 +239,20 @@ sender invocation is attributed only to its first admitting daemon and
 records its phase outcome once. Attempt/deadline/backoff exhaustion and
 cancellation between calls add no synthetic job outcome or log line.
 
-**Future hardening:** Telling the daemon a token is dead remains out of scope
-(no dead-token callback, despite `ErrFCMUnregistered` distinguishing it — see
-[FCM push sender](knowledge/features/fcm-push-sender.md)). Bounded coalescing
-is implemented by #211 and bounded transient retries by #212, split from #173.
+Feedback remains advisory relay testimony, not an authenticated device report;
+a compromised relay can falsely report invalidity. Device ownership is still
+unverified and silence cannot classify a registration. The
+[Core #3423 family](https://github.com/pyrycode/pyrycode/issues/3423) owns generation-scoped
+correlations and atomic clearing of only a matching device/registration snapshot,
+preserving pairing and replacement registrations. This does not make relay
+testimony trustworthy or guarantee delivery.
+
+**Activation:** Bounded coalescing (#211), transient retries (#212) and sanitised
+invalid-token feedback (#213) are implemented, split from #173. Coordinated
+push-result activation stays off until the
+[release check](deploy.md#coordinated-push-result-release-check) records the
+protocol/relay/daemon revisions, completed companion and real-daemon compatibility,
+registration and connection/correlation evidence.
 Manual deployment and production admission activation remain
 [operator follow-ups](deploy.md#daemon-admission-activation); repository checks
 establish neither deployment nor live enforcement.
@@ -354,6 +402,16 @@ logs. Each sender invocation logs once using the existing allowlisted keys;
 duplicates and between-call job termination add no log line. The push metric
 retains exactly five fixed labels without identity or token values; see
 [push outcomes](knowledge/features/push-wake-dispatch.md#metrics).
+
+Push-result feedback has a stricter boundary than those provider-attempt logs:
+only the allowlisted correlation and fixed `invalid_token` enter the result.
+Feedback adds no logs, metric labels, token fingerprints or provider text; the
+WS adapter converts any write error to static `ErrPushResultFailed`, discarded
+by the worker. Raw device/admission/access tokens, token hashes, OAuth
+credentials, FCM reply text, raw transport causes and opaque inner content
+must stay out of feedback results/errors/logs/labels. Existing provider-attempt
+`token_fp`/validated message-ID fields and the five fixed outcome labels retain
+their current semantics; a provider outcome is not evidence of feedback delivery.
 
 **Enforcement:** The canonical set of permitted keys lives in `internal/relay/log_allowlist.go`. `TestLogKeysAreAllowlisted` in `internal/relay/log_keys_test.go` AST-walks every non-test `.go` file in the package on each `make test` run and fails if any `logger.{Info,Warn,Error,Debug}` call carries a key absent from that set or uses a dynamic (non-string-literal) key. Adding a logged key requires editing the allowlist file in the same commit.
 

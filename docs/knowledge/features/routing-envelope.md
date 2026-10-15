@@ -43,19 +43,78 @@ Sentinel errors (branch with `errors.Is`):
 | `ErrMalformedEnvelope` | `Unmarshal` | outer JSON parse fails or payload isn't a JSON object (wraps the decoder error) |
 | `ErrMissingConnID` | `Unmarshal` | `conn_id` absent, empty string, or null, and no valid `push_wake` present |
 | `ErrMissingFrame` | `Unmarshal` | `frame` absent or JSON null, `close_code` is zero, and `conn_id` is present |
-| `ErrMalformedPushWake` | `parsePushWake` | `push_wake` isn't a JSON object or has wrong field types (decoder error not wrapped — no input fragment reaches error text) |
+| `ErrMalformedPushWake` | `parsePushWake` | malformed JSON, non-object wake or wrong platform/token types (decoder error not wrapped — no input fragment reaches error text); invalid `request_id` only disables feedback |
 | `ErrUnsupportedPushPlatform` | `parsePushWake` | `push_wake.platform` isn't exactly `"fcm"` (includes `apns`, empty, missing) |
 | `ErrEmptyPushToken` | `parsePushWake` | `push_wake.token` is empty |
 
 ## `push_wake` shape (relay-addressed)
 
 ```json
-{ "push_wake": { "platform": "fcm", "token": "<fcm-device-token>" } }
+{"push_wake":{"platform":"fcm","token":"<fcm-device-token>","request_id":"wake-A-1"}}
 ```
 
 No `conn_id`, no `frame`. `Unmarshal` treats an envelope as a wake request when `conn_id` is absent/empty/null **and** `push_wake` is present and non-null — the same absent-vs-null presence rule `hasFrame` already applied to `frame`. A wake envelope is returned with a nil error, `ConnID == ""`, and the raw `PushWake` bytes; callers branch on `env.ConnID == ""` to route conn_id envelopes and wake envelopes down different paths (see [`StartBinaryForwarder`](binary-forwarder.md#push_wake-handling)).
 
-`PushWake` stays a raw `json.RawMessage` at this layer — only `parsePushWake` (called from `PushWaker.Request`, never from `Unmarshal` itself) decodes it into the unexported `pushWake{Platform, Token string}` struct and applies the platform/token checks above. Keeping the validation off `Unmarshal` means a `conn_id` envelope that happens to carry a malformed `push_wake` still decodes normally — the wake path and the phone-routing path can't interfere with each other.
+`PushWake` stays a raw `json.RawMessage` at this layer — only `parsePushWake`
+(called by the waker, never by `Unmarshal`) decodes platform/token and the
+optional correlation into `pushWake{Platform, Token, RequestID string}`.
+Keeping validation off `Unmarshal` means a `conn_id` envelope carrying a
+malformed `push_wake` still decodes and routes normally. Unknown fields remain
+tolerated.
+
+The optional `request_id` follows the published
+[correlated wake opt-in](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#correlated-wake-opt-in):
+1–64 ASCII bytes from `[A-Za-z0-9_-]`, generated independently of tokens,
+hashes, credentials and content, fresh for each request on a connection.
+Omitted, empty, overlong, non-ASCII, disallowed-character, null or wrong-typed
+IDs disable only feedback, preserving ordinary admission/coalescing and the
+connection. Malformed JSON is still rejected. Old wake-capable relays ignore
+the optional field; pre-wake relays may drop the request. Neither returns
+feedback, and no capability handshake is required.
+
+Only terminal, uncancelled `ErrFCMUnregistered` permits the canonical
+[result](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result):
+
+```json
+{"push_wake_result":{"request_id":"wake-A-1","code":"invalid_token"}}
+```
+
+This separate relay→daemon shape contains only the accepted ID and fixed
+13-byte `invalid_token` code: no `conn_id`, `frame`, token or Noise sealing,
+and never delivery to a phone. Success, other 4xx, authentication failure,
+transient failure/exhaustion, cancellation and admission rejection produce
+no invalid result; silence does not classify a token. The writer exposes
+only a static failure sentinel, with no new feedback logs or metric labels.
+
+Same-complete-token wakes coalesce across daemons. At most one result attempt
+is made per accepted `(original connection, request_id)` in a retained job,
+including after failed writes. Repeated IDs allocate nothing and renew no deadline;
+equal IDs on different connections are independent. New eligible IDs can use
+a cached invalid outcome before the original ten-second window ends; seen IDs
+receive none. The cache retains only sanitised outcome/deduplication metadata,
+never raw tokens. Eviction requires provider completion and elapsed original
+window; late completion can serve existing subscribers but opens no new window.
+
+Pending, queued and seen records share **128/connection, 64/job and 2048/global**
+hard caps, with continuous accounting through transitions. Overflow declines
+only the new feedback binding. Subscriptions expire at most **60s after
+acceptance**, without renewal. Delivery has **5s total**, including scheduling
+and writer wait, starting at provider completion or cached-binding acceptance;
+expiry, connection cancellation or shutdown can end it sooner. Queued original
+deliveries stay charged to their original job/connection after cache eviction
+until completion/cancellation; they cannot subscribe more callers or restore
+the cache. Existing **32 retained jobs, 45s immutable job deadline, three
+attempts, retry charges/backoff and original 10s window** remain unchanged.
+
+Results use the captured originating `/v1/server` socket, never a current-holder
+lookup. Disconnect/replacement cancels pending/queued feedback; reconnecting
+under the same server-id receives none of it. Reads continue independently of
+writes. Origin teardown and waker close cancel/join bounded workers and release
+state; repeated/concurrent closes join the same work and start no new result
+writes. No cache replay survives eviction, disconnect or restart, and there
+is no durable or exactly-once delivery guarantee. See
+[Push wake dispatch](push-wake-dispatch.md#request-validate-admit-dispatch)
+for lifecycle details and the companion daemon's snapshot-safety boundary.
 
 ## Close notice (relay-to-binary, #152)
 

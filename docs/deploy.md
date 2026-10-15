@@ -392,6 +392,57 @@ that daemon relay leg while preserving local daemon service. Correct private
 provisioning/mode as needed, then have the operator restart the daemon to retry.
 Changing Relay provisioning alone does not restart that terminal daemon leg.
 
+### Coordinated push-result release check
+
+**Pending operator work:** manual deployment and real-daemon verification.
+Keep correlated wake emission/registration-removal activation off until the
+evidence below is recorded. Merge and hermetic relay tests establish neither
+deployment nor production activation. There is no separate relay feedback
+activation flag: a valid `push_wake.request_id` opts in when push is configured.
+The [Core #3423 family](https://github.com/pyrycode/pyrycode/issues/3423) owns
+daemon emission and consumption; coordinate its release before enabling opted-in
+wakes. The parent was closed as a split, not as delivered implementation:
+[Core #3435](https://github.com/pyrycode/pyrycode/issues/3435) owns the
+generation-scoped API and [Core #3436](https://github.com/pyrycode/pyrycode/issues/3436)
+owns daemon adoption and persisted conditional removal. Both are pending at this
+handoff; require completed implementation/review/tests for both.
+
+In the operator release record, capture:
+
+1. The published protocol revision
+   [`d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002`](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result),
+   exact compatible relay and daemon revisions/builds, and completion evidence
+   for the Core #3423 family above. Relay implementation reference:
+   [`9361f176d6f76cb9feee745f52a934e3f4f3ec83`](https://github.com/pyrycode/pyrycode-relay/commit/9361f176d6f76cb9feee745f52a934e3f4f3ec83)
+   (#213). The compatible daemon revision and deployed relay revision remain
+   operator-recorded prerequisites, not established by this reference. The
+   companion owns pending bindings, consumption and conditional removal.
+2. Real-daemon compatibility evidence for **new daemon/new relay**, **old
+   daemon/new relay**, and **new daemon/old wake-capable or pre-wake relay**.
+   Legacy wakes must retain their admission/coalescing behavior; an old
+   wake-capable relay ignores correlation, a pre-wake relay may drop the wake,
+   and neither returns feedback or breaks the relay leg. Record actual versions
+   and observed outcomes for each case.
+3. A terminal invalid result for a live correlation clears only the still-matching
+   paired-device registration, in memory and persisted storage, preserving the
+   pairing and unrelated fields. A stale result after registration replacement
+   preserves the replacement; the consumer's snapshot check/mutation/save must
+   be atomic against updates.
+4. Disconnect, replacement and reconnect under the same server-id discard old
+   pending/queued feedback and cannot clear a registration through a new
+   connection generation. Verify expired, unknown, duplicate and malformed
+   correlations/results are inert, including unknown codes. Silence or local
+   expiry must never remove a registration.
+
+Attach non-secret evidence and completion status to the release record; include
+the tested correlation lifetimes and connection generations without device or
+credential values. Only then activate the compatible daemon/relay combination.
+Deploy Relay manually from clean `main` using the release flow above; nothing
+deploys on merge. A relay rollback can remove feedback support, so repeat the
+compatibility check for the selected pair of revisions. See
+[Push wake dispatch](knowledge/features/push-wake-dispatch.md#api) for the
+implemented bounds and the protocol's conformance scenarios for the joint proof.
+
 ## Restart incident monitoring
 
 [`operations/relay_health.py`](../operations/relay_health.py) is a standalone

@@ -2,7 +2,10 @@
 
 `WSConn` is the single adapter that wraps `github.com/coder/websocket.Conn` so it satisfies the registry's `Conn` interface ([connection-registry.md](connection-registry.md)). The relay's WS upgrade handlers (`/v1/server` in #4/#16, `/v1/client` in #5) hand the registry a `*WSConn` rather than each inventing its own wrapper. Frame forwarding, broadcasts, and the future heartbeat ticket all reach the wire through this type.
 
-The adapter is small on purpose: one file, one mutex, one one-shot guard, no goroutines, no queues. Everything else (handshake, header validation, close-code semantics, ping/pong, read-side frame loop) lives in adjacent tickets.
+The adapter owns a context-aware writer gate and one-shot close guard, with no
+goroutines or send queue. Handshake, header validation, heartbeat policy and
+read-side loops live outside it. The [push waker](push-wake-dispatch.md#concurrency-model)
+owns bounded feedback workers and lifetime accounting.
 
 ## API
 
@@ -28,7 +31,9 @@ const writeTimeout = 10 * time.Second
 const readMessageTimeout = 30 * time.Second
 ```
 
-`writeTimeout` bounds a single `Send`. A slow peer cannot stall a caller past this deadline.
+`writeTimeout` bounds the active write in `Send`, starting after writer-gate
+acquisition. Its gate wait is separate. Push feedback uses the private bounded
+write path below so its five-second total budget also includes contention.
 
 `readMessageTimeout` bounds receipt of one complete inbound message, counted from the arrival of its first data-frame header, not from when `Read` is called (#111). It never bounds the idle gap before a message starts — the heartbeat covers idle liveness — so a peer may sit silent between messages for as long as it likes, but once a message begins arriving (including a fragmented message's continuation frames) it must complete within 30s or the connection is closed. 30s over the 256 KiB `maxFrameBytes` read cap is a floor of ~8.7 KB/s for a max-size message; real frames are far smaller, so a slow mobile link is not at risk. Stored per-connection as the unexported `readTimeout` field (set to `readMessageTimeout` in `NewWSConn`) rather than read directly from the constant, so same-package tests can shorten the deadline on one connection without mutating package state that would race across parallel tests; production never writes the field after construction.
 
@@ -45,7 +50,21 @@ const readMessageTimeout = 30 * time.Second
 | `Read` | none | `context.WithCancel(caller ctx)` (NOT joined with `closeCtx`); a `time.AfterFunc(readTimeout, cancel)` is armed once the library's `Reader` returns (first data-frame header received) and stopped when `Read` returns (#111) | `Send`, `Close` (underlying `Close` aborts in-flight `Read`), `ConnID`. **NOT** safe with another `Read` — single-caller only. |
 | `Close` / `CloseWithCode` | `closeOnce` (one shot); never `writeMu` | cancels `closeCtx` to mark close-start | `Send` (active write retains its deadline; subsequent writes rejected), `Read` (underlying close unblocks it), other close-family calls (first code wins), `ConnID` |
 
-One mutex, one one-shot. The lock graph is a single node. There are no callbacks, no channels, no goroutines spawned by the adapter.
+`writeMu` is a `contextWriteMutex`, a lazily initialised capacity-one channel
+gate supporting ordinary `Lock`/`Unlock` and cancellable `LockContext`. The
+adapter spawns no goroutines. The private `sendPushResult` uses the supplied
+remaining deadline for both acquisition and a text-frame write, checks
+cancellation before/after acquisition and converts every failure to static
+`ErrPushResultFailed`. No raw transport error reaches feedback diagnostics.
+Ordinary `Send` keeps the independent active-write deadline described above.
+
+A separate `resultCtx` descends from `closeCtx`; it supplies the captured
+feedback lifetime to the binary forwarder. Registry takeover/grace reclaim
+cancel it under the identity lock before publishing a replacement, even if
+the old socket remains open. This nonblocking cancellation performs no I/O
+and does not alter ordinary `Send`/close behavior. Closing the socket cancels
+both lifetimes. The waker and origin teardown own cancelling/joining result
+workers, including any writer wait.
 
 `Close` deliberately does **not** take `writeMu`. Waiting for a slow peer's `Send` to release that mutex would delay the start of the library's bounded handshake. `github.com/coder/websocket.Conn.Close` is safe with an in-flight `Write` and serialises its control frame against active data frames. The active write retains its own deadline; the handshake can terminate the socket earlier if the peer stalls.
 

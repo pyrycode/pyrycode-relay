@@ -113,6 +113,20 @@ The sender holds no logger, so it logs nothing;
 logging happens in the caller (below, and [Push wake dispatch](push-wake-dispatch.md)
 § Error handling).
 
+The waker can turn terminal, uncancelled `ErrFCMUnregistered` into the
+published [sanitised result](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result)
+for an opted-in originating daemon. A trailing-read cancellation/deadline
+sentinel suppresses feedback even when the error also matches UNREGISTERED;
+provider-attempt classification remains unchanged. Results contain only the
+accepted allowlisted `request_id` and fixed `invalid_token`, never token hashes,
+provider text, credentials or inner frames. Feedback transport errors become a
+static sentinel and are discarded; no feedback logs or metric labels are added.
+Existing provider-attempt fingerprint/message-ID logs and five outcome labels
+retain their semantics. The sender itself has no subscribers or delivery policy;
+the [waker](push-wake-dispatch.md#concurrency-model) bounds origin delivery to
+five seconds including writer wait, cancels it on disconnect/replacement and
+joins it on shutdown.
+
 ### Retry classification and guidance
 
 Retryable HTTP statuses are FCM 429/500/503 and OAuth
@@ -186,8 +200,8 @@ caller distinguishes a dead token from any other send failure by
 `errors.Is(err, ErrFCMUnregistered)`, never by matching text; see
 [Push wake dispatch § Metrics](push-wake-dispatch.md#metrics) for the
 counter this drives. `UNREGISTERED` means the device token is permanently
-invalid on Google's side — telling the daemon so (and letting it stop
-retrying that token) is still out of scope; see below.
+invalid on Google's side. The waker uses it for bounded correlated feedback;
+the daemon owns conditional removal of a still-matching registration.
 
 ### Returning FCM's message id (#160)
 
@@ -279,12 +293,19 @@ residual-risk accounting.
 ## Out of scope
 
 - APNs (iOS push).
-- Telling the daemon that a device token is dead (no dead-token callback).
+- Device-token ownership verification and durable/guaranteed feedback delivery.
+- Consuming feedback and atomically clearing only a matching registration while
+  preserving pairings and replacements: the
+  [Core #3423 family](https://github.com/pyrycode/pyrycode/issues/3423).
 
 Shared global/device attempt budgets are implemented by
 [`PushWaker`](push-wake-dispatch.md#allowances-and-concurrency-cap), alongside
 the daemon allowance and concurrency cap (#172). Bounded transient retries
-(#212) consume those same budgets; dead-token notification remains separate.
+(#212) consume those same budgets. Correlated invalid-token feedback (#213)
+belongs to the waker and is advisory relay testimony, not an authenticated
+device report or permission to clear a newer registration. Coordinated
+[manual activation](../../deploy.md#coordinated-push-result-release-check)
+requires operator evidence; hermetic checks do not establish deployment.
 
 ## Cross-links
 

@@ -7,7 +7,8 @@ caller) and [`FCMSender`](fcm-push-sender.md) (the thing that actually talks
 to Google), and owns daemon, device and global attempt allowances plus a
 retained-device-job cap. Introduced by #133; shared allowances added by
 [#172](https://github.com/pyrycode/pyrycode-relay/issues/172), bounded
-coalescing by #211, bounded transient retries by #212 and joined cancellation
+coalescing by #211, bounded transient retries by #212, correlated invalid-token
+feedback by #213 and joined cancellation
 by [#169](https://github.com/pyrycode/pyrycode-relay/issues/169).
 
 ## Why a waker, not a direct call
@@ -19,7 +20,8 @@ binary sends, including ordinary phone traffic. `PushWaker.Request` never
 blocks on `Send`: it either starts one asynchronous job, accepts a duplicate
 without another send, or refuses new work immediately. Delivery is
 payload-free and best-effort, with bounded transient retries inside the job;
-there is no daemon reply or durable delivery guarantee.
+valid opted-in requests may receive sanitised invalid-token feedback. Neither
+wakes nor feedback have a durable delivery guarantee.
 
 The relay also cannot verify that a binary's claimed device token belongs to
 one of its own phones. In [daemon admission enforce](server-endpoint.md#daemon-admission-before-upgrade),
@@ -57,6 +59,42 @@ func (w *PushWaker) Close()
 tests can assert the binary read loop keeps forwarding while a send is still
 in flight.
 
+The public `Request(serverID, raw)` remains source-compatible and supplies no
+feedback destination. Production `StartBinaryForwarder` calls the private
+origin-aware `request` method with a captured `pushWakeOrigin`: the original
+writer and its connection lifetime, independent of registry lookups.
+
+The canonical outer request and result follow the published
+[correlated wake opt-in](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#correlated-wake-opt-in)
+and [result contract](https://github.com/pyrycode/pyrycode/blob/d400bc3a4ad7e8bba3fffd6be53fc025e7c1f002/docs/protocol-mobile.md#push_wake_result):
+
+```json
+{"push_wake":{"platform":"fcm","token":"<fcm-device-token>","request_id":"wake-A-1"}}
+```
+
+```json
+{"push_wake_result":{"request_id":"wake-A-1","code":"invalid_token"}}
+```
+
+`request_id` opts in only when it is 1–64 ASCII bytes from `[A-Za-z0-9_-]`.
+The daemon must generate token-independent IDs, fresh for each request on a
+connection; they must encode no token, hash, credential or application content.
+Omitted, empty, overlong, non-ASCII, disallowed-character, null or wrong-typed
+IDs disable feedback without changing ordinary wake admission/coalescing or
+closing the connection. Malformed JSON retains ordinary rejection. Unknown
+fields remain tolerated; a phone-addressed envelope retains its ordinary routing
+even if it also carries `push_wake`.
+
+Only terminal, uncancelled `ErrFCMUnregistered` permits the result above.
+It contains only the accepted ID and fixed `invalid_token` code (13 ASCII
+bytes), with no `conn_id`, `frame`, token or Noise sealing. It travels only
+to the captured daemon `/v1/server` connection, never to phones. Success,
+other 4xx, authentication failure, transient failure/exhaustion, cancellation
+and admission rejection produce no invalid result. Silence says nothing
+about a registration. Old wake-capable relays ignore the new field; pre-wake
+relays may drop the request. Neither supplies feedback; no capability
+handshake is added.
+
 `NewPushWakerFromEnv` is the boot-time constructor: unset
 `PYRYCODE_RELAY_FCM_CREDENTIALS` returns `(nil, nil)` — push is off, not an
 error. A set value builds an `FCMSender` and wraps it; a build failure
@@ -66,7 +104,7 @@ wrapped `ErrFCMCredentials` that carries none of the credential.
 
 ## `Request`: validate, admit, dispatch
 
-`StartBinaryForwarder` calls `Request(serverID, env.PushWake)` once per
+`StartBinaryForwarder` calls `request(serverID, env.PushWake, origin)` once per
 `push_wake` envelope. Three things happen in order, any of which can end the
 call with an error and no send:
 
@@ -80,7 +118,8 @@ call with an error and no send:
 3. **Admission, under `w.mu`:**
    - closed (`Close` already called) → `ErrPushOff`
    - an active job for the complete device token, or one less than ten
-     seconds after its first admission → return `nil` without another send
+     seconds after its first admission → try to bind eligible feedback,
+     return `nil` without another send
    - reclaim expired completed jobs; retained jobs at capacity →
      `ErrPushWakeInFlightCap`
    - refill existing daemon/device buckets and the global bucket; touch each
@@ -95,13 +134,18 @@ call with an error and no send:
      coalescing expiry, capture an immutable 45-second deadline from admission,
      `wg.Add(1)`, spawn the job goroutine, return `nil`
 
+The fresh-job admission also tries to bind eligible feedback under the same
+mutex. Feedback refusal never reverses ordinary admission or coalescing.
+
 Coalescing crosses daemon identities and applies regardless of the send's
 success or failure. Duplicates never extend the admission window or job
 deadline, touch accounting timestamps, charge allowances, create daemon
 buckets or emit outcomes. They neither reset attempts nor schedule follow-on
-work, including during retry backoff. They succeed even when allowances,
-accounting maps or retained-job capacity would refuse new work. No requester
-list is kept.
+provider work, including during retry backoff. They succeed even when allowances,
+accounting maps or retained-job capacity would refuse new work. Each distinct
+eligible `(original connection, request_id)` may attach one bounded record,
+including across daemon identities. Active repeats allocate nothing and renew
+no deadline; equal IDs on different connections are independent.
 At the exact ten-second boundary a completed job becomes eligible for
 ordinary admission; an active job still suppresses duplicates beyond it.
 Different complete device tokens remain independent.
@@ -116,7 +160,33 @@ permits ordinary fresh admission, without refunding allowance debt.
 A refused fresh wake is never queued — the caller logs it and moves on.
 An admitted job runs on its own goroutine with a deadline context descending
 from `w.ctx` (cancelled by `Close`, not the binary connection's context), so
-disconnecting the requesting binary does not cancel delivery.
+disconnecting the requesting binary does not cancel provider delivery.
+
+Feedback has separate, shared record caps: **128 per original connection,
+64 per retained job and 2048 relay-wide**. Pending subscriptions, queued writes
+and seen/deduplication metadata all consume the same allowances continuously.
+Overflow silently declines only the new binding, preserving accepted records
+and ordinary wakes. Every binding expires no later than **60 seconds after
+acceptance**, independently of the accounting sweep; repeats/coalescing renew
+neither lifetime nor job window.
+
+Each accepted binding gets at most one result attempt in its retained job,
+including after a failed write. Before the original ten-second window ends,
+a new eligible ID may receive cached invalid feedback without another provider
+call; a repeated ID receives none. Completed cache state contains only the
+sanitised outcome and bounded correlation/deduplication metadata, never a raw
+token. Evict once both provider completion and the original window have occurred.
+Late completion may deliver to existing eligible subscribers but opens no new
+window. Already-queued original deliveries stay charged to their original job
+and connection after cache eviction until delivery completes or is cancelled;
+they accept no new subscribers and cannot restore the cache. Eviction,
+disconnect and restart grant no replay; a fresh job is a separate ordinary wake.
+
+Delivery runs off the binary read loop and has **five seconds total**, including
+queue scheduling and writer wait, starting at job completion for pending
+bindings or acceptance for cached results. Subscription expiry, connection
+cancellation or shutdown can end it sooner. Disconnect/replacement drops the
+original bindings; a reconnect with the same server-id receives no stale result.
 
 Each job invokes `Send` at most three times within its immutable 45-second
 budget, covering token waiting, authentication, delivery and retry waits.
@@ -185,9 +255,10 @@ digests of the complete inputs. Accounting-key size is independent of input
 length. The truncated `tokenFingerprint` used in logs is unsuitable for
 accounting because distinct tokens can share it. Raw tokens do not enter
 accounting state; active job goroutines retain them through delivery/backoff.
-Device jobs use the same full digest and contain only a fixed expiry and
-active flag; completed jobs retain no raw token or daemon identity. Accounting and job digests are
-never logged.
+Device jobs use the same full digest and retain expiry/completion signals,
+the sanitised outcome and bounded origin/ID records. Completed jobs retain no
+raw token; feedback records reference their original connection, not a daemon
+identity lookup. Accounting and job digests are never logged.
 
 Accounting state becomes eligible for expiry after five minutes without a
 request reaching allowance checks; refusals at that stage touch existing
@@ -216,11 +287,30 @@ and wakes remain payload-free under the
 | `ErrPushWakeRateLimited` | daemon, device or global allowance exhausted | nothing — not even which allowance |
 | `ErrPushWakeStateCap` | a new daemon/device key cannot fit after safe reclamation | nothing |
 | `ErrPushWakeInFlightCap` | retained-device-job capacity reached (32 in production), or no send slot available | nothing |
+| `ErrPushResultFailed` | private WS feedback write failed, expired or was cancelled; discarded by the worker | static text only, no transport cause |
 
 No sentinel here, and no `FCMSender` error surfaced by the send goroutine,
 ever carries the device token or the service-account credential. The
 forwarder logs a refusal as `binary_forwarder_push_wake_dropped`, using only
 `server_id` (or `binary_conn_id`) and `err`.
+
+Invalid correlations, repeats and feedback-cap overflow add no error, log or
+metric. Feedback writes discard the static adapter sentinel; results and
+feedback diagnostics expose no raw device/admission/access tokens, token hashes,
+OAuth credentials, provider reply text or opaque inner frames. No feedback
+labels or logs are added. Existing provider-attempt diagnostics below retain
+their sanitised fingerprint/message-ID fields and five outcome labels.
+
+A provider error can match `ErrFCMUnregistered` alongside a trailing-read
+`context.Canceled` or `context.DeadlineExceeded`. Either context sentinel
+suppresses feedback even if the parent job remains live; the existing provider
+outcome/log classification is preserved. Feedback is advisory relay testimony,
+not proof of device ownership or a generic delivery receipt. The
+[Core #3423 family](https://github.com/pyrycode/pyrycode/issues/3423) owns consuming it
+and atomically clearing only a still-matching registration snapshot, preserving
+pairings and replacements. See the
+[coordinated release check](../../deploy.md#coordinated-push-result-release-check)
+before activation.
 
 Every sender invocation logs exactly one outcome line from `send`
 (#160), attributed to its first admitting daemon. Accepted duplicates log
@@ -295,7 +385,8 @@ zero.
 ## Concurrency model
 
 - One goroutine per admitted job, with at most 32 retained jobs and
-  simultaneous sends. Duplicates spawn no goroutine. The job owns its fixed
+  simultaneous sends. Coalescing spawns no additional provider goroutine;
+  each newly accepted feedback binding has a bounded worker. The job owns its fixed
   45s deadline, up to three sender invocations and cancellable retry timers;
   each timer is stopped on return. Its reserved slot remains occupied while
   waiting. Each invocation uses one whole-call `fcmSendTimeout` budget in
@@ -310,23 +401,44 @@ zero.
   removing it immediately if its fixed window has expired, before `wg.Done`.
 - `w.mu` owns all buckets, their refill/idle timestamps, job lookup/expiry,
   sweeping and the admission commit. The closure check, duplicate check,
-  all three charges, job/slot reservation and `wg.Add` are atomic against
-  other requests and `Close`. Retry charging is atomic under the same mutex,
+  all three charges, job/slot reservation, feedback admission/counts and `wg.Add`
+  are atomic against other requests and `Close`. Retry charging is atomic under the same mutex,
   after rechecking closure and the job deadline.
   Concurrent requests cannot overspend, and none is admitted after the closed
-  transition. No mutex is held across blocking `Send` calls or retry waits.
+  transition. No accounting mutex is held across provider or result I/O or waits.
+- `push_feedback.go` gives each accepted record one worker (at most 2048
+  relay-wide), joined by both its origin and the waker. It waits for completion,
+  expiry or cancellation, attempts at most one context-bounded write, then
+  retains seen state until eviction/expiry/cancellation. No worker is created
+  for repeats or refused bindings. One record keeps its charges through every
+  transition, including delivery after cache eviction.
+- `WSConn`'s context-aware writer gate includes contention in the feedback
+  deadline; wrapping ordinary `Send` in a goroutine would not do so. The private
+  result writer checks cancellation before/after gate acquisition and uses the
+  remaining budget directly. Ordinary `Send` keeps its independent ten-second
+  active-write deadline, preserving graceful shutdown behavior from #207.
+- Origin contexts descend from the socket's separate feedback context. Registry
+  takeover and grace reclaim cancel the incumbent's feedback under the identity
+  lock before publishing the replacement. Waiting for socket close is too late:
+  takeover closes it asynchronously and grace reclaim may leave it open.
+  This fence only cancels, with no I/O or accounting-lock acquisition. Forwarder
+  teardown cancels and joins its origin workers, without cancelling provider jobs.
 - One sweep goroutine runs every five minutes, exits on `w.ctx` cancellation
   and has its own `sweepWG`. It also reclaims expired completed jobs; new-job
-  admission reclaims them before capacity checks, so no extra cleanup timer
-  or goroutine is needed. The sweep never removes active jobs; their deadline
-  ends their goroutine instead. Allowance/coalescing time (`now`) and job
+  admission reclaims them before capacity checks. Feedback workers also arm
+  immutable subscription deadlines and a post-completion original-window timer,
+  so feedback cleanup does not wait five minutes. The sweep never removes active
+  jobs; their deadline ends their goroutine instead. Allowance/coalescing time (`now`) and job
   scheduling time (`jobNow`) are read under `w.mu`; both default to real time.
 - `Close` is idempotent: set `closed` under `w.mu`, cancel `w.ctx`,
-  `wg.Wait()` for every admitted job, including sends and retry waits, and
+  `wg.Wait()` for every admitted job and feedback worker, including sends,
+  retry waits and result delivery, and
   `sweepWG.Wait()` for the sweep goroutine, then clear retained jobs under
   `w.mu`, releasing their device identities. Repeated and concurrent callers
   all join admitted work;
   none returns early merely because another caller marked the waker closed.
+  Cancellation gates refuse new provider invocations and result writes after
+  shutdown begins; feedback accounting is released as workers finish.
   With `FCMSender`, the last waiter cancels and joins unfinished token
   refresh work before its send returns, so the wait group joins cancellable
   authentication as well as FCM delivery and stopped retry timers.
@@ -382,6 +494,19 @@ against a nil-op waker. Both wiring points still run before any listener
 serves, so no `Request` can reach the waker before its hook is in place.
 
 ## Testing
+
+`push_feedback_test.go` uses literal envelopes, held provider replies,
+independent origins and controlled clocks/barriers to distinguish provider
+calls, result attempts/deliveries and retained record counts. It covers syntax,
+exact expiry/window boundaries, cross-connection IDs, cached/failed delivery,
+64/128/2048 caps and queued charges after eviction, retry terminal outcomes,
+cancellation, replacement and concurrent close. Real WS writer contention
+checks continued reads and joined bounded delivery. Replacement tests keep the
+incumbent socket open, so socket-close cancellation cannot mask a missing fence.
+Negative-outcome tests join without cancelling the waker: shutdown could hide
+an unwanted result. Synthetic secret markers are checked in results, errors,
+logs and metrics. These hermetic proofs do not establish real-daemon persistence,
+compatibility or production activation.
 
 `push_wake_budget_test.go` uses a controlled clock and fake sender for shared
 allowance exhaustion, exact refill boundaries and capped credit, the
