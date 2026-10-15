@@ -231,6 +231,11 @@ func (r *Registry) TakeoverServer(serverID string, incumbent, conn Conn) error {
 // replaced binary's timer no-op at the pointer-identity guard in
 // handleGraceExpiry.
 func (r *Registry) replaceBinaryLocked(serverID string, conn Conn) []Conn {
+	if old := r.binaries[serverID]; old != nil && old != conn {
+		if feedback, ok := old.(interface{ cancelPushResults() }); ok {
+			feedback.cancelPushResults()
+		}
+	}
 	if entry, ok := r.timers[serverID]; ok {
 		entry.timer.Stop()
 		delete(r.timers, serverID)

@@ -109,7 +109,8 @@ func TestPushMetrics_CancelledByCloseIsSendFailed(t *testing.T) {
 
 func TestPushMetrics_RateLimitIsDropped(t *testing.T) {
 	t.Parallel()
-	w := newPushWaker(newFakePushSender(), time.Hour, 1, 16, discardLogger())
+	sender := newFakePushSender()
+	w := newPushWaker(sender, time.Hour, 1, 16, discardLogger())
 	h := newPushMetricsBundle(w)
 
 	if err := w.Request("push-sid-1", wakeJSON("fcm", testWakeToken)); err != nil {
@@ -118,6 +119,9 @@ func TestPushMetrics_RateLimitIsDropped(t *testing.T) {
 	if err := w.Request("push-sid-1", wakeJSON("fcm", "another-device")); err == nil {
 		t.Fatal("second wake admitted, want rate-limited")
 	}
+	// Assert an actual invocation's outcome, rather than racing Close's
+	// cancellation of an admitted job that has not started yet.
+	sender.waitStarted(t, 1)
 	w.Close()
 	assertPushWakeOutcomes(t, h, map[string]int{"sent": 1, "dropped": 1})
 }

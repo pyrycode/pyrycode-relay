@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -40,11 +41,13 @@ type WSConn struct {
 	// on a single connection; never written after construction otherwise.
 	readTimeout time.Duration
 
-	writeMu sync.Mutex
+	writeMu contextWriteMutex
 
-	closeOnce sync.Once
-	closeCtx  context.Context
-	cancel    context.CancelFunc
+	closeOnce     sync.Once
+	closeCtx      context.Context
+	cancel        context.CancelFunc
+	resultCtx     context.Context
+	cancelResults context.CancelFunc
 }
 
 // NewWSConn wraps c with the relay-assigned connection id and applies a
@@ -67,12 +70,15 @@ type WSConn struct {
 func NewWSConn(c *websocket.Conn, connID string, maxFrameBytes int64) *WSConn {
 	c.SetReadLimit(maxFrameBytes)
 	ctx, cancel := context.WithCancel(context.Background())
+	resultCtx, cancelResults := context.WithCancel(ctx)
 	return &WSConn{
-		conn:        c,
-		connID:      connID,
-		readTimeout: readMessageTimeout,
-		closeCtx:    ctx,
-		cancel:      cancel,
+		conn:          c,
+		connID:        connID,
+		readTimeout:   readMessageTimeout,
+		closeCtx:      ctx,
+		cancel:        cancel,
+		resultCtx:     resultCtx,
+		cancelResults: cancelResults,
 	}
 }
 
@@ -103,6 +109,53 @@ func (w *WSConn) Send(msg []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()
 	return w.conn.Write(ctx, websocket.MessageText, msg)
+}
+
+// contextWriteMutex preserves ordinary Lock/Unlock and also lets feedback's
+// total deadline bound writer contention. Its zero value is ready for use.
+type contextWriteMutex struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (m *contextWriteMutex) LockContext(ctx context.Context) error {
+	m.once.Do(func() { m.gate = make(chan struct{}, 1) })
+	select {
+	case m.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (m *contextWriteMutex) Lock()   { _ = m.LockContext(context.Background()) }
+func (m *contextWriteMutex) Unlock() { <-m.gate }
+
+// ErrPushResultFailed deliberately hides transport details at the feedback boundary.
+var ErrPushResultFailed = errors.New("relay: push result delivery failed")
+
+func (w *WSConn) pushResultContext() context.Context { return w.resultCtx }
+
+// Nonblocking cancellation only: Registry calls this under its identity lock
+// before publishing a replacement, independently of the old socket's close.
+func (w *WSConn) cancelPushResults() { w.cancelResults() }
+
+// Unlike Send, feedback must include writer wait in its caller's budget.
+// No raw WebSocket error escapes this boundary, even to internal diagnostics.
+func (w *WSConn) sendPushResult(ctx context.Context, msg []byte) error {
+	if ctx.Err() != nil || w.resultCtx.Err() != nil {
+		return ErrPushResultFailed
+	}
+	if err := w.writeMu.LockContext(ctx); err != nil {
+		return ErrPushResultFailed
+	}
+	defer w.writeMu.Unlock()
+	if ctx.Err() != nil || w.resultCtx.Err() != nil {
+		return ErrPushResultFailed
+	}
+	if err := w.conn.Write(ctx, websocket.MessageText, msg); err != nil {
+		return ErrPushResultFailed
+	}
+	return nil
 }
 
 // Read returns the next inbound message as opaque bytes. ctx bounds the

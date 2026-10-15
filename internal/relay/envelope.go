@@ -54,8 +54,9 @@ type Envelope struct {
 
 // pushWake is the relay-addressed wake request carried in Envelope.PushWake.
 type pushWake struct {
-	Platform string `json:"platform"`
-	Token    string `json:"token"`
+	Platform  string `json:"platform"`
+	Token     string `json:"token"`
+	RequestID string `json:"-"`
 }
 
 // parsePushWake validates a push_wake object at the envelope boundary. fcm
@@ -63,17 +64,38 @@ type pushWake struct {
 // rejected. The decoder error is not wrapped so no fragment of the input
 // reaches error text.
 func parsePushWake(raw json.RawMessage) (pushWake, error) {
-	var w pushWake
-	if err := json.Unmarshal(raw, &w); err != nil {
+	var decoded struct {
+		pushWake
+		RequestID json.RawMessage `json:"request_id"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return pushWake{}, ErrMalformedPushWake
 	}
+	w := decoded.pushWake
 	if w.Platform != "fcm" {
 		return pushWake{}, ErrUnsupportedPushPlatform
 	}
 	if w.Token == "" {
 		return pushWake{}, ErrEmptyPushToken
 	}
+	var id string
+	if json.Unmarshal(decoded.RequestID, &id) == nil && validPushRequestID(id) {
+		w.RequestID = id
+	}
 	return w, nil
+}
+
+func validPushRequestID(id string) bool {
+	if len(id) < 1 || len(id) > 64 {
+		return false
+	}
+	for i := range id {
+		c := id[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // hasFrame reports whether f carries a real inner frame. An absent field
